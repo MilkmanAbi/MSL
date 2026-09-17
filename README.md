@@ -28,6 +28,10 @@
 
 <br>
 
+> MSL is completely free software, it has no funding, and the prebuilt images for it are hosted on SourceForge... It is painfully slow. I apologise for that.
+
+> The Ubuntu image has a SLEW of issues, so many deps needed. It's kinda annoying, sorry.
+
 MSL runs real Linux distributions on your Mac: an actual Linux kernel and an actual Linux userland on Apple's own Virtualization framework, with nothing emulated and no virtual machine window to babysit. You type `msl` and you're in. Your home folder is already there. Linux apps show up in the Dock, in Spotlight and in ⌘-Tab like they always lived there. ✨
 
 MSL has been in development for over a year, and getting here took an honestly insane amount of engineering effort. It's free, it's open source, and it's still held together with a great deal of love. ヽ(・∀・)ﾉ

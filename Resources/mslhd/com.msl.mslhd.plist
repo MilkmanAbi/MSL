@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.msl.mslhd</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/mslhd</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardErrorPath</key>
+    <string>/tmp/mslhd.err.log</string>
+    <!--
+      Not using launchd socket activation (the `Sockets` key) here - that
+      needs a small C shim around launch_activate_socket() from <launch.h>
+      that isn't wired up yet. KeepAlive + a normal bind/listen in
+      DaemonServer is the simpler starting point; socket activation would
+      let mslhd itself not be resident until first use, which is the more
+      "lean" version of this - worth doing later.
+    -->
+</dict>
+</plist>

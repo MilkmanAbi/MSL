@@ -1,0 +1,7 @@
+# en* is what systemd names the virtio NIC on most distros (enp0s1); Kali
+# keeps the kernel name, eth0, and an unmatched link stays unconfigured.
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes

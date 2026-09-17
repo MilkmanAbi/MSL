@@ -1,0 +1,9 @@
+#!/bin/sh
+# mdev (busybox's device manager, what a minimal Alpine install uses
+# instead of udev) repopulates /dev fresh every boot from its own defaults,
+# creating /dev/null and siblings as crw-rw---- root:root instead of the
+# standard crw-rw-rw-. That silently breaks basic stdio redirection
+# (</dev/null, >/dev/null) for any non-root process - which includes the
+# unprivileged `msl` user MSL explicitly supports. A static chmod on the
+# image would not survive mdev's next repopulate, so it has to run at boot.
+chmod 666 /dev/null /dev/zero /dev/full /dev/random /dev/urandom /dev/tty /dev/ptmx 2>/dev/null

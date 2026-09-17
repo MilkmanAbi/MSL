@@ -1,0 +1,7 @@
+#!/bin/sh
+modprobe vmw_vsock_virtio_transport 2>/dev/null
+# No `export HOME=/root` here - shellinit sets HOME/USER/LOGNAME/SHELL
+# itself per-session, from whichever user the EXEC frame resolves to (root
+# by default, see `msl -u`). A blanket root-only value baked in here would
+# be wrong for every other user.
+exec /usr/local/bin/shellinit &

@@ -1,0 +1,60 @@
+#!/usr/bin/expect -f
+# The first-start account prompt, offered a username that already exists in
+# the guest. It must say so and let a different name through.
+#
+#   account-name-taken.exp MSL_BINARY INSTANCE TAKEN_NAME NEW_NAME PASSWORD
+#
+# Prints OK-/BAD- marker lines for backlog-test.sh.
+
+set timeout 240
+lassign $argv msl instance taken fresh password
+
+spawn $msl $instance
+
+expect {
+    "New UNIX username: " { send "$taken\r" }
+    timeout { puts "\nBAD-NO-PROMPT"; exit 1 }
+}
+
+# The check may come straight after the name or only after the passwords;
+# either order is fine, as long as it comes before anything is created.
+set refused 0
+while {!$refused} {
+    expect {
+        "already exists" { set refused 1 }
+        "New password: " { send "$password\r" }
+        "Retype new password: " { send "$password\r" }
+        "created" { puts "\nBAD-TAKEN-NAME-ACCEPTED"; exit 1 }
+        timeout { puts "\nBAD-NO-REFUSAL"; exit 1 }
+    }
+}
+puts "\nOK-TAKEN-NAME-REFUSED"
+
+expect {
+    "New UNIX username: " { send "$fresh\r" }
+    timeout { puts "\nBAD-NO-SECOND-CHANCE"; exit 1 }
+}
+puts "\nOK-ASKED-AGAIN"
+expect {
+    "New password: " { send "$password\r" }
+    timeout { puts "\nBAD-NO-PASSWORD-PROMPT"; exit 1 }
+}
+expect {
+    "Retype new password: " { send "$password\r" }
+    timeout { puts "\nBAD-NO-RETYPE-PROMPT"; exit 1 }
+}
+expect {
+    "created" {}
+    timeout { puts "\nBAD-NOT-CREATED"; exit 1 }
+}
+expect {
+    -re {[$#>] $} {}
+    timeout { puts "\nBAD-NO-SHELL"; exit 1 }
+}
+send "echo WHOAMI=\$(whoami)\r"
+expect {
+    -re {WHOAMI=([a-z0-9_-]+)\r} { puts "\nLOGIN=$expect_out(1,string)" }
+    timeout { puts "\nBAD-NO-WHOAMI"; exit 1 }
+}
+send "exit\r"
+expect eof

@@ -1,0 +1,46 @@
+#!/usr/bin/expect -f
+# Drives MSL's real first-start account prompt, the way a person would meet
+# it in Terminal, then checks the account inside the guest.
+#
+#   smoke-account.exp MSL_BINARY INSTANCE USERNAME PASSWORD
+#
+# Prints marker lines the wrapper (smoke-account.sh) looks for.
+
+set timeout 240
+lassign $argv msl instance username password
+
+spawn $msl $instance
+
+expect {
+    "New UNIX username: " { send "$username\r" }
+    timeout { puts "\nACCOUNT-NO-PROMPT"; exit 1 }
+}
+expect {
+    "New password: " { send "$password\r" }
+    timeout { puts "\nACCOUNT-NO-PASSWORD-PROMPT"; exit 1 }
+}
+expect {
+    "Retype new password: " { send "$password\r" }
+    timeout { puts "\nACCOUNT-NO-RETYPE-PROMPT"; exit 1 }
+}
+expect {
+    "created" {}
+    "already exists" { puts "\nACCOUNT-ALREADY-EXISTS"; exit 1 }
+    timeout { puts "\nACCOUNT-NOT-CREATED"; exit 1 }
+}
+expect {
+    -re {[$#>] $} {}
+    timeout { puts "\nACCOUNT-NO-SHELL"; exit 1 }
+}
+
+# One line, so a slow prompt can't interleave with the output. Every check
+# prints OK-... or BAD-...; the password is fed with sudo -S so nothing waits
+# on a hidden prompt.
+set pw $password
+send "echo WHOAMI=\$(whoami); echo GROUPS=\$(id -nG); sudo -k; echo '$pw' | sudo -S -p '' true && echo OK-SUDO-WITH-PASSWORD || echo BAD-SUDO-WITH-PASSWORD; sudo -k; sudo -n true 2>/dev/null && echo BAD-SUDO-WITHOUT-PASSWORD || echo OK-SUDO-NEEDS-PASSWORD; sudo -k; echo not-the-password | sudo -S -p '' true 2>/dev/null && echo BAD-WRONG-PASSWORD-ACCEPTED || echo OK-WRONG-PASSWORD-REJECTED; echo HASH=\$(echo '$pw' | sudo -S -p '' sh -c \"grep '^$username:' /etc/shadow | cut -d: -f2 | cut -c1-3\"); echo SUDOERS_D=\$(echo '$pw' | sudo -S -p '' ls -A /etc/sudoers.d | tr '\\n' ' '); echo '$pw' | sudo -S -p '' visudo -cf /etc/sudoers.d/10-msl-admins >/dev/null 2>&1 && echo OK-VISUDO || echo BAD-VISUDO; echo ACCOUNT-CHECKS-DONE\r"
+expect {
+    "ACCOUNT-CHECKS-DONE\r" {}
+    timeout { puts "\nACCOUNT-CHECKS-TIMEOUT"; exit 1 }
+}
+send "exit\r"
+expect eof

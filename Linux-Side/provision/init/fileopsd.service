@@ -1,0 +1,10 @@
+[Unit]
+Description=MSL file-ops listener (vsock, sandbox)
+After=network.target
+
+[Service]
+ExecStart=/bin/sh -c "modprobe vmw_vsock_virtio_transport 2>/dev/null; exec /usr/local/bin/fileopsd"
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

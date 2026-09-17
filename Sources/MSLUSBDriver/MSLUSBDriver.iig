@@ -1,0 +1,40 @@
+// MSLUSBDriver.iig
+//
+// Phase 2 skeleton (per msl-platform.md): a DriverKit extension that can
+// detach macOS's own system driver from a USB device (webcams, audio
+// interfaces, USB NICs, HID devices) and hand ownership to msl-usbd.
+// Phase 1 (Sources/msl-usbd) doesn't need this at all - it only claims
+// devices with no existing system driver, which IOUSBHostDevice's
+// userspace init already does cleanly on its own.
+//
+// NOT BUILDABLE HERE: DriverKit targets need a real Xcode project (File →
+// New Target → DriverKit → Generic DriverKit Driver generates the .iig
+// toolchain wiring SPM has no equivalent for), and no Xcode.app is
+// installed in the environment this was written in (confirmed - only
+// Command Line Tools). This is scaffolding for whenever that changes,
+// mirroring how Sources/MSLApp/ sits outside Package.swift for the same
+// reason. Even with Xcode available, loading a dext at all - for local
+// testing, not just distribution - requires System Integrity Protection
+// to allow it and, per Apple's docs, the specific DriverKit + USB
+// transport entitlements below to actually be granted by Apple to a
+// signing identity; ad-hoc signing (which sufficed for
+// com.apple.security.virtualization and, per Resources/msl-usbd, probably
+// com.apple.vm.device-access) is not expected to be enough on its own
+// here - this is a materially higher tier of restriction.
+//
+// Class shape verified against the real DriverKit header on this machine
+// (Kernel.framework/Headers/USBDriverKit/IOUSBHostDevice.h) - IOService
+// subclassing and the Open/Close/DeviceRequest method shapes below match
+// that header, not guessed.
+
+#include <DriverKit/IOService.iig>
+#include <USBDriverKit/IOUSBHostDevice.iig>
+
+class MSLUSBDriver: public IOService
+{
+public:
+    virtual bool init(void) override;
+    virtual kern_return_t Start(IOService *provider) override;
+    virtual kern_return_t Stop(IOService *provider) override;
+    virtual void free(void) override;
+};

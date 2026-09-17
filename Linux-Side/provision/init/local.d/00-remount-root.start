@@ -1,0 +1,7 @@
+#!/bin/sh
+# This minimal Alpine install never enabled the standard "boot" runlevel
+# services (checkfs/fsck/mount-ro) that would normally remount root rw, so
+# it silently stayed read-only through every boot - masked until fileopsd
+# started writing real guest paths and hit "Read-only file system" (errno
+# 30). 00- prefix so it sorts before everything else in local.d.
+mount -o remount,rw /

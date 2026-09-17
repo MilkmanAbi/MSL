@@ -1,0 +1,1 @@
+../../Sources/provision-disk-image/main.swift

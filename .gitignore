@@ -1,0 +1,16 @@
+.build/
+.build-dext/
+.build-app/
+.swiftpm/
+*.img
+*.state
+*.machineid
+*.dSYM/
+.DS_Store
+MSL-Images/shared/kernel-Image
+MSL-Images/shared/initramfs-virt
+dist/
+.claude-session/
+MSL-Images/*.xz
+MSL-Images/*.gz
+__pycache__/

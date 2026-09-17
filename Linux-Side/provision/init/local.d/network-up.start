@@ -1,0 +1,10 @@
+#!/bin/sh
+# eth0 exists but stays administratively down without this (confirmed live:
+# `ip addr` showed state DOWN, no address). `ip link set up` first is
+# required - udhcpc does NOT bring the interface up itself and retries
+# "Network is down" forever otherwise, which, combined with `-b` only
+# backgrounding after a successful lease, hung the entire boot at
+# "Starting local...". shellinit itself needs no networking; everything
+# else does.
+ip link set eth0 up 2>/dev/null
+udhcpc -i eth0 -b 2>/dev/null

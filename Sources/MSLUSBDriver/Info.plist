@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.msl.MSLUSBDriver</string>
+    <key>CFBundleExecutable</key>
+    <string>MSLUSBDriver</string>
+    <key>CFBundleName</key>
+    <string>MSLUSBDriver</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1</string>
+    <key>CFBundlePackageType</key>
+    <string>DEXT</string>
+    <key>OSBundleUsageDescription</key>
+    <string>MSL USB passthrough driver (Phase 2, development skeleton)</string>
+    <!--
+      No idVendor/idProduct here on purpose - Phase 2 (see msl-platform.md)
+      needs to match against whatever device the user picks to pass
+      through at runtime, not a fixed device this driver ships knowing
+      about. A real implementation likely needs the matching dictionary
+      populated dynamically (or widened here and filtered in Start()) once
+      the actual "user picks a device in the MSL UI" flow exists - that
+      flow doesn't exist yet either (see msl-usbd's README).
+    -->
+    <key>IOKitPersonalities</key>
+    <dict>
+        <key>MSLUSBDriver</key>
+        <dict>
+            <key>CFBundleIdentifier</key>
+            <string>com.msl.MSLUSBDriver</string>
+            <key>IOClass</key>
+            <string>IOUserService</string>
+            <key>IOUserClass</key>
+            <string>MSLUSBDriver</string>
+            <key>IOProviderClass</key>
+            <string>IOUSBHostDevice</string>
+            <key>IOUserServerName</key>
+            <string>com.msl.MSLUSBDriver</string>
+        </dict>
+    </dict>
+</dict>
+</plist>

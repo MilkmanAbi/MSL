@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Verified against this machine's actual SDK header
+      (IOKit/usb/IOUSBHostFamilyDefinitions.h's kIOUSBTransportDextEntitlement
+      / IOKitKeys.h's kIODriverKitUSBTransportEntitlementKey both define
+      this exact string) - more specific and more current than the
+      generic com.apple.developer.driverkit.userclient-access the original
+      design doc's C sample guessed at. This is a restricted entitlement:
+      Apple must approve it for your Developer ID before a dext using it
+      can be distributed, and before macOS will load it locally at all
+      outside of a very limited local-testing allowance (System Settings
+      > Privacy & Security, and typically requires enabling
+      `systemextensionsctl developer on` and a reboot even for that).
+    -->
+    <key>com.apple.developer.driverkit.transport.usb</key>
+    <true/>
+    <!--
+      Required on any DriverKit extension regardless of family - without
+      it the dext can't be loaded as a system extension at all.
+    -->
+    <key>com.apple.developer.driverkit</key>
+    <true/>
+</dict>
+</plist>

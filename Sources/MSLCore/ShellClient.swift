@@ -80,7 +80,10 @@ public final class ShellClient {
             switch frame.type {
             case .data: collected.append(contentsOf: frame.payload)
             case .exit: exitCode = Int32(frame.payload.first ?? 1)
-            case .exec, .resize: break
+            // `.session` is a detachable session's hello. This client runs
+            // one-shot commands and never reattaches, so it is noted and
+            // ignored - it sends no session id, so it will not arrive.
+            case .exec, .resize, .session, .attach, .detach: break
             }
         }
 

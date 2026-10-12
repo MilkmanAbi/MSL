@@ -6,8 +6,9 @@ import IOKit.usb
 
 /// A snapshot of one USB device's identity, read from the IOKit registry.
 /// Enumerating this needs no entitlement at all - it's a plain registry
-/// read. Actually opening/claiming the device (`USBDeviceClaim`) is the
-/// part that needs `com.apple.vm.device-access`.
+/// read, and neither does opening the device (`HostUSBDevice`). Only
+/// *capturing* one from macOS's own driver is privileged, and root is
+/// enough for that - see `HostUSBDevice`.
 public struct USBDeviceInfo: Equatable, CustomStringConvertible {
     public let vendorID: UInt16
     public let productID: UInt16

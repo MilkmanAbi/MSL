@@ -21,8 +21,11 @@ import MSLCore
 // the app reads back to explain a launch that silently did nothing.
 let logURL: URL = {
     MSLPaths.ensureDirectory(MSLPaths.logsDirectory)
-    let name = Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "app"
-    return MSLPaths.logsDirectory.appendingPathComponent("\(name).log")
+    // The bundle's own filename, not `CFBundleName`: the Flatpak and the
+    // Snap build of one application deliberately share a display name now,
+    // and they must not share a log.
+    let name = Bundle.main.bundleURL.deletingPathExtension().lastPathComponent
+    return MSLPaths.logsDirectory.appendingPathComponent("\(name.isEmpty ? "app" : name).log")
 }()
 
 let logFormatter: DateFormatter = {
@@ -48,6 +51,13 @@ func log(_ message: String) {
 /// `LSUIElement`, so it has to become active on its own for the alert to
 /// come to the front.
 func showFailure(_ message: String) {
+    // Called from the background queue that runs the Linux app; AppKit
+    // wants this on the main thread, and the caller has to wait for the
+    // answer because it exits as soon as this returns.
+    if !Thread.isMainThread {
+        DispatchQueue.main.sync { showFailure(message) }
+        return
+    }
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     app.activate(ignoringOtherApps: true)
@@ -86,21 +96,59 @@ guard let registeredDistro = registry.distro(for: instance) else {
     exit(1)
 }
 
+/// Opening the app again means "open another one".
+///
+/// Without a run loop, this process never answered macOS's reopen events.
+/// They queued instead, and were delivered when it exited - so clicking an
+/// app three times opened one window, and *closing* that window made
+/// another one appear, out of nowhere, some time later.
+///
+/// Answering them by starting a fresh instance is also the behaviour to
+/// want: a second click on a Linux app should open a second window, exactly
+/// as it would on a Linux desktop. Apps that allow only one instance
+/// (Firefox, GNOME's single-instance apps) still say so themselves and
+/// simply raise the window they have - that is their decision to make, not
+/// MSL's.
+final class LauncherDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration)
+        return true
+    }
+}
+
+let application = NSApplication.shared
+// Accessory, not regular: the X11 side already puts one tile in the Dock
+// for this app, and a second would be worse than none. See `LSUIElement`
+// in `LinuxAppBundle`.
+application.setActivationPolicy(.accessory)
+let delegate = LauncherDelegate()
+application.delegate = delegate
+
 log("launching \(appName) on \(instance) (\(registeredDistro.rawValue))")
 let started = Date()
-do {
-    let (code, output) = try LinuxAppLauncher.runCapturingOutput(
-        instance: instance, distro: registeredDistro == distro ? distro : registeredDistro,
-        command: exec, log: log
-    )
-    if let message = LinuxAppLauncher.failureMessage(
-        appName: appName, instance: instance, command: exec,
-        exitCode: code, output: output, runTime: Date().timeIntervalSince(started)) {
-        showFailure(message)
+
+// The guest app runs off the main thread so the run loop above stays free
+// to answer reopen events for this app's whole life.
+DispatchQueue.global(qos: .userInitiated).async {
+    do {
+        let (code, output) = try LinuxAppLauncher.runCapturingOutput(
+            instance: instance, distro: registeredDistro == distro ? distro : registeredDistro,
+            command: exec, log: log
+        )
+        if let message = LinuxAppLauncher.failureMessage(
+            appName: appName, instance: instance, command: exec,
+            exitCode: code, output: output, runTime: Date().timeIntervalSince(started)) {
+            showFailure(message)
+        }
+        exit(code)
+    } catch {
+        log("launch failed: \(error)")
+        showFailure("\(error)")
+        exit(1)
     }
-    exit(code)
-} catch {
-    log("launch failed: \(error)")
-    showFailure("\(error)")
-    exit(1)
 }
+
+application.run()

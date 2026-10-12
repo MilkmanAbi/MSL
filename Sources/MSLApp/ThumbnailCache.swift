@@ -92,12 +92,15 @@ struct FileThumbnail: View {
     let item: MSLFileItem
     var size: CGFloat = 64
     @ObservedObject private var thumbnails = ThumbnailCache.shared
+    @Environment(\.filesFolderTint) private var folderTint
 
     var body: some View {
         // Reading `generation` is what subscribes this view to thumbnail
         // arrivals; without it the cache would fill and nothing would redraw.
         let _ = thumbnails.generation
-        if let thumbnail = thumbnails.thumbnail(for: item, size: size) {
+        if folderTint != nil, item.isBrowsableDirectory {
+            FileIcon(item: item, size: size)
+        } else if let thumbnail = thumbnails.thumbnail(for: item, size: size) {
             Image(nsImage: thumbnail)
                 .resizable()
                 .interpolation(.high)

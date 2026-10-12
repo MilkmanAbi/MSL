@@ -59,17 +59,71 @@ public enum LinuxAppLauncher {
         command: String,
         log: ((String) -> Void)? = nil
     ) throws -> (exitCode: Int32, output: String) {
+        // Launching Linux apps at all. Checked before the display is
+        // prepared, so a denied instance does not start an X server it
+        // will never use.
+        guard MSLAPGate.allows("apps.launch", instance: instance) else {
+            throw MSLAPRefusal(MSLAPGate.reason("apps.launch", instance: instance)
+                               ?? "Not allowed by the MSL Admin Portal")
+        }
         try prepareDisplay(instance: instance, distro: distro, log: log)
 
-        log?("running: \(command)")
+        // As the user's own account, never root. The shell protocol treats an
+        // empty user as root, which is what every launched app used to get.
+        let user = GuestUser.shellUser(instance: instance, distro: distro)
+        log?("running: \(command)\(GuestUser.isRoot(user) ? " (as root - no Linux account yet)" : " (as \(user))")")
         let client = ShellClient()
-        let (exitCode, output) = try client.runOneShotCommand(
-            instance: instance, distro: distro,
-            command: GuestIntegration.launchCommand(command, settings: MSLExperimentalSettingsStore.load())
+        if let custom = AppCustomCommandStore.command(instance: instance, command: command) {
+            log?("custom launch command: \(custom)")
+        }
+        let guestCommand = GuestIntegration.launchCommand(
+            command, instance: instance, settings: MSLExperimentalSettingsStore.load())
+        var (exitCode, output) = try client.runOneShotCommand(
+            instance: instance, distro: distro, command: guestCommand, user: user
         )
+
+        // One retry when the app could not open the display.
+        //
+        // "x11tunnel ready" proves the guest can reach the tunnel; it does
+        // not prove the HOST is serving yet. A freshly started tunnel
+        // accepts a connection happily while `mslhd`'s listener is still
+        // coming up, and the client gets a connection that closes on it -
+        // so the first app launched after a cold VM boot sometimes dies
+        // instantly with "cannot open display :1". Measured 2026-09-23:
+        // one failure in three cold boots, so a race rather than something
+        // deterministic, and the app that fails is always the first one.
+        //
+        // Retried rather than fixed with a stronger readiness probe on
+        // purpose: an end-to-end probe means completing an X11 handshake
+        // from the guest, and a bare probe client announces itself like
+        // any other app (`x11tunnel --announce`), which starts a host
+        // process for the probe. That is a bigger change than the bug
+        // justifies. `startTunnel` already self-heals the same way.
+        if exitCode != 0, Self.looksLikeDisplayNotReady(output) {
+            log?("display was not ready yet - preparing it again and retrying once")
+            try? prepareDisplay(instance: instance, distro: distro, log: log)
+            (exitCode, output) = try client.runOneShotCommand(
+                instance: instance, distro: distro, command: guestCommand, user: user
+            )
+        }
+
         if !output.isEmpty { log?(output.trimmingCharacters(in: .whitespacesAndNewlines)) }
         log?("exited with code \(exitCode)")
         return (exitCode, output)
+    }
+
+    /// Whether a failed launch looks like "the display was not up yet"
+    /// rather than a real problem with the app.
+    ///
+    /// Matched on the toolkits' own wording. Deliberately narrow: a retry
+    /// must never fire for an app that genuinely failed, or a crash on
+    /// startup becomes two crashes.
+    static func looksLikeDisplayNotReady(_ output: String) -> Bool {
+        let lowered = output.lowercased()
+        return lowered.contains("cannot open display")       // GTK, Xlib
+            || lowered.contains("can't open display")        // Xt ("Xt error: Can't open display")
+            || lowered.contains("could not connect to display") // Qt/xcb
+            || lowered.contains("failed to open display")
     }
 
     /// What to tell the user about a launch that ended, or nil when there is
@@ -88,7 +142,12 @@ public enum LinuxAppLauncher {
         exitCode: Int32, output: String, runTime: TimeInterval
     ) -> String? {
         let program = command.split(separator: " ").first.map(String.init) ?? command
-        let detail = output.split(separator: "\n").suffix(4).joined(separator: "\n")
+        // `isNewline`, not "\n": the guest runs on a pty and sends CRLF, which
+        // Swift treats as a single Character, so splitting on "\n" would hand
+        // back the whole output as one "line".
+        let detail = output.split(whereSeparator: \.isNewline).suffix(4)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         switch exitCode {
         case 0:
@@ -116,8 +175,47 @@ public enum LinuxAppLauncher {
     public static func prepareDisplay(instance: String, distro: GuestDistro, log: ((String) -> Void)? = nil) throws {
         try DaemonClient.ensureRunning(log: log)
 
+        // A real user session first: snap will not run without one, and
+        // portals look for /run/user/<uid>. Root-side, idempotent, and a
+        // no-op on a guest without logind - see
+        // `GuestIntegration.userSessionCommand`.
+        let account = GuestUser.shellUser(instance: instance, distro: distro)
+        // Both of these need root, and the second one is why a shell used to
+        // get nothing: the profile stub lives in /etc, which the user account
+        // cannot write, so running it as the user wrote nothing and failed
+        // silently (`|| true`). Sent together to save a round trip, and run
+        // even when the account IS root - the stub is what a login shell
+        // reads either way.
+        // **The session command runs in a subshell, and that is load-bearing.**
+        // It begins `command -v loginctl || { …; exit 0; }`, so on a guest
+        // without logind - Alpine, which is OpenRC - that `exit` ended the
+        // whole `sh -c` and everything after it was silently skipped. The
+        // profile stub below is what gives a shell its DISPLAY and session
+        // bus, so on Alpine alone, typing an app's name at a prompt failed
+        // with "Failed to open display" while every systemd distro worked
+        // (reported 2026-10-02). Parenthesised, its `exit` leaves only itself.
+        let session = GuestUser.isRoot(account)
+            ? "" : "(\n" + GuestIntegration.userSessionCommand(user: account) + "\n)\n"
+        _ = try? ShellClient().runOneShotCommand(
+            instance: instance, distro: distro,
+            command: session + GuestIntegration.sessionProfileCommand(),
+            user: "")
+
         log?("starting the native GUI server for \(instance)")
-        guard let response = DaemonClient.send(.startNativeGui(instance: instance)) else {
+        // Retried, because `ensureRunning` above can return the moment the
+        // daemon's socket exists while it is still coming up - and because a
+        // daemon that has just been replaced (an MSL upgrade, a developer
+        // build) is unreachable for a second or two. Clicking an app in that
+        // window failed outright with "couldn't reach mslhd". The request
+        // itself is idempotent: it starts the X11 server for an instance, or
+        // says it already did.
+        var response: String?
+        for attempt in 0..<10 {
+            response = DaemonClient.send(.startNativeGui(instance: instance))
+            if response != nil { break }
+            if attempt < 9 { usleep(400_000) }
+        }
+        guard let response else {
             throw LaunchError.daemonRefused("couldn't reach mslhd")
         }
         guard response.hasPrefix("OK") else {
@@ -148,15 +246,48 @@ public enum LinuxAppLauncher {
     /// The MSL integration kit (`GuestIntegration`) is refreshed in the same
     /// command, to save a round trip per launch. It cannot fail the launch.
     private static func startTunnel(instance: String, distro: GuestDistro, log: ((String) -> Void)?) throws {
-        let start = GuestIntegration.installCommand() + "\n" + GuestIntegration.displayProfileCommand() + "\n" + """
-        kill -0 $(cat /tmp/x11tunnel-1-5003.pid 2>/dev/null) 2>/dev/null || \
-        (setsid sh -c 'exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; exec /usr/local/bin/x11tunnel 1 5003 --announce' </dev/null >/tmp/x11tunnel-native.log 2>&1 & \
-        echo $! > /tmp/x11tunnel-1-5003.pid; sleep 1; \
-        kill -0 $(cat /tmp/x11tunnel-1-5003.pid) 2>/dev/null || \
-        (cat /tmp/x11tunnel-native.log >&2; exit 1))
-        """
+        // The audio setup goes before the tunnel start, never after: it
+        // ends in `|| true`, and as the last line it would hide a failed
+        // tunnel from the exit-code check below.
+        // `sessionEnvFileCommand` writes the per-user half of the session
+        // environment, in the user's own home, with the settings as they are
+        // right now - which is what keeps a shell in step with the Mac's
+        // experimental switches. Its root half (the profile stub that sources
+        // it) went out in `prepareDisplay`.
+        let start = GuestIntegration.installCommand() + "\n" + GuestIntegration.displayProfileCommand()
+            + "\n" + GuestIntegration.sessionEnvFileCommand(settings: MSLExperimentalSettingsStore.load())
+            + "\n" + GuestIntegration.sessionAudioCommand
+            + "\n" + GuestIntegration.tunnelStartCommand(display: 1, port: 5003, announce: true)
+        // Also as the user: the tunnel writes its pidfile and the display
+        // socket in /tmp, and `GuestIntegration.installCommand` writes the kit
+        // into $HOME. Started as root, the kit landed in root's home, where
+        // the app that needs it never looks.
         let client = ShellClient()
-        let (code, output) = try client.runOneShotCommand(instance: instance, distro: distro, command: start)
+        var (code, output) = try client.runOneShotCommand(
+            instance: instance, distro: distro, command: start,
+            user: GuestUser.shellUser(instance: instance, distro: distro))
+
+        // Self-healing, once. Both failures below mean the same thing: an
+        // earlier tunnel that ran as root left files the user cannot
+        // touch - in `/tmp` and in the sticky `/tmp/.X11-unix` - and the
+        // shipped images carry them from their own build. Clearing them
+        // needs root, so MSL does that itself rather than leaving someone
+        // with an app that will never open. See
+        // `GuestIntegration.tunnelCleanupCommand`.
+        // Any failure, not only the two messages this used to look for: the
+        // display can be unusable in ways that never reach the tunnel's own
+        // output at all, and the cleanup is safe to run whenever a start has
+        // just failed.
+        if code != 0 {
+            log?("clearing a stale display socket left by an earlier session")
+            _ = try? client.runOneShotCommand(
+                instance: instance, distro: distro,
+                command: GuestIntegration.tunnelCleanupCommand(display: 1, port: 5003),
+                user: "")
+            (code, output) = try client.runOneShotCommand(
+                instance: instance, distro: distro, command: start,
+                user: GuestUser.shellUser(instance: instance, distro: distro))
+        }
         guard code == 0 else {
             throw LaunchError.tunnelFailed(output.trimmingCharacters(in: .whitespacesAndNewlines))
         }

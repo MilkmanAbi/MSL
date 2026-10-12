@@ -13,22 +13,38 @@ import SwiftUI
 /// its own icon - a GIMP window showing a melon in the Dock would lose exactly
 /// the thing the per-app split was built for.
 final class MSLAppDelegate: NSObject, NSApplicationDelegate {
+    /// Clicking the Dock tile, Launchpad or Spotlight for an app that is
+    /// already running does not launch anything - it arrives here. Without
+    /// this, MSL was activated with no window at all (see `MSLWindowReopen`).
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        MSLWindowReopen.handleReopen(hasVisibleWindows: flag)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        guard let url = MSLAsset.url("App_Logo", extension: "png"),
+        UpdatePrompt.checkAtLaunch()
+        // Only for an unbundled development run. A bundled MSL has a real
+        // icon (Assets.car + .icns); setting the raw PNG here replaced it at
+        // runtime, and a runtime icon gets no squircle and no dark, clear or
+        // tinted variant - the melon sat bare in a tinted Dock.
+        guard Bundle.main.bundleURL.pathExtension != "app",
+              let url = MSLAsset.url("App_Logo", extension: "png"),
               let image = NSImage(contentsOf: url) else { return }
         NSApplication.shared.applicationIconImage = image
     }
 }
 
-@main
 struct MSLApp: App {
+    static let mainWindowID = "main"
+
     @NSApplicationDelegateAdaptor(MSLAppDelegate.self) private var delegate
     @StateObject private var model = AppModel()
     @StateObject private var terminals = TerminalSessions()
     /// `openWindow` is only available inside a scene, so the menu command
     /// reaches it through this rather than an environment lookup.
     @Environment(\.openWindow) private var openWindow
-    private var openFiles: (() -> Void)? { { openWindow(id: "files") } }
+    /// MSL Files is its own app now; this opens it (or, when it isn't
+    /// installed, the copy of the browser built into MSL).
+    private var openFiles: (() -> Void)? { { MSLFilesLauncher.open { openWindow(id: "files") } } }
     private var openAbout: (() -> Void)? { { openWindow(id: "about") } }
     private var openHelp: (() -> Void)? { { openWindow(id: "help") } }
 
@@ -41,11 +57,25 @@ struct MSLApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
+        // An explicit id, so the reopen path has something to ask for -
+        // `openWindow` needs one and the main group had none.
+        WindowGroup(id: MSLApp.mainWindowID) {
             RootView()
                 .environmentObject(model)
                 .environmentObject(terminals)
+                .registersForReopen { openWindow(id: MSLApp.mainWindowID) }
                 .task { model.start() }
+                // Attached out here rather than inside `RootView`, which
+                // already carries New Instance's sheet - two `.sheet`
+                // modifiers on one view is a SwiftUI coin toss, and that
+                // note is repeated three times in `RootView` for a reason.
+                // This is a different view node, so both are honoured.
+                .sheet(isPresented: $model.showingWelcome) {
+                    WelcomeView { model.finishWelcome() }
+                }
+                // After `model.start()`, so the window has drawn before a
+                // sheet slides over it.
+                .task { model.showWelcomeIfNeeded() }
                 // A shell session is what keeps an instance awake, so a
                 // session left open against an instance that has been
                 // removed is a leak with teeth.
@@ -98,6 +128,22 @@ struct MSLApp: App {
         .defaultSize(width: 560, height: 720)
         .windowResizability(.contentMinSize)
 
+        // Its own window, because a managed user opens it to find out why
+        // something refused them, not as part of configuring anything.
+        Window("MSL Admin Portal", id: "adminportal") {
+            AdminPortalWindow()
+        }
+        .defaultSize(width: 680, height: 620)
+        .windowResizability(.contentMinSize)
+
+        // Its own window: somebody uninstalling has already decided, and
+        // making them find a terminal for it is the software arguing.
+        Window("Remove MSL", id: "uninstall") {
+            UninstallWindow()
+        }
+        .defaultSize(width: 680, height: 620)
+        .windowResizability(.contentMinSize)
+
         // A window of its own, like the About panel: a guide is something
         // people keep open beside the thing it explains.
         Window("MSL Help", id: "help") {
@@ -115,6 +161,7 @@ struct MSLApp: App {
                 // No ⌘? - SwiftUI drops a shortcut whose key needs Shift, and
                 // ⇧⌘? already opens this menu system-wide (checked through
                 // the accessibility tree: the item carried no key at all).
+                Button("Welcome to MSL") { model.showingWelcome = true }
                 Button("MSL Help") { openHelp?() }
                 Button("Getting Started") { openHelp(at: "install-distro") }
                 Button("Keyboard Shortcuts") { openHelp(at: "shortcuts") }
@@ -127,6 +174,7 @@ struct MSLApp: App {
             // things worth saying (what it is, what's experimental).
             CommandGroup(replacing: .appInfo) {
                 Button("About MSL") { openAbout?() }
+                Button("Check for Updates…") { UpdatePrompt.checkNow() }
             }
             CommandGroup(replacing: .newItem) {
                 Button("New Instance…") { model.showingNewInstance = true }
@@ -142,7 +190,21 @@ struct MSLApp: App {
                 // keeping this one shortcut.
                 Button("MSL Files") { openFiles?() }
                     .keyboardShortcut("f", modifiers: [.command, .option])
-                Button("Experimental Features") { openWindow(id: "experimental") }
+                // Tier 3: hiding a window, nothing more. The switches
+                // behind it are each gated in the settings store, which is
+                // what actually refuses - this only keeps the panel out of
+                // the way when a policy says the person has no business
+                // in it.
+                if MSLAPGate.allows("system.experimental", instance: nil) {
+                    Button("Experimental Features") { openWindow(id: "experimental") }
+                }
+                Button("MSL Admin Portal") { openWindow(id: "adminportal") }
+                Divider()
+                // Shown even when a policy forbids it, and refused when
+                // pressed. Hiding it would leave a managed user hunting
+                // for a menu item that is not there; the refusal says who
+                // decided and why, which is the whole point of MSLAP.
+                Button("Remove MSL…") { openWindow(id: "uninstall") }
             }
             FilesCommands()
         }

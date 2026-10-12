@@ -20,10 +20,14 @@ import SwiftUI
 /// implemented on the hand-laid header instead of being lost with it.
 struct FileListView: View {
     @ObservedObject var files: FilesModel
+    /// True when the window shows a Darker surface or a tinted wash behind
+    /// the files; the list then drops its own opaque background.
+    @Environment(\.filesCustomBackdrop) private var customBackdrop
 
     /// Fixed widths, shared by the header and every row so the two line up.
     /// Hand-laid columns mean nothing enforces that agreement but this.
     private enum Columns {
+        static let permissions: CGFloat = 96
         static let size: CGFloat = 80
         static let kind: CGFloat = 150
         static let modified: CGFloat = 170
@@ -32,39 +36,57 @@ struct FileListView: View {
         static let gap: CGFloat = 16
     }
 
+    /// The `ls -l` permissions column earns its space only on a Linux root,
+    /// where the mode is real and worth seeing; on a Mac root it would just
+    /// repeat what Finder already conveys, so it stays hidden.
+    private var showsPermissions: Bool { files.selectedRoot?.isGuest == true }
+
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            List(selection: $files.selection) {
+            // No `selection:` binding: selection belongs to `FileClickLayer`
+            // and the model, as in every other view mode. A bound List draws
+            // AppKit's own blue highlight (which ignores the theme) and its
+            // native click handling competed with ours.
+            List {
                 ForEach(files.groupedItems, id: \.title) { group in
                     if group.title.isEmpty {
                         ForEach(group.items) { item in
-                            row(item).tag(item.path)
-                                .fileItemInteractions(item, files: files)
+                            selectableRow(item)
                         }
                     } else {
                         Section {
                             ForEach(group.items) { item in
-                                row(item).tag(item.path)
-                                    .fileItemInteractions(item, files: files)
+                                selectableRow(item)
                             }
                         } header: {
                             Text("\(group.title)  (\(group.items.count))")
                                 .font(.caption.weight(.semibold))
+                                .foregroundStyle(files.theme.headerText)
                         }
                     }
                 }
             }
             .environment(\.defaultMinListRowHeight, 22)
             .listStyle(.inset)
+            .scrollContentBackground(customBackdrop ? .hidden : .automatic)
             .alternatingRowBackgrounds()
+            // Drag on empty space to rubber-band select (see `MarqueeLayer`).
+            .overlay(MarqueeLayer(files: files))
+            .dropsIntoCurrentFolder(files)
         }
     }
 
     private var header: some View {
         HStack(spacing: 0) {
             headerCell(.name).frame(maxWidth: .infinity, alignment: .leading)
+            if showsPermissions {
+                Text("Permissions")
+                    .foregroundStyle(.secondary)
+                    .frame(width: Columns.permissions, alignment: .leading)
+                    .padding(.leading, Columns.gap)
+            }
             headerCell(.size, alignment: .trailing).frame(width: Columns.size, alignment: .trailing)
             headerCell(.kind).frame(width: Columns.kind, alignment: .leading)
                 .padding(.leading, Columns.gap)
@@ -94,6 +116,27 @@ struct FileListView: View {
         .buttonStyle(.plain)
     }
 
+    /// Icon + name: the part of a row that drags the file. Beyond it the row
+    /// is whitespace a drag rubber-bands from, as in Finder's list view.
+    private func nameHandleWidth(_ item: MSLFileItem) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: NSFont.systemFontSize)
+        let text = (item.name as NSString).size(withAttributes: [.font: font]).width
+        return 16 + 6 + text + 12
+    }
+
+    /// A row with its interactions and the themed selection highlight.
+    private func selectableRow(_ item: MSLFileItem) -> some View {
+        let selected = files.selection.contains(item.path)
+        return row(item)
+            .fileItemInteractions(item, files: files, dragHandleWidth: nameHandleWidth(item))
+            .listRowBackground(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(selected ? files.theme.selection.opacity(0.30) : .clear)
+                    .overlay(RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(selected ? files.theme.selection.opacity(0.55) : .clear))
+                    .padding(.horizontal, 6))
+    }
+
     private func row(_ item: MSLFileItem) -> some View {
         HStack(spacing: 0) {
             HStack(spacing: 6) {
@@ -103,12 +146,23 @@ struct FileListView: View {
                 } else {
                     Text(item.name).lineLimit(1).truncationMode(.middle)
                 }
+                if let badge = files.gitBadge(for: item) { GitDot(badge: badge) }
+                LinuxTypeBadge(mode: files.linuxMode(for: item), tint: files.theme.companion)
                 Spacer(minLength: 6)
                 // Finder draws tag dots at the trailing edge of the Name
                 // column, not in a column of their own.
                 TagSwatches(tags: item.tags)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+
+            if showsPermissions {
+                Text(files.linuxMode(for: item).map(LinuxFileMode.lsString) ?? "")
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .frame(width: Columns.permissions, alignment: .leading)
+                    .padding(.leading, Columns.gap)
+                    .help("Linux permissions")
+            }
 
             Text(FileFormat.size(item))
                 .foregroundStyle(.secondary).monospacedDigit()
@@ -120,6 +174,46 @@ struct FileListView: View {
             Text(FileFormat.date(item.modified))
                 .foregroundStyle(.secondary)
                 .frame(width: Columns.modified, alignment: .trailing)
+        }
+    }
+}
+
+/// A small glyph marking a Linux file type the file icon can't convey on its
+/// own - a symlink, a named pipe, a socket, a device node. Nothing for a
+/// plain file or folder, and nothing on a Mac root (the mode is nil there),
+/// so it costs a real row nothing.
+/// The git dot on a folder: green when the working tree is clean, red the
+/// moment anything has changed.
+///
+/// **A folder with no dot is not a repository, or could not be read.** The
+/// absence is never "clean" - a repository that timed out produces no badge
+/// at all, precisely so that nothing shows green on the strength of an answer
+/// nobody got.
+///
+/// Red and green alone are the classic pair two people in a hundred cannot
+/// tell apart, so the shape differs too - a filled dot for changes, a ring
+/// for clean - and the tooltip says it in words with a count.
+struct GitDot: View {
+    let badge: Git.Badge
+
+    var body: some View {
+        Image(systemName: badge.isClean ? "circle" : "circle.fill")
+            .font(.system(size: 7, weight: .bold))
+            .foregroundStyle(badge.isClean ? Color.green : Color.red)
+            .help(badge.summary)
+            .accessibilityLabel(badge.summary)
+    }
+}
+
+struct LinuxTypeBadge: View {
+    let mode: UInt32?
+    var tint: Color = .secondary
+    var body: some View {
+        if let mode, let symbol = LinuxFileMode.kind(mode).badgeSymbol {
+            Image(systemName: symbol)
+                .font(.system(size: 9, weight: .semibold))
+                .foregroundStyle(tint)
+                .help(LinuxFileMode.kind(mode).label ?? "")
         }
     }
 }
@@ -150,7 +244,7 @@ struct FileIconGridView: View {
                             HStack {
                                 Text("\(group.title)  (\(group.items.count))")
                                     .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(files.theme.headerText)
                                 Spacer()
                             }
                             .padding(.vertical, 3)
@@ -161,9 +255,10 @@ struct FileIconGridView: View {
             }
             .padding(Design.Spacing.medium)
         }
-        // Clicking empty space clears the selection, as it does in Finder.
-        .contentShape(Rectangle())
-        .onTapGesture { files.selection = [] }
+        // Empty space belongs to the marquee: drag to rubber-band select,
+        // click to clear the selection, as in Finder.
+        .overlay(MarqueeLayer(files: files))
+        .dropsIntoCurrentFolder(files)
     }
 
     private func cell(_ item: MSLFileItem) -> some View {
@@ -171,6 +266,16 @@ struct FileIconGridView: View {
         return VStack(spacing: 4) {
             FileThumbnail(item: item, size: iconSize)
                 .frame(width: iconSize, height: iconSize)
+                // On the icon's corner rather than beside the name: a grid
+                // cell's name is centred and often two lines, so anything
+                // added inline moves as the text reflows.
+                .overlay(alignment: .bottomTrailing) {
+                    if let badge = files.gitBadge(for: item) {
+                        GitDot(badge: badge)
+                            .padding(2)
+                            .background(Circle().fill(.background).opacity(0.9))
+                    }
+                }
             Group {
                 if files.renaming == item.path {
                     RenameField(name: item.name) { files.rename(item, to: $0) }
@@ -185,7 +290,7 @@ struct FileIconGridView: View {
                         .padding(.vertical, 1)
                         .background(
                             RoundedRectangle(cornerRadius: 4)
-                                .fill(selected ? Color.accentColor : .clear))
+                                .fill(selected ? files.theme.selection : .clear))
                         .foregroundStyle(selected ? Color.white : .primary)
                 }
             }
@@ -205,6 +310,9 @@ struct FileIconGridView: View {
 /// separately - see `FilesModel.columnChain` for why that matters.
 struct FileColumnView: View {
     @ObservedObject var files: FilesModel
+    /// True when the window shows a Darker surface or a tinted wash behind
+    /// the files; the list then drops its own opaque background.
+    @Environment(\.filesCustomBackdrop) private var customBackdrop
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -239,6 +347,8 @@ struct FileColumnView: View {
                 HStack(spacing: 6) {
                     FileIcon(item: item, size: 16)
                     Text(item.name).lineLimit(1).truncationMode(.middle)
+                    if let badge = files.gitBadge(for: item) { GitDot(badge: badge) }
+                    LinuxTypeBadge(mode: files.linuxMode(for: item), tint: files.theme.companion)
                     Spacer(minLength: 4)
                     TagSwatches(tags: item.tags, diameter: 7)
                     if item.isBrowsableDirectory {
@@ -249,7 +359,7 @@ struct FileColumnView: View {
                 .padding(.vertical, 1)
                 .listRowBackground(
                     column.selected == item.path
-                        ? RoundedRectangle(cornerRadius: 4).fill(Color.accentColor.opacity(0.85))
+                        ? RoundedRectangle(cornerRadius: 4).fill(files.theme.selection.opacity(0.85))
                         : nil)
                 .foregroundStyle(column.selected == item.path ? Color.white : .primary)
                 // Single click moves through columns here - that is what
@@ -260,7 +370,15 @@ struct FileColumnView: View {
             }
         }
         .listStyle(.plain)
+        .scrollContentBackground(customBackdrop ? .hidden : .automatic)
         .environment(\.defaultMinListRowHeight, 22)
+        // Each column drops into the folder that column is showing, not into
+        // whichever one happens to be selected.
+        .fileDropTarget {
+            files.canWrite ? column.path : nil
+        } receive: { urls, destination in
+            files.receive(urls, into: destination)
+        }
     }
 }
 
@@ -312,10 +430,10 @@ struct FileGalleryView: View {
                             .padding(3)
                             .background(
                                 RoundedRectangle(cornerRadius: 6)
-                                    .fill(selected ? Color.accentColor.opacity(0.35) : .clear))
+                                    .fill(selected ? files.theme.selection.opacity(0.35) : .clear))
                             .overlay(
                                 RoundedRectangle(cornerRadius: 6)
-                                    .strokeBorder(selected ? Color.accentColor : .clear))
+                                    .strokeBorder(selected ? files.theme.selection : .clear))
                             .id(item.path)
                             .fileItemInteractions(item, files: files)
                     }
@@ -433,6 +551,205 @@ struct FileInspector: View {
 }
 
 // MARK: - Quick Look
+
+// MARK: - Quick Look sheet
+
+/// The space-bar Quick Look: a real preview beside an info panel.
+///
+/// The old sheet was `QLPreviewView` alone, which draws *nothing* for a folder
+/// (the common case here) and nothing for a file whose type it can't preview,
+/// so the peek looked broken. This keeps the live preview where there is one
+/// and always shows the metadata Finder's Quick Look puts in its title bar and
+/// More-Info: kind, size, dates, and - the part Finder can't - the real Linux
+/// permissions. For a folder it counts what's inside.
+struct QuickLookSheet: View {
+    let item: MSLFileItem
+    @ObservedObject var files: FilesModel
+    let onClose: () -> Void
+
+    @State private var folderStats: FolderStats?
+    @State private var textPreview: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                FileIcon(item: item, size: 16)
+                Text(item.name).font(.headline).lineLimit(1).truncationMode(.middle)
+                LinuxTypeBadge(mode: files.linuxMode(for: item), tint: files.theme.companion)
+                Spacer()
+                Button("Open") { files.open(item); onClose() }
+                Button("Done", action: onClose).keyboardShortcut(.defaultAction)
+            }
+            .padding(Design.Spacing.medium)
+            Divider()
+            HStack(spacing: 0) {
+                previewArea
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Divider()
+                infoPanel
+                    .frame(width: 240)
+            }
+            // Space and Escape both dismiss, as they do in Finder's Quick Look.
+            // Zero-sized so they only register the key equivalents.
+            Group {
+                Button("", action: onClose).keyboardShortcut(.space, modifiers: [])
+                Button("", action: onClose).keyboardShortcut(.cancelAction)
+            }
+            .opacity(0).frame(width: 0, height: 0)
+        }
+        .frame(minWidth: 720, minHeight: 460)
+        .task(id: item.path) {
+            folderStats = nil
+            textPreview = nil
+            if item.isBrowsableDirectory {
+                folderStats = await FolderStats.load(item.path, provider: files.currentProvider)
+            } else if item.size <= UInt64(QuickLookSheet.textPreviewLimit) {
+                textPreview = await Self.loadTextPreview(item.path)
+            }
+        }
+    }
+
+    /// A text file preview reads up to this much - enough to fill the pane,
+    /// far short of loading a log the size of a disk.
+    static let textPreviewLimit = 512 * 1024
+
+    /// The head of a file, decoded as text, or nil if it isn't text. Off the
+    /// main actor: the read goes over the WebDAV mount for a guest file. This
+    /// is what makes the peek show *something* for the config files and
+    /// scripts `QLPreviewView` draws blank.
+    static func loadTextPreview(_ path: String) async -> String? {
+        let limit = textPreviewLimit
+        return await Task.detached(priority: .userInitiated) { () -> String? in
+            guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else { return nil }
+            defer { try? handle.close() }
+            guard let data = try? handle.read(upToCount: limit) else { return nil }
+            guard TextFileKind.looksTextual(sample: data.prefix(TextFileKind.sniffByteCount)) else { return nil }
+            return String(decoding: data, as: UTF8.self)
+        }.value
+    }
+
+    @ViewBuilder private var previewArea: some View {
+        if item.isBrowsableDirectory {
+            // A folder has no Quick Look content, so show it as itself, big -
+            // the same move Finder makes.
+            VStack(spacing: 12) {
+                FileThumbnail(item: item, size: 128)
+                if let stats = folderStats {
+                    Text(stats.summaryLine).foregroundStyle(.secondary)
+                } else {
+                    ProgressView().controlSize(.small)
+                }
+            }
+        } else if let text = textPreview {
+            // A real text peek for the extensionless configs and scripts that
+            // QLPreviewView shows nothing for.
+            ScrollView([.vertical, .horizontal]) {
+                Text(text)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(Design.Spacing.medium)
+            }
+            .background(Color(nsColor: .textBackgroundColor))
+        } else {
+            QuickLookPreview(url: URL(fileURLWithPath: item.path))
+                .padding(1)
+        }
+    }
+
+    private var infoPanel: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                infoGroup("General") {
+                    infoRow("Kind", kindLine)
+                    if item.isBrowsableDirectory {
+                        // No "Size" for a folder: this counts only the
+                        // immediate level, so a folder of folders would read
+                        // "Zero KB" and look broken. The count is the honest
+                        // figure a quick peek can give without a full walk.
+                        if let stats = folderStats {
+                            infoRow("Contains", stats.containsLine)
+                            if stats.totalSize > 0 {
+                                infoRow("Files here", ByteCountFormatter.string(
+                                    fromByteCount: Int64(stats.totalSize), countStyle: .file))
+                            }
+                        }
+                    } else {
+                        infoRow("Size", FileFormat.size(item))
+                    }
+                    infoRow("Where", (item.path as NSString).deletingLastPathComponent)
+                    infoRow("Created", FileFormat.date(item.created))
+                    infoRow("Modified", FileFormat.date(item.modified))
+                }
+                if let mode = files.linuxMode(for: item) {
+                    infoGroup("Linux") {
+                        infoRow("Permissions", LinuxFileMode.lsString(mode))
+                        infoRow("Octal", LinuxFileMode.octalString(mode))
+                        if let linux = files.guestPath(forHostPath: item.path) {
+                            infoRow("Path", linux)
+                        }
+                    }
+                }
+                if !item.tags.isEmpty {
+                    infoGroup("Tags") {
+                        Text(item.tags.map(\.name).joined(separator: ", "))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(Design.Spacing.medium)
+        }
+    }
+
+    private var kindLine: String {
+        if let mode = files.linuxMode(for: item), let label = LinuxFileMode.kind(mode).label {
+            return label
+        }
+        return item.kind ?? (item.isDirectory ? "Folder" : "Document")
+    }
+
+    private func infoGroup(_ title: String, @ViewBuilder content: () -> some View) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+            content()
+        }
+    }
+
+    private func infoRow(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(label).font(.caption2).foregroundStyle(.tertiary)
+            Text(value).font(.caption).textSelection(.enabled)
+                .lineLimit(3).truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+}
+
+/// One directory's immediate contents, counted. Immediate rather than
+/// recursive on purpose: a recursive walk of a guest tree over the WebDAV
+/// mount would make a "quick" look anything but. It's the same figure Finder
+/// shows first, before its own slower recursive total catches up.
+struct FolderStats: Equatable {
+    let folders: Int
+    let files: Int
+    let totalSize: UInt64
+
+    var summaryLine: String {
+        "\(folders + files) item\(folders + files == 1 ? "" : "s")"
+    }
+    var containsLine: String {
+        "\(folders) folder\(folders == 1 ? "" : "s"), \(files) file\(files == 1 ? "" : "s")"
+    }
+
+    static func load(_ path: String, provider: LocalFileProvider?) async -> FolderStats {
+        guard let provider else { return FolderStats(folders: 0, files: 0, totalSize: 0) }
+        let entries = (try? await provider.list(path)) ?? []
+        let folders = entries.filter(\.isDirectory).count
+        let size = entries.filter { !$0.isDirectory }.reduce(UInt64(0)) { $0 + $1.size }
+        return FolderStats(folders: folders, files: entries.count - folders, totalSize: size)
+    }
+}
 
 /// A real Quick Look preview.
 ///

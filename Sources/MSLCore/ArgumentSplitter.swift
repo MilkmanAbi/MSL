@@ -24,10 +24,11 @@ import Foundation
 /// applied from the very front. The rule is therefore per-command:
 ///
 /// - Options are always consumed from the front, before any name.
-/// - A command with a **verbatim tail** (`--`, `gui`, `gui-native`, or a
-///   bare instance name) consumes options only while they sit at the front
-///   of what follows its name; from the first non-option token onward,
-///   every argument belongs to the guest untouched.
+/// - A command with a **verbatim tail** (`--`, `run`, `gui`, `gui-native`,
+///   or a bare instance name) consumes options while they sit either side
+///   of its instance name - `msl run -u root work` and `msl run work -u
+///   root` are the same request - and from the first non-option token
+///   after that, every argument belongs to the guest untouched.
 /// - Any other subcommand takes fixed arguments and no guest command, so
 ///   options are recognised anywhere within it.
 public enum ArgumentSplitter {
@@ -36,26 +37,42 @@ public enum ArgumentSplitter {
         public var distro: String?
         public var user: String?
         public var manifest: String?
+        /// Where `--shipment` should write, and the note to put in it.
+        public var output: String?
+        public var note: String?
+        /// `msl <instance> --shipment` - a bare flag, not a `--flag value`
+        /// pair, which is why the scanners below check for booleans first.
+        public var shipment = false
         /// The subcommand or instance name and its arguments, with this
         /// CLI's own options removed.
         public var remainder: [String]
 
         public init(distro: String? = nil, user: String? = nil,
-                    manifest: String? = nil, remainder: [String] = []) {
+                    manifest: String? = nil, output: String? = nil, note: String? = nil,
+                    shipment: Bool = false, remainder: [String] = []) {
             self.distro = distro
             self.user = user
             self.manifest = manifest
+            self.output = output
+            self.note = note
+            self.shipment = shipment
             self.remainder = remainder
         }
     }
 
     /// Commands whose trailing arguments are a command line for the guest
     /// rather than arguments for `msl`.
-    static let verbatimTail: Set<String> = ["--", "gui", "gui-native"]
+    ///
+    /// Defined in `CLICommands` so the dispatch in `main.swift` and this
+    /// parser cannot disagree about which commands have a guest tail. Being
+    /// on the wrong list is not a cosmetic mistake: a verbatim-tail command
+    /// listed as fixed-arity has its guest's flags eaten (see the tests
+    /// above this file's `split`).
+    static var verbatimTail: Set<String> { CLICommands.verbatimTail }
 
     /// How many tokens a verbatim-tail command takes before the tail
     /// starts: `--` is followed immediately by the command, while `gui`
-    /// takes an instance name first.
+    /// and `run` take an instance name first.
     private static func namesConsumed(by command: String) -> Int {
         command == "--" ? 1 : 2
     }
@@ -87,13 +104,27 @@ public enum ArgumentSplitter {
 
         // 4. A verbatim-tail command, or a bare instance name. Keep its
         //    name(s), then options only while they lead.
-        let names = verbatimTail.contains(token) ? namesConsumed(by: token) : 1
-        let nameEnd = min(index + names, argv.count)
-        var remainder = Array(argv[index..<nameEnd])
+        let isCommand = verbatimTail.contains(token)
+        var remainder = [token]
+        var cursor = index + 1
 
-        var tailIndex = nameEnd
-        tailIndex = consumeOptions(argv, from: tailIndex, into: &options, stopAtNonOption: true)
-        remainder.append(contentsOf: argv[tailIndex...])
+        // Options may sit *between* the command word and the name:
+        // `msl run -u root work` is the same request as `msl run work -u
+        // root`, and people who come from WSL put flags first. Only for a
+        // real command word - for a bare instance name, `token` is already
+        // the name and anything after it belongs to the guest.
+        if isCommand, namesConsumed(by: token) > 1 {
+            cursor = consumeOptions(argv, from: cursor, into: &options, stopAtNonOption: true)
+            if cursor < argv.count {
+                remainder.append(argv[cursor])
+                cursor += 1
+            }
+        }
+
+        // Then options again, after the name, which is the documented
+        // `msl <instance> -u root` form.
+        cursor = consumeOptions(argv, from: cursor, into: &options, stopAtNonOption: true)
+        remainder.append(contentsOf: argv[cursor...])
         options.remainder = remainder
         return options
     }
@@ -105,8 +136,15 @@ public enum ArgumentSplitter {
         case "--distro", "-d": return \.distro
         case "--user", "-u": return \.user
         case "--manifest": return \.manifest
+        case "--output", "-o": return \.output
+        case "--note": return \.note
         default: return nil
         }
+    }
+
+    /// Options that are a flag on their own, with no value after them.
+    private static func booleanKey(_ argument: String) -> WritableKeyPath<Options, Bool>? {
+        argument == "--shipment" ? \.shipment : nil
     }
 
     /// Consumes `--flag value` pairs starting at `from`, stopping at the
@@ -116,6 +154,11 @@ public enum ArgumentSplitter {
     ) -> Int {
         var index = start
         while index < argv.count {
+            if let flag = booleanKey(argv[index]) {
+                options[keyPath: flag] = true
+                index += 1
+                continue
+            }
             guard let key = optionKey(argv[index]) else { break }
             // A trailing option with no value is left in place so the
             // command's own usage error can report it, rather than being
@@ -134,6 +177,11 @@ public enum ArgumentSplitter {
         var result: [String] = []
         var index = 0
         while index < arguments.count {
+            if let flag = booleanKey(arguments[index]) {
+                options[keyPath: flag] = true
+                index += 1
+                continue
+            }
             if let key = optionKey(arguments[index]), index + 1 < arguments.count {
                 options[keyPath: key] = arguments[index + 1]
                 index += 2

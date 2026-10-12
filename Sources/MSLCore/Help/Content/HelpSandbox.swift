@@ -6,7 +6,7 @@ extension HelpChapter {
     static let sandbox = HelpChapter(
         id: "sandbox", title: "Sandbox Tab", symbol: "lock.shield", tint: .red,
         blurb: "Cut an instance off from the network, your files, graphics or input — and watch what it says.",
-        articles: [.sandbox, .sandboxGates, .trafficMonitor])
+        articles: [.sandbox, .sandboxGates, .trafficMonitor, .guestVPN])
 }
 
 extension HelpArticle {
@@ -111,6 +111,13 @@ extension HelpArticle {
         | Stop an instance from putting windows on your screen | Graphics |
         | Look but don't touch | Keyboard & mouse |
         | Everything, for something you don't trust | **Seal it** |
+        
+        ## This one matters for a protected image {#protect}
+
+        The Mac home share is how instance disks are reachable from inside a guest: they live in your home folder,
+        and the share is writable. If you are keeping an image from being copied, cutting this gate is the first
+        step — see [Protecting an image](help:instances-protect).
+
         """#)
 
     static let trafficMonitor = HelpArticle(
@@ -166,5 +173,58 @@ extension HelpArticle {
         > [!NOTE] Only while it's running
         > If the instance isn't running, this lane says so — and won't start it just to look, since that would change
         > the very thing you're watching.
+        """#)
+
+    static let guestVPN = HelpArticle(
+        id: "guest-vpn", title: "A VPN inside one instance", symbol: "network.badge.shield.half.filled",
+        summary: "Installing the hide.me client in an instance, and exactly whose traffic it covers.",
+        keywords: ["vpn", "hide.me", "hideme", "wireguard", "tunnel", "privacy", "ip", "location"],
+        related: ["sandbox", "sandbox-gates", "trouble-network", "traffic-monitor"],
+        body: #"""
+        The Sandbox tab can install the **hide.me** VPN client inside one instance. What it covers is the
+        important part.
+
+        ## It covers that instance, and nothing else {#scope}
+
+        > [!IMPORTANT] Not your Mac, and not your other instances
+        > The tunnel is a WireGuard interface **inside that one Linux**. Your Mac's own traffic is untouched, and
+        > so is every other instance. A VPN switch in a Mac app looks like it covers the Mac, so this is worth
+        > being clear about.
+
+        That is also what makes it useful: one instance can be somewhere else while everything else on your Mac
+        carries on normally.
+
+        ## What MSL does and does not do {#what-msl-does}
+
+        | MSL does | MSL does not |
+        |---|---|
+        | Install the official client, at a pinned version whose exact contents it checks | Handle your account, password or access token |
+        | Report whether the client is installed, whether the kernel can do WireGuard, whether you are logged in and whether a tunnel is up | Wrap the client's own commands in a button |
+        | Tell you the next step, in the client's own words | Connect or disconnect for you |
+
+        Connecting is you, in your own instance, with your own credentials:
+
+        ```
+        sudo hide.me token <server>
+        sudo hide.me connect <server>
+        ```
+
+        The card tells you which of those is next.
+
+        ## The checks it reports {#checks}
+
+        | Check | Why it matters |
+        |---|---|
+        | **Installed** | The client is present in the instance. |
+        | **WireGuard** | The instance's kernel can carry the tunnel. Without it the client cannot connect at all. |
+        | **Logged in** | An access token is present. |
+        | **Connected** | A tunnel interface exists right now. |
+
+        WireGuard is checked *before* you get as far as an account, because finding out afterwards is a poor way
+        to spend ten minutes.
+
+        > [!NOTE] It needs the network gate open
+        > A VPN is still network traffic. With the Sandbox's **Network** gate closed nothing connects, including
+        > this.
         """#)
 }

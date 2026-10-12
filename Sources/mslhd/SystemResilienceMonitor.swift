@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import MSLCore
+import Network
 import IOKit
 import IOKit.pwr_mgt
 import IOKit.ps
@@ -176,6 +177,43 @@ final class SystemResilienceMonitor {
         registerForPowerNotifications()
         registerForPowerSourceNotifications()
         registerForWorkspaceNotifications()
+        watchNetworkChanges()
+    }
+
+    // MARK: - The Mac changing networks
+
+    private let pathMonitor = NWPathMonitor()
+    private var lastPathSignature: String?
+    private var pendingNetworkRefresh: DispatchWorkItem?
+
+    /// A guest's resolver has to follow the Mac from one network to the next
+    /// (see `GuestDNS.automaticScript`), so every running instance is
+    /// re-checked when the Mac's network changes. Debounced: joining a wifi
+    /// network reports several paths in a burst, and only where it settles
+    /// matters. The first report is the network at launch, which each
+    /// instance's own start already handled.
+    private func watchNetworkChanges() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            guard let self else { return }
+            let signature = "\(path.status)|" + path.availableInterfaces.map(\.name).joined(separator: ",")
+            DispatchQueue.main.async {
+                defer { self.lastPathSignature = signature }
+                guard let previous = self.lastPathSignature, previous != signature,
+                      path.status == .satisfied else { return }
+                self.pendingNetworkRefresh?.cancel()
+                let work = DispatchWorkItem { [weak self] in
+                    guard let self else { return }
+                    self.log("Mac network changed - rechecking guest DNS")
+                    let running = self.managersSnapshot().filter { $0.currentState() == .running }
+                    Task {
+                        for manager in running { await manager.refreshGuestDNS(reason: "network change") }
+                    }
+                }
+                self.pendingNetworkRefresh = work
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
+            }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "msl.network-path"))
     }
 
     // MARK: - Logging out and switching users
@@ -373,8 +411,33 @@ final class SystemResilienceMonitor {
     /// After a wake, the *guests* are fine - they were frozen - but a lot of
     /// state around them is not, and none of it announces itself. Each of
     /// these surfaces later as an unrelated-looking error.
+    /// Whether this wake is a **dark wake** (Power Nap / maintenance):
+    /// the CPU runs but the display stays off, and macOS usually goes
+    /// straight back to sleep.
+    ///
+    /// `kIOMessageSystemHasPoweredOn` does not distinguish one from a real
+    /// wake, so guests are resumed for both - which means a VM spins up with
+    /// the lid shut, runs a clock resync and a DNS refresh, and is frozen
+    /// again moments later. A dark wake cannot be triggered by hand, so this
+    /// **records** it and changes nothing.
+    ///
+    /// **This signal is not good enough to act on, and must not be.** The
+    /// display can still be asleep at the instant the message arrives on an
+    /// ordinary lid-open wake too, so a real wake may well log this. The
+    /// documented way to tell the two apart is
+    /// `IOPMConnectionGetSystemCapabilities`' graphics capability bit, via
+    /// an `IOPMConnectionCreate` registration - and that is what a real fix
+    /// would have to use. Until the log from a genuine lid open confirms
+    /// this line reads "awake", nobody should skip the resume on the
+    /// strength of it: a wrong answer in that direction leaves every guest
+    /// frozen after a real wake, far worse than the churn it would save.
+    private var wakeLooksDark: Bool {
+        // Only ever used for the log line - see the warning above.
+        CGDisplayIsAsleep(CGMainDisplayID()) != 0
+    }
+
     private func handleWake() {
-        log("host woke from sleep")
+        log("host woke from sleep (display \(wakeLooksDark ? "still asleep - MAY be a dark wake, not conclusive" : "awake"))")
 
         // Every vsock connection died with the sleep; the daemon's session
         // counts and per-instance connection tables are now fiction.
@@ -412,6 +475,7 @@ final class SystemResilienceMonitor {
             if !toResume.isEmpty { log("wake: resumed \(resumed) instance(s) that sleep froze") }
             for manager in managersSnapshot() where manager.currentState() == .running {
                 await manager.resyncGuestClock()
+                await manager.refreshGuestDNS(reason: "wake")
             }
         }
     }
@@ -513,6 +577,17 @@ final class SystemResilienceMonitor {
     /// running. Exposed to `main.swift` so the same code paths can be driven
     /// by hand for testing - a host power event cannot be simulated any
     /// other way.
+    /// Whether a power response is freezing or saving instances right now.
+    /// `DaemonServer` holds new VM starts until it is not: a start that
+    /// lands mid-response builds a second VM onto the disk the frozen one
+    /// still holds, and fails with "The storage device attachment is
+    /// invalid" (seen 2026-09-28, a command arriving during a low-battery
+    /// hibernate).
+    var isResponding: Bool {
+        actionLock.lock(); defer { actionLock.unlock() }
+        return actionInFlight
+    }
+
     func respond(_ response: Response, reason: String) {
         actionLock.lock()
         if actionInFlight {
@@ -576,10 +651,30 @@ final class SystemResilienceMonitor {
             }
         }
         if response == .pauseAndSave {
+            // Record what is open **before** waiting, so the apps come back
+            // on resume. A power event cannot be vetoed: macOS is going to
+            // sleep whether or not an app wants to argue about it, so unlike
+            // the other two hibernate triggers this one never aborts - it
+            // records, gives them the grace below, and saves regardless.
+            // An app that outlives the grace is saved blind and comes back
+            // without windows, which is the least-bad option available.
+            for manager in running {
+                let name = manager.configuration.name
+                guard InstanceExperiments.effective(for: name).reopenAppsAfterHibernate else { continue }
+                AppSessionRestore.save(AppSessionRestore.snapshot(instance: name))
+            }
             waitForGUIHostsToExit()
         }
         if !running.isEmpty {
-            _ = quiesced.wait(timeout: .now() + quiesceDeadline)
+            // Logged because this is the step that decides how much recent
+            // work survives a battery dying mid-sleep, and it is invisible
+            // otherwise: reading the code is the only way to tell a sleep
+            // flushed anything, which is exactly how a reviewer concluded
+            // (wrongly, 2026-09-29) that sleep skipped it. `pauseAndSave`
+            // is not the only caller - every response flushes.
+            let flushed = quiesced.wait(timeout: .now() + quiesceDeadline) == .success
+            log("\(reason): flushed \(running.count) guest(s) to disk"
+                + (flushed ? "" : " - ran out of time, some may not have finished"))
         }
 
         // Phase 1 - freeze everything. This is the part that matters, and it
@@ -713,8 +808,12 @@ final class SystemResilienceMonitor {
         return group.wait(timeout: .now() + deadline) == .success
     }
 
+    /// Stamped - see `MSLLog`. Every destructive event in the whole daemon
+    /// (SIGTERM, hibernate, freeze, save, wake) goes through this one
+    /// function, so stamping it is what makes "when did the VM stop?"
+    /// answerable at all.
     private func log(_ message: String) {
-        FileHandle.standardError.write("mslhd[power]: \(message)\n".data(using: .utf8)!)
+        MSLLog.line("mslhd[power]", message)
     }
 }
 

@@ -50,6 +50,23 @@ final class X11KeyboardState: @unchecked Sendable {
         return tracker.snapshot(modMap: visibleMap(map))
     }
 
+    /// The 32-byte "which keys are down" vector `QueryKeymap` answers
+    /// with: bit `keycode % 8` of byte `keycode / 8`.
+    ///
+    /// Built from the same held-key set the events come from, so the two
+    /// cannot disagree - which is the whole point of the request. Qt
+    /// re-syncs modifier state from it on focus-in, and hidden modifiers
+    /// (the Command keys, while the shortcut remapper owns them) stay
+    /// hidden here too.
+    var keymapVector: [UInt8] {
+        lock.lock(); defer { lock.unlock() }
+        var bits = [UInt8](repeating: 0, count: 32)
+        for keycode in heldKeys.union(tracker.held) where !hidden.contains(keycode) {
+            bits[Int(keycode) / 8] |= UInt8(1 << (Int(keycode) % 8))
+        }
+        return bits
+    }
+
     func setHiddenModifiers(_ keycodes: Set<UInt8>) {
         lock.lock(); defer { lock.unlock() }
         hidden = keycodes

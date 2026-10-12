@@ -109,7 +109,18 @@ enum X11AppIdentity {
             let base = ptr.baseAddress!
             while got < count {
                 let n = Darwin.read(fd, base + got, count - got)
-                if n <= 0 { return false }
+                if n < 0 {
+                    // A read interrupted by a signal is not a failure, and
+                    // treating it as one here was worse than it looks: the
+                    // caller answers with an empty announcement and the
+                    // bytes already read are DISCARDED, so the client's
+                    // X11 setup request arrives truncated and the
+                    // handshake never completes. `X11Connection.readFull`
+                    // in this same codebase handles both cases.
+                    if errno == EINTR || errno == EAGAIN { continue }
+                    return false
+                }
+                if n == 0 { return false } // peer closed
                 got += n
             }
             return true

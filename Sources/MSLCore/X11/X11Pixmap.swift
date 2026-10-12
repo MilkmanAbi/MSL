@@ -30,5 +30,5 @@ final class X11Pixmap: X11Drawable {
         bitmapContext = makeFlippedBitmapContext(width: pixelWidth, height: pixelHeight)
     }
 
-    func notifyChanged() {} // nothing on-screen to redraw until a CopyArea pulls from this
+    func notifyChanged(damage: CGRect?) {} // nothing on-screen to redraw until a CopyArea pulls from this
 }

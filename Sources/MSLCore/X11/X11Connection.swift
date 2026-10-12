@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import IOKit.pwr_mgt
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -26,6 +27,33 @@ final class X11Connection: NSObject {
 
     private var littleEndian = true
     private var sequenceNumber: UInt16 = 0
+
+    /// The same value as `currentRequestSequence`, readable from any thread.
+    ///
+    /// **Events must carry the sequence of the last request PROCESSED**, not
+    /// the last one read off the socket. Before reading and dispatch were
+    /// split those were the same number, so every event builder could read
+    /// `sequenceNumber` safely. The split made the reader run ahead - measured
+    /// at 33 requests on average, 46 at peak under GIMP churn - and an event
+    /// stamped ahead of a reply the client is still waiting for is fatal:
+    /// libxcb's `read_packet` advances `request_read` to the arriving packet's
+    /// sequence and frees every pending reply at or below it, so
+    /// `xcb_wait_for_reply` returns NULL with no error, and libX11's `_XReply`
+    /// has no reading of that except a dead connection - `_XIOError`, then
+    /// GDK's `_exit(1)`. The socket is fine throughout, which is why
+    /// `xcb_connection_has_error()` is 0 in every recorded death.
+    private var lastProcessedSequence: UInt16 = 0
+    private let sequenceLock = NSLock()
+
+    /// What every event and every hand-rolled reply must stamp.
+    private var stampSequence: UInt16 {
+        sequenceLock.lock(); defer { sequenceLock.unlock() }
+        return lastProcessedSequence
+    }
+
+    /// The sequence of the request currently being dispatched - what its
+    /// reply and any error must carry. See the note in the read loop.
+    private var currentRequestSequence: UInt16 = 0
     /// A real X11 `TIMESTAMP` (milliseconds, server-defined reference
     /// point - doesn't need to be wall-clock-accurate, just monotonic
     /// and reflective of REAL elapsed time between events) - `.systemUptime`
@@ -43,23 +71,93 @@ final class X11Connection: NSObject {
     /// disambiguate from) a double-click gesture. `UInt32` wraps after
     /// ~49 days of uptime, which is fine - X11 timestamps are DEFINED to
     /// wrap and clients are required to handle it.
-    private var currentX11Timestamp: UInt32 { UInt32(truncatingIfNeeded: Int(ProcessInfo.processInfo.systemUptime * 1000)) }
+    private var currentX11Timestamp: UInt32 { Self.x11Now }
+
+    /// This server's clock, in the milliseconds X11 timestamps are counted
+    /// in. `static` so anything outside a connection - `X11Clipboard`
+    /// taking a selection on the Mac's behalf - stamps its events from the
+    /// same source rather than inventing a second one.
+    static var x11Now: UInt32 { UInt32(truncatingIfNeeded: Int(ProcessInfo.processInfo.systemUptime * 1000)) }
     private var resourceIdBase: UInt32 = 0
     private var resourceIdMask: UInt32 = 0
     private var rootWindowID: UInt32 = 0
     private var colormapID: UInt32 = 0
+    /// The `_NET_SUPPORTING_WM_CHECK` window - EWMH's "is a window manager
+    /// running?" token. It is never mapped and never drawn; a client only
+    /// ever reads two properties off it.
+    private var wmCheckWindowID: UInt32 = 0
     /// This client's `XkbPerClientFlags`. DetectableAutoRepeat is the one
     /// that changes what gets sent - see `keyEvent`.
     private var xkbClientFlags: UInt32 = 0
     /// Mac keys whose keyDown the shortcut remapper replaced, so their keyUp
     /// is swallowed rather than delivered unpaired. Main thread only.
     private var remappedMacKeys: Set<UInt16> = []
+    /// Counts this client's keymap reads (`GetKeyboardMapping`, `XkbGetMap`),
+    /// so text injection knows when a client has seen a slot rebinding - see
+    /// `insertText`. Touched on this connection's reader thread and the main
+    /// thread, hence the lock.
+    private var keymapReadsLock = NSLock()
+    private var keymapReadsValue = 0
+    private var keymapReads: Int {
+        keymapReadsLock.lock(); defer { keymapReadsLock.unlock() }
+        return keymapReadsValue
+    }
+    private func noteKeymapRead() {
+        keymapReadsLock.lock(); keymapReadsValue += 1; keymapReadsLock.unlock()
+    }
     /// Observes keyboard layout switches, so the client hears about them.
     private var keymapObserver: NSObjectProtocol?
     /// Buttons currently held down, this connection's one pointer - feeds
     /// `mouseButton`'s `state` field (see its doc comment). Not per-window:
     /// X11's pointer is a single per-connection resource.
     private var pressedButtons: Set<UInt8> = []
+
+    /// GLX contexts and drawables this client made (see `X11GLX.swift`).
+    let glx = X11GLXState()
+
+    /// XI2 version this client negotiated with XIQueryVersion (the lower of
+    /// its request and ours). Gates what XIQueryDevice shows and which
+    /// events it may receive: ScrollClass since 2.1, gestures since 2.4.
+    private var xiVersion: (major: UInt16, minor: UInt16) = (2, 0)
+    private func xiAtLeast(_ major: UInt16, _ minor: UInt16) -> Bool { (xiVersion.major, xiVersion.minor) >= (major, minor) }
+    /// Scroll input state - see `X11ScrollTranslator`. Main thread only.
+    private var scrollTranslator = X11ScrollTranslator()
+    /// Slave devices whose scroll valuators this client has already been
+    /// shown (see `primeScrollValuators`).
+    private var scrollPrimed: Set<UInt16> = []
+    /// The current touchpad scroll gesture's target, for its closing
+    /// zero-delta event (GTK's is_stop).
+    private var touchpadScrollTarget: (window: UInt32, x: Int16, y: Int16)?
+    private var touchpadScrollSerial = 0
+    /// A pinch in progress: its window, whether it goes out as XI 2.4
+    /// gesture events or as the Ctrl+scroll fallback, and the running scale.
+    private var pinch: (window: UInt32, native: Bool, scale: Double)?
+    private var pinchFallback = X11PinchZoomFallback()
+
+    /// Windows whose size changed during a drag but was skipped by the
+    /// live-resize throttle, so `windowDidEndLiveResize` knows to flush
+    /// them. See `windowDidResize`.
+    private var pendingLiveResize: Set<UInt32> = []
+
+    /// `XFixesSelectSelectionInput` subscriptions on this connection:
+    /// window -> selection -> the event mask that window asked for. Per
+    /// connection because the events are delivered down this socket, and
+    /// keyed by window because that is what the event reports back and what
+    /// a client uses to unsubscribe.
+    ///
+    /// **Locked.** Selection ownership is server-wide, so the deliverer runs
+    /// on whatever thread changed it - another connection's reader thread,
+    /// the pasteboard poll, or a disconnect teardown - while this
+    /// connection's own thread is subscribing, unsubscribing or destroying
+    /// windows. A Swift Dictionary read concurrently with a write does not
+    /// merely return a stale value, it corrupts and takes the host process
+    /// with it.
+    private var xfixesSelectionWatches: [UInt32: [UInt32: UInt32]] = [:]
+    private let xfixesLock = NSLock()
+    private var lastLiveResizeAt: TimeInterval = 0
+    /// Set while a trailing flush runs, so the throttle does not swallow
+    /// the very update it scheduled.
+    private var bypassLiveResizeThrottle = false
     /// Most recently mapped ORDINARY (not override-redirect) top-level on
     /// this connection - the fallback "window this menu spawned from" when
     /// a popup sets no `WM_TRANSIENT_FOR` and nothing holds the input
@@ -138,6 +236,7 @@ final class X11Connection: NSObject {
         let flags = fcntl(fd, F_GETFL)
         if flags >= 0 { _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK) }
         guard performHandshake() else { return }
+        handshakeComplete = true
         state.registerConnection(self, clientIndex: clientIndex) // see X11State's doc comment - needed for cross-connection selection events
         DispatchQueue.main.async {
             X11KeymapProvider.shared.startObserving()
@@ -147,6 +246,86 @@ final class X11Connection: NSObject {
             forName: X11KeymapProvider.didChangeNotification, object: nil, queue: .main
         ) { [weak self] _ in self?.keymapDidChange() }
 
+        // Reading and dispatching are separate from here on. See
+        // `readRequests` for why - it is the whole vanishing-apps bug.
+        let reader = Thread { [weak self] in self?.readRequests() }
+        reader.name = "x11-reader-\(clientIndex)"
+        reader.stackSize = 512 * 1024
+        reader.start()
+
+        // This thread is now purely the dispatcher. It can take as long as it
+        // likes over any one request without the socket backing up, because
+        // nothing it does holds up the reader.
+        while let request = nextRequest() {
+            currentRequestSequence = request.sequence
+            sequenceLock.lock()
+            lastProcessedSequence = request.sequence
+            sequenceLock.unlock()
+            packetsForThisRequest = 0
+            dispatch(opcode: request.opcode, detail: request.detail, body: request.body)
+            // Extension requests carry replies too, and the core table
+            // above cannot see them: the client that died waiting on
+            // `XRenderQueryFormats` would never have shown up here. RENDER's
+            // reply-carrying minors are QueryVersion(0), QueryPictFormats(1),
+            // QueryPictIndexValues(2) and QueryFilters(29).
+            let isRenderReplyRequest = request.opcode == X11Opcode.renderExtension
+                && [0, 1, 2, 29].contains(Int(request.detail))
+            if Self.repliesRequired.contains(request.opcode) || isRenderReplyRequest,
+               packetsForThisRequest == 0, unansweredReports < 20 {
+                unansweredReports += 1
+                MSLLog.line("x11", "UNANSWERED: opcode \(request.opcode) seq "
+                            + "\(request.sequence) returned without sending anything "
+                            + "- this client will now block in _XReply")
+            }
+        }
+    }
+
+    /// One request, off the wire and waiting its turn.
+    private struct PendingRequest {
+        let sequence: UInt16
+        let opcode: UInt8
+        let detail: UInt8
+        let body: [UInt8]
+    }
+
+    private var pendingRequests: [PendingRequest] = []
+    private var pendingRequestBytes = 0
+    private var peakPendingBytes = 0
+    private var queueFullReports = 0
+    private var readerFinished = false
+    private let requestQueue = NSCondition()
+
+    /// How much unprocessed request data to hold before making the client
+    /// wait. Far above any socket buffer (those are hundreds of KB), so an
+    /// ordinary burst never reaches it, and bounded so a runaway client
+    /// cannot exhaust memory.
+    private static let pendingRequestByteLimit = 32 << 20
+
+    /// Pulls bytes off the socket as fast as the client can send them, and
+    /// does nothing else.
+    ///
+    /// **This is the fix for the bug that made GUI apps vanish.** Dispatch
+    /// used to run inline here, so any slow handler - drawing, image
+    /// transfer, anything hopping to the main thread - stopped this loop
+    /// from reading. A client repainting hard then filled its send buffer,
+    /// started getting short writes, and the next time it needed a reply it
+    /// could not flush its pending requests to ask for one. Xlib treats a
+    /// flush that cannot complete as a fatal I/O error, and GDK's handler
+    /// calls `_exit(1)`: no signal, no core, no crash report, the app simply
+    /// gone mid-frame. Measured at death: 672 MB written against 27 MB read,
+    /// and `xcb_connection_has_error() == 0` every time, because nothing was
+    /// ever wrong with the socket. See READMES/28-THE-VANISHING-APPS-BUG.md.
+    ///
+    /// Requests are queued in arrival order and keep the sequence number they
+    /// were given here, so the stream stays exactly ordered: X11 is a stream
+    /// protocol and a reply must carry its own request's sequence.
+    private func readRequests() {
+        defer {
+            requestQueue.lock()
+            readerFinished = true
+            requestQueue.broadcast()
+            requestQueue.unlock()
+        }
         while true {
             guard let header = readFull(4) else { break }
             let opcode = header[0]
@@ -163,13 +342,28 @@ final class X11Connection: NSObject {
             // ever sent `BigReqEnable`) is safe for the same reason and
             // avoids tracking an extra per-connection flag for it.
             var length = UInt32(shortLength)
+            var headerBytes = header
             if shortLength == 0 {
                 guard let extended = readFull(4) else { break }
+                headerBytes += extended
                 length = littleEndian
                     ? (UInt32(extended[3]) << 24 | UInt32(extended[2]) << 16 | UInt32(extended[1]) << 8 | UInt32(extended[0]))
                     : (UInt32(extended[0]) << 24 | UInt32(extended[1]) << 16 | UInt32(extended[2]) << 8 | UInt32(extended[3]))
             }
             guard length >= 1 else { break } // every request is at least one 4-byte unit (its own header)
+            // And no larger than the maximum this server advertised. With
+            // BIG-REQUESTS the length is a full CARD32, so four bytes on
+            // the wire could ask `readFull` for a ~17 GB allocation -
+            // `handleBigReqEnable` publishes a 4,000,000-unit ceiling and
+            // nothing was enforcing it. This matters most once a stream
+            // has desynced for any other reason: the next four bytes read
+            // as a length are then effectively random, and the server
+            // would try to allocate the average of a uniform 32-bit number
+            // rather than failing cleanly.
+            guard length <= Self.maxRequestLengthUnits else {
+                sendError(code: X11ErrorCode.length, badValue: length, minorOpcode: 0, majorOpcode: opcode)
+                break
+            }
             let bodyByteCount = Int(length) * 4 - 4 - (shortLength == 0 ? 4 : 0)
             var body: [UInt8] = []
             if bodyByteCount > 0 {
@@ -177,11 +371,125 @@ final class X11Connection: NSObject {
                 body = read
             }
             sequenceNumber = sequenceNumber &+ 1
-            dispatch(opcode: opcode, detail: detail, body: body)
+            noteRequest("seq \(sequenceNumber) op \(opcode).\(detail) len \(length)"
+                        + (shortLength == 0 ? " (big)" : ""))
+            capture?.record(header: headerBytes, body: body)
+
+            // `sequenceNumber`, NOT `stampSequence`: this is where a request is
+            // GIVEN its sequence, so it must be the counter the reader just
+            // advanced. Taking the processed counter here stamps every request
+            // with its predecessor's number - and a reply below the request a
+            // client is waiting on is never matched by xcb, so the client
+            // hangs forever. (It arrived as collateral from a blanket rename
+            // of `sequence: sequenceNumber` across the event builders.)
+            let request = PendingRequest(sequence: sequenceNumber, opcode: opcode,
+                                         detail: detail, body: body)
+            requestQueue.lock()
+            // Back-pressure, not loss: wait for the dispatcher rather than
+            // drop anything. A dropped request is a reply that never comes,
+            // which is the failure this whole change exists to remove.
+            if pendingRequestBytes > Self.pendingRequestByteLimit, !writeClosed,
+               queueFullReports < 10 {
+                queueFullReports += 1
+                // If this fires, splitting reading from dispatch was not
+                // enough on its own: the DISPATCHER is now the bottleneck,
+                // the queue is full, and the reader parks here - which puts
+                // the socket right back where it was.
+                MSLLog.line("x11", "QUEUE FULL: \(pendingRequestBytes) bytes of "
+                            + "unprocessed requests - the reader is now waiting on "
+                            + "the dispatcher, and the socket will back up again")
+            }
+            while pendingRequestBytes > Self.pendingRequestByteLimit, !writeClosed {
+                requestQueue.wait()
+            }
+            // How deep the queue ever got, reported at disconnect: the direct
+            // measure of whether dispatch keeps up with the wire.
+
+            pendingRequests.append(request)
+            pendingRequestBytes += body.count + 32
+            // After the append, or it always reads zero.
+            if pendingRequestBytes > peakPendingBytes { peakPendingBytes = pendingRequestBytes }
+            requestQueue.signal()
+            requestQueue.unlock()
         }
     }
 
+    /// The next request in arrival order, or nil once the client is gone and
+    /// everything it sent has been handled.
+    private func nextRequest() -> PendingRequest? {
+        requestQueue.lock()
+        defer { requestQueue.unlock() }
+        while pendingRequests.isEmpty, !readerFinished {
+            requestQueue.wait()
+        }
+        guard !pendingRequests.isEmpty else { return nil }
+        let request = pendingRequests.removeFirst()
+        pendingRequestBytes -= request.body.count + 32
+        // The reader may be parked on the limit.
+        requestQueue.signal()
+        return request
+    }
+
+    /// Request recorder, when `MSL_X11_CAPTURE_DIR` is set (see
+    /// `X11Capture`). Made after the handshake: it needs the id range.
+    private lazy var capture: X11Capture? = X11Capture(base: resourceIdBase, mask: resourceIdMask,
+                                                       littleEndian: littleEndian, root: rootWindowID)
+
+    /// The last requests in and packets out, for the dump in
+    /// `cleanupOnDisconnect`.
+    ///
+    /// **Why a ring and not a trace.** The failure this exists for is a
+    /// client dying in `_XReply` while xcb reports no socket error, which
+    /// means a reply was skipped or the sequence numbering drifted. Only
+    /// the handful of packets either side of the death say which. A full
+    /// trace would answer that too, and `MSL_X11_SNAPSHOT_DIR` once took
+    /// mslhd to 100% CPU and 38 GB on a real GTK app - no use for a run
+    /// meant to last an hour. This is fixed-size and always on.
+    private var requestRing: [String] = []
+    private var packetRing: [String] = []
+    private static let ringLimit = 128
+
+    /// Core requests that MUST produce a reply. If a handler returns having
+    /// sent nothing, the client blocks in `_XReply` forever - and Xlib
+    /// eventually calls the I/O error handler, which in GDK is `_exit(1)`.
+    /// That is the whole shape of the vanishing-app bug: 31 recorded deaths,
+    /// every one waiting on a reply, `xcb_connection_has_error() == 0`, and
+    /// GetInputFocus the most common unanswered request.
+    private static let repliesRequired: Set<UInt8> = [
+        3, 14, 15, 16, 17, 20, 21, 23, 26, 31, 38, 39, 40, 43, 44, 47, 48,
+        49, 52, 73, 83, 84, 85, 86, 87, 91, 92, 97, 98, 99, 101, 103, 106,
+        108, 110, 116, 117, 119,
+    ]
+
+    /// Packets written for the request being dispatched. Reset per request.
+    private var packetsForThisRequest = 0
+
+    private func noteRequest(_ text: String) {
+        requestRing.append(text)
+        if requestRing.count > Self.ringLimit { requestRing.removeFirst() }
+    }
+
+    /// Why this client's connection ended, set by whichever path noticed.
+    /// Logged on the way out - see the note in `readFull`.
+    private var disconnectReason: String?
+
     private func cleanupOnDisconnect() {
+        writeLock.lock()
+        let writeSideReason = writeFailure
+        writeLock.unlock()
+        MSLLog.line("x11", "client \(clientIndex) disconnected: "
+                    + (writeSideReason ?? disconnectReason ?? "the read loop ended"))
+        // The last of the wire, both directions. A client that died waiting
+        // in `_XReply` left its request here without a matching reply.
+        writeLock.lock()
+        let outgoing = packetRing.suffix(24).joined(separator: " | ")
+        writeLock.unlock()
+        MSLLog.line("x11", "client \(clientIndex) queue peaked at "
+                    + "\(peakPendingBytes) bytes of unprocessed requests")
+        MSLLog.line("x11", "client \(clientIndex) last requests: "
+                    + requestRing.suffix(24).joined(separator: " | "))
+        MSLLog.line("x11", "client \(clientIndex) last packets out: " + outgoing)
+        releaseScreenSaverSuspension()
         // Stop writers first: the backlog drain must never send on a
         // descriptor number that `close` has freed for reuse.
         writeLock.lock()
@@ -209,10 +517,25 @@ final class X11Connection: NSObject {
         // Ownership is recoverable with no extra bookkeeping - a window
         // ID's high 11 bits are the owning client's index (see
         // `resourceIdBase`).
+        // The same teardown, but XFIXES has a distinct subtype for it: a
+        // watcher is told the selection's CLIENT went away, not merely that
+        // one window did.
+        isDisconnecting = true
         for windowID in state.windowIDs(ownedByClientIndex: clientIndex) {
             destroyWindowRecursive(windowID)
         }
+        // And everything that is not a window. A real server frees all of a
+        // client's resources; mslgd freed only the windows, so pixmaps, GCs,
+        // pictures and glyph sets accumulated for the life of the host
+        // process - which outlives the app's windows on purpose. See
+        // `X11State.releaseResources(ownedByClientIndex:)`. Last, because
+        // the teardown above still reads the records it drops.
+        state.releaseResources(ownedByClientIndex: clientIndex)
     }
+
+    /// Set while `cleanupOnDisconnect` tears this client's windows down, so
+    /// the selection notifies it causes report `SelectionClientClose`.
+    private var isDisconnecting = false
 
     // MARK: - Connection setup
 
@@ -260,8 +583,35 @@ final class X11Connection: NSObject {
         // same effect without restructuring the per-connection ID scheme:
         // a client would need to sequentially self-allocate over two
         // million resources before ever reaching up here.
-        rootWindowID = resourceIdBase | resourceIdMask
-        colormapID = resourceIdBase | (resourceIdMask - 1)
+        // **Fixed, and the SAME for every client.** These used to be
+        // `resourceIdBase | ...`, i.e. per-connection, so three clients were
+        // told three different root windows (measured: 0x103fffff,
+        // 0x105fffff, 0x107fffff). In a real X server the root is ONE
+        // window with ONE id that every client shares, and a surprising
+        // amount depends on that: XDND passes window ids BETWEEN processes
+        // during a drag, EWMH properties name the root, selection owners
+        // are exchanged as ids, and a multi-process app (GIMP and its
+        // plug-ins, Chromium's helpers) hands ids across connections
+        // constantly. Each of those silently addressed the wrong window.
+        //
+        // The space is free because `nextClientIndex` starts at
+        // `hostSlot * 32 + 1`, never 0, so no client's
+        // `resourceIdBase = clientIndex << 21` can ever reach below
+        // 0x00200000. That is the "ID space no client's range ever reaches"
+        // the note above asks for, rather than the top-of-range
+        // approximation it settled for.
+        rootWindowID = 0x0000_0001
+        colormapID = 0x0000_0002
+        wmCheckWindowID = 0x0000_0003
+        // A REAL window record, not just an id. GDK checks for a window
+        // manager by reading `_NET_SUPPORTING_WM_CHECK` off the root, then
+        // reading it again off the window it names and selecting input on
+        // that window - so a phantom id fails the check and the client
+        // concludes there is no WM after all. Never mapped, input-only,
+        // nothing is ever drawn in it.
+        let wmCheck = state.makeWindow(id: wmCheckWindowID, parent: rootWindowID,
+                                       isTopLevel: false, frame: CGRect(x: -1, y: -1, width: 1, height: 1))
+        wmCheck.inputOnly = true
 
         let (screenW, screenH) = Self.mainScreenSizeInPixels()
         let response = X11ConnectionSetup.buildSuccessResponse(.init(
@@ -272,6 +622,8 @@ final class X11Connection: NSObject {
             colormapID: colormapID,
             visualID: visualID,
             argbVisualID: argbVisualID,
+            extraVisuals24: X11GLXConfig.extraVisuals(visualID: visualID, argbVisualID: argbVisualID, depth: 24),
+            extraVisuals32: X11GLXConfig.extraVisuals(visualID: visualID, argbVisualID: argbVisualID, depth: 32),
             screenWidthPixels: screenW,
             screenHeightPixels: screenH
         ))
@@ -292,9 +644,48 @@ final class X11Connection: NSObject {
         writeFull(w.bytes)
     }
 
+    /// The screen the X11 coordinate system is anchored to.
+    ///
+    /// **Not `NSScreen.main`**, which is "the screen with the key window"
+    /// and therefore changes as the user moves focus between displays -
+    /// making the constant this server's whole coordinate space is built
+    /// on not a constant. `NSScreen.screens[0]` is the primary screen: the
+    /// one whose lower-left corner is the origin, and the one the menu bar
+    /// is on. On a single display the two coincide, which is why this
+    /// never showed up.
+    static var primaryScreen: NSScreen? { NSScreen.screens.first ?? NSScreen.main }
+
+    /// The usable height of that screen, for flipping X11's Y-down
+    /// coordinates into Cocoa's Y-up ones. `maxY`, not `height`: a screen
+    /// frame's origin is only (0,0) for the primary display, and anchoring
+    /// on `height` quietly assumed it always is.
+    static var primaryScreenMaxY: CGFloat { primaryScreen?.frame.maxY ?? 1080 }
+
+    /// What this server tells clients the screen is.
+    ///
+    /// `visibleFrame`, not `frame`, and that difference is a bug report:
+    /// AppKit's `constrainFrameRect(_:to:)` will not place a window over
+    /// the menu bar, so advertising the full height invites a client to
+    /// size itself to a height it can never actually have and then get
+    /// silently shrunk at `orderFront`. That is the LibreOffice Math
+    /// symptom in `07-MSLGD-BUGS.md` - "Math asks for 1595x1012 and macOS
+    /// shrinks it to 968 high" - and XQuartz subtracts the menu bar in
+    /// rootless mode for exactly this reason.
+    ///
+    /// This does NOT replace `handleConfigureWindow`'s "leave AppKit
+    /// geometry alone when nothing changed" guard. AppKit can still
+    /// constrain a window for other reasons, and that guard is what stops
+    /// the stale re-grow; both are needed.
     private static func mainScreenSizeInPixels() -> (width: Int, height: Int) {
         var result = (width: 1920, height: 1080)
-        let read = { if let frame = NSScreen.main?.frame { result = (Int(frame.width), Int(frame.height)) } }
+        let read = {
+            // In X pixels: with Native Scaling each pixel is smaller than a
+            // point, so Linux is told about a correspondingly larger screen
+            // and lays its windows out for the room it really has.
+            if let frame = primaryScreen?.visibleFrame {
+                result = (Int(frame.width / X11DisplayScale.factor), Int(frame.height / X11DisplayScale.factor))
+            }
+        }
         if Thread.isMainThread { read() } else { DispatchQueue.main.sync(execute: read) }
         return result
     }
@@ -309,9 +700,15 @@ final class X11Connection: NSObject {
     /// (near the screen's top) lands the window near the BOTTOM instead.
     /// Must run on the main thread (`NSScreen.main`); every call site
     /// already is.
-    private static func cocoaScreenFrame(fromX11 frame: CGRect) -> CGRect {
-        let screenHeight = NSScreen.main?.frame.height ?? 1080
-        return CGRect(x: frame.origin.x, y: screenHeight - frame.origin.y - frame.height, width: frame.width, height: frame.height)
+    ///
+    /// Native Scaling (`X11DisplayScale`): X11 coordinates are in X pixels
+    /// and a pixel is `scale` points, so the whole rect - origin included,
+    /// because the root window is the screen divided by the same factor -
+    /// is multiplied before the flip.
+    static func cocoaScreenFrame(fromX11 frame: CGRect, scale: CGFloat = X11DisplayScale.factor) -> CGRect {
+        let screenMaxY = primaryScreenMaxY
+        return CGRect(x: frame.origin.x * scale, y: screenMaxY - (frame.origin.y + frame.height) * scale,
+                      width: frame.width * scale, height: frame.height * scale)
     }
 
     /// Inverse of `cocoaScreenFrame(fromX11:)` - reads a WINDOW's real,
@@ -343,24 +740,194 @@ final class X11Connection: NSObject {
     /// and correct for exactly this class of silent AppKit adjustment,
     /// not just handle explicit client-driven moves the way
     /// `windowDidMove` already did.
-    private static func x11Frame(fromCocoaWindow window: NSWindow) -> CGRect {
-        let screenHeight = NSScreen.main?.frame.height ?? 1080
+    private static func x11Frame(fromCocoaWindow window: NSWindow, scale: CGFloat = X11DisplayScale.factor) -> CGRect {
+        let screenMaxY = primaryScreenMaxY
         let contentSize = window.contentView?.frame.size ?? window.frame.size
         let contentBottomAppKit = window.frame.origin.y // title bar (if any) extends the frame UPWARD from here, never moves it
         let contentTopAppKit = contentBottomAppKit + contentSize.height
-        return CGRect(x: window.frame.origin.x, y: screenHeight - contentTopAppKit, width: contentSize.width, height: contentSize.height)
+        // Points back to X pixels (Native Scaling); rounded, because a
+        // window AppKit placed at a fractional pixel is still one window.
+        return CGRect(x: (window.frame.origin.x / scale).rounded(), y: ((screenMaxY - contentTopAppKit) / scale).rounded(),
+                      width: (contentSize.width / scale).rounded(), height: (contentSize.height / scale).rounded())
     }
 
     // MARK: - Request dispatch
 
+    /// The gate every core request passes before its handler: minimum
+    /// length and the ids it names. See `X11RequestRules` for the policy and
+    /// the crash that made it necessary. Returns false when an error was
+    /// sent and the handler must not run.
+    private func validateCoreRequest(opcode: UInt8, body: [UInt8]) -> Bool {
+        guard opcode < 128 else { return true }
+        guard let rule = X11RequestRules.core[opcode] else { return true }
+        guard body.count >= rule.minBody else {
+            sendError(code: X11ErrorCode.length, badValue: 0, minorOpcode: 0, majorOpcode: opcode)
+            return false
+        }
+        for (kind, offset) in rule.ids {
+            let id = X11ByteReader(Array(body[offset..<(offset + 4)]), littleEndian: littleEndian).readU32()
+            if let code = invalidResourceError(kind: kind, id: id) {
+                sendError(code: code, badValue: id, minorOpcode: 0, majorOpcode: opcode)
+                return false
+            }
+        }
+        return true
+    }
+
+    /// Value and match errors the handlers never raised - each one found by
+    /// xhell sending exactly that request. Runs after `validateCoreRequest`,
+    /// so every field read here is inside the body. Returns false when an
+    /// error was sent.
+    private func validateCoreValues(opcode: UInt8, detail: UInt8, body: [UInt8]) -> Bool {
+        guard opcode < 128 else { return true }
+        func u8(_ o: Int) -> UInt8 { body[o] }
+        func u16(_ o: Int) -> UInt16 {
+            littleEndian ? UInt16(body[o]) | UInt16(body[o + 1]) << 8 : UInt16(body[o]) << 8 | UInt16(body[o + 1])
+        }
+        func u32(_ o: Int) -> UInt32 {
+            X11ByteReader(Array(body[o..<(o + 4)]), littleEndian: littleEndian).readU32()
+        }
+        func fail(_ code: UInt8, _ value: UInt32 = 0) -> Bool {
+            sendError(code: code, badValue: value, minorOpcode: 0, majorOpcode: opcode)
+            return false
+        }
+        let drawingOps: ClosedRange<UInt8> = 61...77
+
+        switch opcode {
+        case X11Opcode.createWindow:
+            // width/height 0, or a class other than CopyFromParent,
+            // InputOutput, InputOnly.
+            if u16(12) == 0 || u16(14) == 0 { return fail(X11ErrorCode.value) }
+            if u16(18) > 2 { return fail(X11ErrorCode.value, UInt32(u16(18))) }
+        case X11Opcode.createPixmap:
+            if u16(8) == 0 || u16(10) == 0 { return fail(X11ErrorCode.value) }
+            // Every depth Xorg supports, advertised or not (storage is RGBA
+            // whatever the depth). Depth 4 is NOT optional: libXrender's
+            // `XRenderHasDepths` test-creates a 1x1 pixmap at each of
+            // 1/4/8/24/32 the screen doesn't list, and if one fails it
+            // reports RENDER as absent for the whole display. Allowing only
+            // 1/8/24/32 here silently turned RENDER off for every Xlib
+            // client - cairo-xlib (GTK2/GTK3) and Xft (Tk) fell back to
+            // GetImage/PutImage for everything. xhell: ext.xrender-depth-probe.
+            if ![1, 4, 8, 15, 16, 24, 32].contains(detail) { return fail(X11ErrorCode.value, UInt32(detail)) }
+        case X11Opcode.changeProperty:
+            if detail > 2 { return fail(X11ErrorCode.value, UInt32(detail)) }             // mode
+            if ![8, 16, 32].contains(u8(12)) { return fail(X11ErrorCode.value, UInt32(u8(12))) } // format
+        case X11Opcode.createGC, X11Opcode.changeGC:
+            // GCFunction is bit 0, so when present it is the first value.
+            let maskAt = opcode == X11Opcode.createGC ? 8 : 4
+            if u32(maskAt) & 1 != 0, body.count >= maskAt + 8, u32(maskAt + 4) > 15 {
+                return fail(X11ErrorCode.value, u32(maskAt + 4))
+            }
+        case X11Opcode.reparentWindow:
+            // Into itself, or into its own subtree, would make a cycle.
+            let wid = u32(0)
+            var ancestor = u32(4)
+            for _ in 0..<4096 {
+                if ancestor == wid { return fail(X11ErrorCode.match, wid) }
+                guard ancestor != rootWindowID, let up = state.window(ancestor)?.parent, up != ancestor else { break }
+                ancestor = up
+            }
+        case X11Opcode.copyArea:
+            if let a = state.pixmap(u32(0)), let b = state.pixmap(u32(4)), a.depth != b.depth {
+                return fail(X11ErrorCode.match)
+            }
+        case X11Opcode.getImage:
+            // Pixmaps only: a window's readable area depends on the screen.
+            if let p = state.pixmap(u32(0)) {
+                let x = Int(Int16(bitPattern: u16(4))), y = Int(Int16(bitPattern: u16(6)))
+                let w = Int(u16(8)), h = Int(u16(10))
+                if x < 0 || y < 0 || x + w > p.pixelWidth || y + h > p.pixelHeight { return fail(X11ErrorCode.match) }
+            }
+        default:
+            break
+        }
+        // Nothing can be drawn on an InputOnly window.
+        if drawingOps.contains(opcode) || opcode == X11Opcode.copyArea || opcode == 63 {
+            let targets = (opcode == X11Opcode.copyArea || opcode == 63) ? [u32(0), u32(4)] : [u32(0)]
+            if targets.contains(where: { state.window($0)?.inputOnly == true }) { return fail(X11ErrorCode.match) }
+        }
+        return true
+    }
+
+    private enum FlatKind { static let font: UInt8 = 1; static let cursor: UInt8 = 2; static let colormap: UInt8 = 3 }
+
+    /// Untracks a flat resource (font/cursor/colormap - kinds this server
+    /// keeps no real object for). Returns true when it existed; when it did
+    /// not, sends the matching Bad* error, but only for an id in this
+    /// client's own range (a foreign or zero id follows the lenient policy
+    /// of `invalidResourceError`). Found by the xhell suite: freeing one of
+    /// these was a silent no-op where a real server answers BadFont etc.
+    private func freedFlat(_ kind: UInt8, _ id: UInt32, error: UInt8) -> Bool {
+        if state.removeFlatResource(kind, id) { return true }
+        if id != 0, isOwnID(id) {
+            sendError(code: error, badValue: id, minorOpcode: 0, majorOpcode: currentOpcode)
+        }
+        return false
+    }
+
+    private func isOwnID(_ id: UInt32) -> Bool { id & ~resourceIdMask == resourceIdBase }
+
+    /// Whether `id` names a window this server may refuse.
+    ///
+    /// The single rule every window check must use, because two of them get
+    /// it wrong independently otherwise (2026-09-29: SHAPE, XFIXES and
+    /// `RotateProperties` each grew their own check and all three rejected
+    /// the **root window**). Root is a real window with no `WindowRecord` -
+    /// it has no client that created it - and it is an ordinary target:
+    /// `clipnotify` subscribes to selections on it, `XRotateBuffers`
+    /// rotates the cut buffers on it, and transparency tools make a Picture
+    /// of it. Another client's ids are never judged, the policy
+    /// `invalidResourceError` documents.
+    private func windowIsMissing(_ id: UInt32) -> Bool {
+        guard id != rootWindowID, state.window(id) == nil else { return false }
+        return isOwnID(id)
+    }
+
+    /// The error a real server sends for `id` used as `kind`, or nil to let
+    /// the request through (valid, or someone else's id - see the policy).
+    private func invalidResourceError(kind: X11RequestRules.Kind, id: UInt32) -> UInt8? {
+        let windowExists = { id == self.rootWindowID || self.state.window(id) != nil }
+        let reportable = id == 0 || isOwnID(id)
+        switch kind {
+        case .window:
+            return reportable && !windowExists() ? X11ErrorCode.window : nil
+        case .drawable:
+            return reportable && !windowExists() && state.pixmap(id) == nil ? X11ErrorCode.drawable : nil
+        case .pixmap:
+            return reportable && state.pixmap(id) == nil ? X11ErrorCode.pixmap : nil
+        case .gc:
+            return reportable && state.gc(id) == nil ? X11ErrorCode.gContext : nil
+        case .atom:
+            return state.atomName(id) == nil ? X11ErrorCode.atom : nil
+        case .newID:
+            let inUse = id == rootWindowID || state.window(id) != nil || state.pixmap(id) != nil
+                || state.gc(id) != nil || state.picture(id) != nil
+            return !isOwnID(id) || inUse ? X11ErrorCode.idChoice : nil
+        }
+    }
+
+    /// The major opcode being handled, for error replies raised deep inside
+    /// a handler (`sendReply`'s layout guard).
+    private var currentOpcode: UInt8 = 0
+
+    /// The detail byte of the request being handled, for handlers whose
+    /// signature predates needing it (ChangeProperty's mode).
+    private var currentDetail: UInt8 = 0
+
     private func dispatch(opcode: UInt8, detail: UInt8, body: [UInt8]) {
+        currentOpcode = opcode
+        currentDetail = detail
         X11Trace.request(opcode: opcode, detail: detail, bodyCount: body.count)
+        guard validateCoreRequest(opcode: opcode, body: body),
+              validateCoreValues(opcode: opcode, detail: detail, body: body) else { return }
         switch opcode {
         case X11Opcode.createWindow: handleCreateWindow(detail: detail, body: body)
         case X11Opcode.mapWindow: handleMapWindow(body: body)
         case X11Opcode.unmapWindow: handleUnmapWindow(body: body)
         case X11Opcode.destroyWindow: handleDestroyWindow(body: body)
         case X11Opcode.configureWindow: handleConfigureWindow(body: body)
+        case 13: handleCirculateWindow(direction: detail, body: body)
         case X11Opcode.getGeometry: handleGetGeometry(body: body)
         case X11Opcode.createGC: handleCreateGC(body: body)
         case X11Opcode.changeGC: handleChangeGC(body: body)
@@ -380,10 +947,11 @@ final class X11Connection: NSObject {
         // content with stale offscreen-buffer pixels in gaps that were
         // never meant to be touched - see `handleSetClipRectangles`'s and
         // `handleCopyArea`'s own doc comments.
-        case X11Opcode.setClipRectangles: handleSetClipRectangles(body: body)
+        case X11Opcode.setClipRectangles: handleSetClipRectangles(ordering: detail, body: body)
         case X11Opcode.polyFillRectangle: handlePolyFillRectangle(body: body)
         case X11Opcode.clearArea: handleClearArea(detail: detail, body: body)
         case X11Opcode.copyArea: handleCopyArea(body: body)
+        case 63: handleCopyPlane(body: body) // CopyPlane
         case X11Opcode.imageText8: handleImageText8(detail: detail, body: body)
         case X11Opcode.polyText8: handlePolyText8(body: body)
         case X11Opcode.queryTree: handleQueryTree(body: body)
@@ -410,12 +978,19 @@ final class X11Connection: NSObject {
         case X11Opcode.queryExtension: handleQueryExtension(body: body)
         case X11Opcode.listExtensions: handleListExtensions()
         case X11Opcode.renderExtension: handleRenderRequest(minor: detail, body: body)
-        case X11Opcode.bigRequestsExtension: handleBigReqEnable()
+        case X11Opcode.bigRequestsExtension:
+            // BIG-REQUESTS has exactly one request, Enable (minor 0).
+            if detail == 0 { handleBigReqEnable() }
+            else { sendError(code: X11ErrorCode.request, badValue: 0, minorOpcode: UInt16(detail), majorOpcode: opcode) }
+        case X11Opcode.xtestExtension: handleXTestRequest(minor: detail, body: body)
+        case X11Opcode.screenSaverExtension: handleScreenSaverRequest(minor: detail, body: body)
         case X11Opcode.xinputExtension: handleXInputRequest(minor: detail, body: body)
         case X11Opcode.xkbExtension: handleXkbRequest(minor: detail, body: body)
         case X11Opcode.randrExtension: handleRandRRequest(minor: detail, body: body)
         case X11Opcode.xcMiscExtension: handleXCMiscRequest(minor: detail, body: body)
         case X11Opcode.shapeExtension: handleShapeRequest(minor: detail, body: body)
+        case X11Opcode.glxExtension: handleGLXRequest(minor: detail, body: body)
+        case X11Opcode.xfixesExtension: handleXFixesRequest(minor: detail, body: body)
         case X11Opcode.getInputFocus: handleGetInputFocus()
         case X11Opcode.queryPointer: handleQueryPointer(body: body)
         case X11Opcode.translateCoordinates: handleTranslateCoordinates(body: body)
@@ -427,12 +1002,38 @@ final class X11Connection: NSObject {
         case X11Opcode.lookupColor: handleLookupColor(body: body)
         case X11Opcode.mapSubwindows: handleMapSubwindows(body: body)
         case X11Opcode.reparentWindow: handleReparentWindow(body: body)
-        case X11Opcode.createCursor, X11Opcode.createGlyphCursor, X11Opcode.freeCursor, X11Opcode.recolorCursor:
-            break // no reply per spec - no real cursor shapes exist yet (see X11Server's doc comment)
-        case X11Opcode.grabButton, X11Opcode.ungrabButton: break // no reply per spec; single-client grabs aren't meaningfully contested
+        case X11Opcode.createCursor:
+            // No real cursor shapes yet (see X11Server), but the id is
+            // tracked so FreeCursor of an unknown id is BadCursor.
+            //
+            // The source and mask must be real, depth-1 pixmaps. mslgd
+            // accepted anything - an unknown id and a depth-24 pixmap alike
+            // (xdiff `cursor.pixmap`, 2026-09-29) - which hides the client's
+            // own bug until something much later renders wrongly.
+            guard cursorPixmapsAreValid(body: body, opcode: opcode) else { break }
+            state.addFlatResource(FlatKind.cursor, X11ByteReader(body, littleEndian: littleEndian).readU32())
+        case X11Opcode.createGlyphCursor:
+            state.addFlatResource(FlatKind.cursor, X11ByteReader(body, littleEndian: littleEndian).readU32())
+        case X11Opcode.freeCursor:
+            _ = freedFlat(FlatKind.cursor, X11ByteReader(body, littleEndian: littleEndian).readU32(), error: X11ErrorCode.cursor)
+        case X11Opcode.recolorCursor:
+            break // no reply per spec
+        case X11Opcode.grabButton: // no reply per spec; single-client grabs aren't meaningfully contested
+            _ = grabModesAreValid(body: body, offsets: (6, 7), opcode: opcode)
+        case X11Opcode.ungrabButton: break
         // Same for passive key grabs. Every GTK app sends UngrabKey at
         // startup and got BadImplementation for it.
-        case X11Opcode.grabKey, X11Opcode.ungrabKey: break
+        case X11Opcode.grabKey: // window(4), modifiers(2), key(1), then the modes
+            _ = grabModesAreValid(body: body, offsets: (7, 8), opcode: opcode)
+        case X11Opcode.ungrabKey: break
+        case X11Opcode.allowEvents:
+            // The mode rides in the request's detail byte. Eight are
+            // defined (AsyncPointer ... ReplayKeyboard, 0-7); a ninth is
+            // BadValue, not silence (xdiff `grab.passive`, 2026-09-29).
+            if detail > 7 {
+                sendError(code: X11ErrorCode.value, badValue: UInt32(detail),
+                          minorOpcode: 0, majorOpcode: opcode)
+            }
         // No reply per spec for any of these five - and nothing real to
         // do for any of them, matching `handleAllocColor`/`handleQueryColors`'s
         // own "one flat, always-available colormap" reasoning (see their
@@ -443,22 +1044,760 @@ final class X11Connection: NSObject {
         // (defensive GTK boilerplate, not anything abiword-specific) and
         // got a real `BadImplementation` X error from the previous
         // shared `default:` catch-all.
-        case X11Opcode.createColormap, X11Opcode.freeColormap, X11Opcode.copyColormapAndFree,
-             X11Opcode.installColormap, X11Opcode.uninstallColormap: break
+        case X11Opcode.createColormap:
+            // One flat colormap (see handleAllocColor), but the id is
+            // tracked so FreeColormap of an unknown id is BadColor.
+            //
+            // `alloc` rides in the detail byte and is None (0) or All (1).
+            // The window is validated by the rules table; this is the
+            // enumeration it cannot express (xdiff `colormap.lifecycle`).
+            if detail > 1 {
+                sendError(code: X11ErrorCode.value, badValue: UInt32(detail),
+                          minorOpcode: 0, majorOpcode: opcode)
+                break
+            }
+            state.addFlatResource(FlatKind.colormap, X11ByteReader(body, littleEndian: littleEndian).readU32())
+        case X11Opcode.freeColormap:
+            _ = freedFlat(FlatKind.colormap, X11ByteReader(body, littleEndian: littleEndian).readU32(), error: X11ErrorCode.colormap)
+        case X11Opcode.copyColormapAndFree, X11Opcode.installColormap, X11Opcode.uninstallColormap: break
         case X11Opcode.listInstalledColormaps: handleListInstalledColormaps()
         case X11Opcode.grabServer, X11Opcode.ungrabServer: break // no reply per spec; nothing to actually serialize against with one server-side dispatch queue
-        case X11Opcode.grabPointer, X11Opcode.grabKeyboard: handleGrabReply()
-        case X11Opcode.setInputFocus: handleSetInputFocus(body: body) // no reply per spec, but real state to record
+        case X11Opcode.grabPointer:
+            // pointer-mode is at 6, keyboard-mode at 7 (after window and
+            // event-mask). Both are Sync/Async - nothing else exists, and a
+            // reply for a mode that does not is a reply a client will act on.
+            guard grabModesAreValid(body: body, offsets: (6, 7), opcode: opcode) else { break }
+            handleGrabReply()
+        case X11Opcode.grabKeyboard:
+            // GrabKeyboard puts the timestamp before its modes: window(4),
+            // time(4), then pointer-mode, keyboard-mode.
+            guard grabModesAreValid(body: body, offsets: (8, 9), opcode: opcode) else { break }
+            keyboardGrabbed(window: X11ByteReader(body, littleEndian: littleEndian).readU32())
+            handleGrabReply()
+        case X11Opcode.setInputFocus: handleSetInputFocus(detail: detail, body: body) // no reply per spec, but real state to record
         case X11Opcode.ungrabPointer, X11Opcode.ungrabKeyboard: break // no reply per spec
         case X11Opcode.openFont: handleOpenFont(body: body) // no reply; see MARK: - Font requests
-        case X11Opcode.closeFont: state.setFont(X11ByteReader(body, littleEndian: littleEndian).readU32(), isSymbol: false)
-        case X11Opcode.queryFont: handleQueryFont()
+        case X11Opcode.closeFont:
+            let fid = X11ByteReader(body, littleEndian: littleEndian).readU32()
+            if freedFlat(FlatKind.font, fid, error: X11ErrorCode.font) { state.setFont(fid, isSymbol: false) }
+        case X11Opcode.queryFont: handleQueryFont(body: body)
         case X11Opcode.queryTextExtents: handleQueryTextExtents(detail: detail, body: body)
         case X11Opcode.getKeyboardMapping: handleGetKeyboardMapping(body: body)
         case X11Opcode.getModifierMapping: handleGetModifierMapping()
-        case X11Opcode.bell, X11Opcode.noOperation: break // deliberate silent no-ops
-        default: sendError(code: X11ErrorCode.implementation, badValue: 0, minorOpcode: 0, majorOpcode: opcode)
+        case X11Opcode.noOperation: break // deliberate silent no-op
+        case X11Opcode.bell:
+            // The percent rides in the detail byte as a SIGNED -100...100.
+            // As an unsigned byte that is 0...100 and 156...255, so the
+            // illegal band is 101...155 - a range easy to get wrong in
+            // exactly one direction, which is why it is spelled out.
+            let percent = Int8(bitPattern: detail)
+            if percent < -100 || percent > 100 {
+                sendError(code: X11ErrorCode.value, badValue: UInt32(detail),
+                          minorOpcode: 0, majorOpcode: opcode)
+            }
+
+        // MARK: Requests answered rather than errored (doc 10 F10)
+        //
+        // `BadImplementation` is not a soft failure: Xlib's default error
+        // handler EXITS the process and GDK's aborts, and the log already
+        // records this catch-all killing galculator (on `SetClipRectangles`)
+        // and abiword (on `CreateColormap`) outright. So every request
+        // below gets a structurally valid answer instead - which is also
+        // what unblocks `xdpyinfo`, `xprop` and `xmodmap -pp`, the
+        // standard tools for asking this server what it thinks it is.
+        case 21: handleListProperties(body: body)
+        case 44: handleQueryKeymap()
+        case 49: handleListFonts(body: body)
+        case 50: handleListFontsWithInfo(body: body)
+        case 57: handleCopyGC(body: body)
+        case 97: handleQueryBestSize(detail: detail, body: body)
+        case 103: handleGetKeyboardControl()
+        case 106: handleGetPointerControl()
+        case 117: handleGetPointerMapping()
+
+        // Replies where zero genuinely is the answer.
+        case 39: sendEmptyReply(fixedZeroBytes: 24)          // GetMotionEvents: no history kept
+        case 52: sendEmptyReply(fixedZeroBytes: 24)          // GetFontPath: no font path
+        case 86, 87: sendEmptyReply(fixedZeroBytes: 24)      // AllocColorCells / AllocColorPlanes
+        case 108: sendEmptyReply(fixedZeroBytes: 24)         // GetScreenSaver: all disabled
+        case 110: sendEmptyReply(fixedZeroBytes: 24)         // ListHosts: access control off, no hosts
+        case 116, 118: sendEmptyReply(fixedZeroBytes: 24)    // SetPointerMapping / SetModifierMapping: Success
+
+        // No reply at all. Accepting these silently is deliberately NOT
+        // the same as implementing them - the drawing or state change does
+        // not happen - but a client that gets no error carries on, and
+        // several of these are things toolkits do constantly (`AllowEvents`
+        // after any synchronous grab, `ChangeActivePointerGrab` to swap
+        // the cursor mid-drag). Erroring was costing whole applications.
+        case 5, 6, 11, 13, 30, 41, 51, 58, 63, 75, 77,
+             88, 89, 90, 100, 102, 105, 107, 109, 111, 112, 113, 115:
+            // Accepted, but not blindly: several of these carry an
+            // enumeration or a range, and a value outside it is `BadValue`
+            // on a real server. Accepting one silently hides the client's
+            // own bug (xdiff `setters.*`, `closedown.mode`, `access.control`,
+            // `window.stacking_modes`, 2026-09-29). The request still does
+            // nothing - that part is unchanged - but an illegal one is now
+            // refused the way it would be anywhere else.
+            guard unimplementedRequestIsWellFormed(opcode: opcode, detail: detail, body: body) else { break }
+            if X11Trace.enabled {
+                MSLLog.line("x11", "accepted-unimplemented opcode=\(opcode)")
+            }
+        case 114: handleRotateProperties(body: body)
+
+        // BadRequest for an opcode nobody defines (the spec's answer);
+        // BadImplementation only for a real core request this server has
+        // not implemented yet.
+        default: sendError(code: opcode >= 128 || X11RequestRules.isUnassignedCore(opcode)
+                               ? X11ErrorCode.request : X11ErrorCode.implementation,
+                           badValue: 0, minorOpcode: 0, majorOpcode: opcode)
         }
+    }
+
+    /// The enumerations and ranges carried by the requests this server
+    /// accepts but does not implement. Returns false when an error was sent
+    /// and the caller must stop.
+    ///
+    /// Accepting a request that does nothing is a deliberate choice made
+    /// elsewhere in this file (erroring cost whole applications). Accepting
+    /// an *illegal* one is not: the client has a bug, a real server tells it
+    /// so, and staying silent means the bug surfaces later somewhere with no
+    /// connection to its cause.
+    private func unimplementedRequestIsWellFormed(opcode: UInt8, detail: UInt8, body: [UInt8]) -> Bool {
+        func badValue(_ value: UInt32) -> Bool {
+            sendError(code: X11ErrorCode.value, badValue: value, minorOpcode: 0, majorOpcode: opcode)
+            return false
+        }
+        func value(at offset: Int) -> UInt32? {
+            guard offset + 4 <= body.count else { return nil }
+            return X11ByteReader(Array(body[offset..<offset + 4]), littleEndian: littleEndian).readU32()
+        }
+        switch opcode {
+        case 13: // CirculateWindow - RaiseLowest, LowerHighest
+            return detail <= 1 || badValue(UInt32(detail))
+        case 41: // WarpPointer - src-window(4) dst-window(4), both of
+                 // which may be None. `None` cannot go in the rules table
+                 // because that treats 0 as reportable.
+            for offset in [0, 4] {
+                guard let id = value(at: offset), id != 0, isOwnID(id),
+                      id != rootWindowID, state.window(id) == nil else { continue }
+                sendError(code: X11ErrorCode.window, badValue: id,
+                          minorOpcode: 0, majorOpcode: opcode)
+                return false
+            }
+            return true
+        case 58: // SetDashes - the list must be non-empty, and no dash may be 0
+            guard body.count >= 8 else { return true } // length is the rules table's job
+            let count = Int(X11ByteReader(Array(body[6..<8]), littleEndian: littleEndian).readU16())
+            guard count > 0 else { return badValue(0) }
+            for dash in body.dropFirst(8).prefix(count) where dash == 0 { return badValue(0) }
+            return true
+        case 102: // ChangeKeyboardControl
+            guard body.count >= 4 else { return true }
+            let mask = X11ByteReader(Array(body[0..<4]), littleEndian: littleEndian).readU32()
+            // Values follow the mask, low bit first.
+            var offset = 4
+            for bit in 0..<8 where mask & (1 << UInt32(bit)) != 0 {
+                guard let v = value(at: offset) else { break }
+                offset += 4
+                let signed = Int32(bitPattern: v)
+                switch bit {
+                // The bit numbering matters and is easy to get wrong:
+                // 0 key-click-percent, 1 bell-percent, 2 bell-PITCH (Hz),
+                // 3 bell-DURATION (ms), 4 led, 5 led-mode, 6 key,
+                // 7 auto-repeat-mode. Pitch and duration are not
+                // percentages and have no upper bound - treating bit 2 as
+                // one made `xset b 50 400 100` BadValue, and xset exits on
+                // an X error.
+                case 0, 1: // percentages: -1 (default) ... 100
+                    if signed < -1 || signed > 100 { return badValue(v) }
+                case 2, 3: // pitch, duration: any value from -1 (default) up
+                    if signed < -1 { return badValue(v) }
+                case 5: // led-mode: Off, On
+                    if v > 1 { return badValue(v) }
+                case 7: // auto-repeat-mode: Off, On, Default
+                    if v > 2 { return badValue(v) }
+                default: break
+                }
+            }
+            return true
+        case 105: // ChangePointerControl - body is 8 bytes: numerator,
+                  // denominator, threshold (INT16 each), then two BOOLs.
+            guard body.count >= 8 else { return true }
+            let r = X11ByteReader(body, littleEndian: littleEndian)
+            let numerator = Int16(bitPattern: r.readU16())
+            let denominator = Int16(bitPattern: r.readU16())
+            let threshold = Int16(bitPattern: r.readU16())
+            let doAcceleration = r.readU8() != 0
+            let doThreshold = r.readU8() != 0
+            // **-1 means "restore the default"** for all three, which is
+            // exactly what `xset m default` sends. Refusing it was a worse
+            // bug than the leniency it replaced - the rule this campaign
+            // keeps restating.
+            if doAcceleration {
+                if numerator < -1 { return badValue(UInt32(bitPattern: Int32(numerator))) }
+                // A zero denominator is a divide by zero waiting to happen;
+                // -1 is the one legal non-positive value.
+                if denominator != -1, denominator <= 0 {
+                    return badValue(UInt32(bitPattern: Int32(denominator)))
+                }
+            }
+            if doThreshold, threshold < -1 { return badValue(UInt32(bitPattern: Int32(threshold))) }
+            return true
+        case 107: // SetScreenSaver - prefer-blanking, allow-exposures
+            guard body.count >= 6 else { return true }
+            if body[4] > 2 { return badValue(UInt32(body[4])) }
+            if body[5] > 2 { return badValue(UInt32(body[5])) }
+            return true
+        case 109: // ChangeHosts - Insert, Delete
+            return detail <= 1 || badValue(UInt32(detail))
+        case 111: // SetAccessControl - Disable, Enable
+            return detail <= 1 || badValue(UInt32(detail))
+        case 112: // SetCloseDownMode - Destroy, RetainPermanent, RetainTemporary
+            return detail <= 2 || badValue(UInt32(detail))
+        case 113: // KillClient - AllTemporary (0) or a real resource
+            guard let resource = value(at: 0), resource != 0 else { return true }
+            // Only this client's own ids are judged - see `isOwnID` and the
+            // policy `invalidResourceError` documents.
+            guard isOwnID(resource) else { return true }
+            let known = state.window(resource) != nil || state.pixmap(resource) != nil
+                || state.gc(resource) != nil || state.picture(resource) != nil
+                || state.glyphSet(resource) != nil
+                || state.hasFlatResource(FlatKind.font, resource)
+                || state.hasFlatResource(FlatKind.cursor, resource)
+                || state.hasFlatResource(FlatKind.colormap, resource)
+            return known || badValue(resource)
+        case 115: // ForceScreenSaver - Reset, Activate
+            return detail <= 1 || badValue(UInt32(detail))
+        default:
+            return true
+        }
+    }
+
+    /// `RotateProperties` - shuffles the values among a list of properties
+    /// on one window. A window manager uses it to reorder a property list
+    /// without a read-modify-write per entry.
+    ///
+    /// Implemented rather than accepted-and-ignored because the interesting
+    /// half is the refusal: naming a property the window does not have is
+    /// `BadMatch`, and mslgd used to accept it silently (xdiff
+    /// `props.rotate`, 2026-09-29).
+    private func handleRotateProperties(body: [UInt8]) {
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        let wid = r.readU32()
+        let count = Int(r.readU16())
+        let delta = Int(Int16(bitPattern: r.readU16()))
+        guard !windowIsMissing(wid) else {
+            return sendError(code: X11ErrorCode.window, badValue: wid,
+                             minorOpcode: 0, majorOpcode: X11Opcode.rotateProperties)
+        }
+        guard count > 0 else { return } // no properties named: nothing to do
+        // Root has no record to rotate properties on; naming any there is
+        // `BadMatch`, the same answer as naming one a window does not have.
+        guard let record = state.window(wid) else {
+            return sendError(code: X11ErrorCode.match, badValue: 0,
+                             minorOpcode: 0, majorOpcode: X11Opcode.rotateProperties)
+        }
+        var atoms: [UInt32] = []
+        for _ in 0..<count {
+            guard r.remaining >= 4 else { break }
+            atoms.append(r.readU32())
+        }
+        guard atoms.count == count else { return }
+        // Every named property must exist, and they must all be distinct -
+        // the whole request fails if any one of them does not.
+        guard Set(atoms).count == atoms.count else {
+            return sendError(code: X11ErrorCode.match, badValue: 0,
+                             minorOpcode: 0, majorOpcode: X11Opcode.rotateProperties)
+        }
+        var values: [(type: UInt32, format: UInt8, data: [UInt8])] = []
+        for atom in atoms {
+            guard let existing = record.properties[atom] else {
+                return sendError(code: X11ErrorCode.match, badValue: 0,
+                                 minorOpcode: 0, majorOpcode: X11Opcode.rotateProperties)
+            }
+            values.append(existing)
+        }
+        // A delta of zero is legal and does nothing - but it still had to
+        // pass the checks above, which is why this is not an early return.
+        let shift = ((delta % count) + count) % count
+        guard shift != 0 else { return }
+        for (index, atom) in atoms.enumerated() {
+            record.properties[atom] = values[(index + shift) % count]
+            sendPropertyNotify(record, atom: atom, state: 0) // 0 = NewValue
+        }
+    }
+
+    // MARK: - XFIXES
+
+    /// XFIXES, for one request that matters here:
+    /// `XFixesSelectSelectionInput`. It is how GTK, Qt and every clipboard
+    /// manager hear that a selection changed hands. Without it a toolkit
+    /// either polls the selection on a timer or never notices a copy it did
+    /// not make itself - and on this server "someone else" includes the Mac,
+    /// whose pasteboard changes are pushed in as selection ownership.
+    ///
+    /// **Version 1.0 deliberately**, not the 6.0 a modern Xorg reports.
+    /// `libXfixes` gates its whole API on the version the server agrees to,
+    /// so claiming only 1.0 means a client never calls the region, cursor-
+    /// naming or pointer-barrier requests this server has no answer for.
+    /// Claiming 6.0 to look complete would invite exactly the requests that
+    /// would then have to be refused or, worse, answered with a fabricated
+    /// reply - the failure mode this campaign keeps finding.
+    private func handleXFixesRequest(minor: UInt8, body: [UInt8]) {
+        switch minor {
+        case X11XFixesOpcode.queryVersion:
+            // The negotiated version is min(client, server), per the spec -
+            // a client asking for 6.0 is told 1.0 and confines itself to it.
+            guard body.count >= 8 else {
+                return sendError(code: X11ErrorCode.length, badValue: 0,
+                                 minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xfixesExtension)
+            }
+            let r = X11ByteReader(body, littleEndian: littleEndian)
+            let clientMajor = r.readU32()
+            let clientMinor = r.readU32()
+            let major: UInt32 = min(clientMajor, 1)
+            let minorVersion: UInt32 = major == 1 && clientMajor >= 1 ? 0 : min(clientMinor, 0)
+            let fw = X11ByteWriter(littleEndian: littleEndian)
+            fw.writeU32(major)
+            fw.writeU32(minorVersion)
+            fw.writePadding(16)
+            sendReply(fixed24: fw, detail: 0)
+        case X11XFixesOpcode.changeSaveSet:
+            // A save-set decides what happens to another client's windows
+            // when the window manager that reparented them dies. This server
+            // never reparents a client's window (top-levels become NSWindows
+            // directly), so there is nothing for a save-set to rescue and
+            // recording one would describe a relationship that does not
+            // exist. Accepted silently, which is what the client needs.
+            break
+        case X11XFixesOpcode.selectSelectionInput:
+            guard body.count >= 12 else {
+                return sendError(code: X11ErrorCode.length, badValue: 0,
+                                 minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xfixesExtension)
+            }
+            let r = X11ByteReader(body, littleEndian: littleEndian)
+            let window = r.readU32()
+            let selection = r.readU32()
+            let eventMask = r.readU32()
+            // Root is the usual target: a clipboard watcher subscribes to
+            // `DefaultRootWindow`, not to a window of its own.
+            guard !windowIsMissing(window) else {
+                return sendError(code: X11ErrorCode.window, badValue: window,
+                                 minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xfixesExtension)
+            }
+            guard eventMask & ~X11XFixesSelectionEvent.allMasks == 0 else {
+                return sendError(code: X11ErrorCode.value, badValue: eventMask,
+                                 minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xfixesExtension)
+            }
+            // A zero mask is how a client unsubscribes.
+            xfixesLock.lock()
+            if eventMask == 0 {
+                xfixesSelectionWatches[window]?.removeValue(forKey: selection)
+                if xfixesSelectionWatches[window]?.isEmpty == true { xfixesSelectionWatches[window] = nil }
+            } else {
+                xfixesSelectionWatches[window, default: [:]][selection] = eventMask
+            }
+            xfixesLock.unlock()
+        default:
+            // XFIXES 1.0 ends at GetCursorImage (4). Within range but
+            // unimplemented is BadImplementation; past the version this
+            // server claims there is nothing the client can mean, so
+            // BadRequest - the rule every other extension here follows.
+            sendError(code: minor > X11XFixesOpcode.lastInVersion1 ? X11ErrorCode.request : X11ErrorCode.implementation,
+                      badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xfixesExtension)
+        }
+    }
+
+    /// The same notify to every connection, not just this one. Selection
+    /// ownership is server-wide, so a watcher in another app has to hear it.
+    func broadcastXFixesSelectionNotify(selection: UInt32, owner: UInt32,
+                                        subtype: UInt8, mask: UInt32,
+                                        selectionTime: UInt32) {
+        for connection in state.allConnections() {
+            connection.deliverXFixesSelectionNotify(selection: selection, owner: owner,
+                                                    subtype: subtype, mask: mask,
+                                                    selectionTime: selectionTime)
+        }
+    }
+
+    /// `XFixesSelectionNotify` (XFIXES event 0) to every window that asked
+    /// about this selection, on this connection.
+    ///
+    /// Called for the whole server on any ownership change, so a copy in
+    /// one Linux app reaches a clipboard viewer in another - and a copy on
+    /// the Mac reaches both, because `X11Clipboard` pushes the pasteboard in
+    /// as an ownership change too.
+    func deliverXFixesSelectionNotify(selection: UInt32, owner: UInt32,
+                                      subtype: UInt8, mask: UInt32,
+                                      selectionTime: UInt32) {
+        // Snapshot under the lock, write after releasing it: `writeFull`
+        // can block on a slow client, and holding the lock across it would
+        // stall every other connection's selection traffic behind it.
+        xfixesLock.lock()
+        let targets = xfixesSelectionWatches.compactMap { window, watches -> UInt32? in
+            guard let watched = watches[selection], watched & mask != 0 else { return nil }
+            return window
+        }
+        xfixesLock.unlock()
+        for window in targets {
+            let w = X11ByteWriter(littleEndian: littleEndian)
+            w.writeU8(X11ExtensionBase.xfixesFirstEvent) // XFixesSelectionNotify
+            w.writeU8(subtype)
+            w.writeU16(stampSequence)
+            w.writeU32(window)
+            w.writeU32(owner)
+            w.writeU32(selection)
+            w.writeU32(currentX11Timestamp)
+            w.writeU32(selectionTime)
+            w.writePadding(8)
+            writeFull(w.bytes)
+        }
+    }
+
+    // MARK: - MIT-SCREEN-SAVER
+
+    /// There is no screen saver here: macOS owns blanking, and this server
+    /// has no concept of idle time of its own. So every answer is the
+    /// "nothing is happening" one, which is both true and what a client
+    /// probing for this extension wants to hear - several toolkits poll on
+    /// a timer when the extension is missing, which is the cost this
+    /// removes.
+    private func handleScreenSaverRequest(minor: UInt8, body: [UInt8]) {
+        switch minor {
+        case X11ScreenSaverOpcode.queryVersion:
+            let fw = X11ByteWriter(littleEndian: littleEndian)
+            fw.writeU8(1) // server major version
+            fw.writeU8(1) // server minor version
+            fw.writePadding(22)
+            sendReply(fixed24: fw, detail: 0)
+        case X11ScreenSaverOpcode.queryInfo:
+            let fw = X11ByteWriter(littleEndian: littleEndian)
+            fw.writeU32(0) // saver window - None
+            fw.writeU32(0) // ms until the saver would engage: never
+            fw.writeU32(0) // ms since it engaged: it has not
+            fw.writeU32(0) // event mask
+            fw.writeU8(0)  // kind: Blanked
+            fw.writePadding(7)
+            sendReply(fixed24: fw, detail: 0) // detail: state = Off
+        case X11ScreenSaverOpcode.selectInput,
+             X11ScreenSaverOpcode.setAttributes,
+             X11ScreenSaverOpcode.unsetAttributes:
+            break // no reply, and nothing to record: no saver ever engages
+        case X11ScreenSaverOpcode.suspend:
+            // SDL sends this for every game and video player it runs
+            // ("don't blank while I'm playing"). Refusing it printed an X
+            // error at every launch of mari0. It maps onto the Mac's own
+            // notion: keep the display awake while any such client asks.
+            let suspend = body.count >= 4
+                && X11ByteReader(Array(body[0..<4]), littleEndian: littleEndian).readU32() != 0
+            if suspend { holdScreenSaverSuspension() } else { releaseScreenSaverSuspension() }
+        default:
+            // MIT-SCREEN-SAVER ends at Suspend (5). Past it there is nothing
+            // a client can mean, so BadRequest - the same rule SHAPE, XKB,
+            // GLX, RENDER and XI already follow (xdiff `ext.minor_sweep`).
+            sendError(code: minor > 5 ? X11ErrorCode.request : X11ErrorCode.implementation,
+                      badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.screenSaverExtension)
+        }
+    }
+
+    /// The macOS assertion behind a client's ScreenSaverSuspend, if any.
+    /// Suspend is a boolean per client (not a counter), so one is enough.
+    private var screenSaverAssertion: IOPMAssertionID = 0
+
+    private func holdScreenSaverSuspension() {
+        guard screenSaverAssertion == 0 else { return }
+        var id: IOPMAssertionID = 0
+        let reason = "A Linux app asked to keep the display awake" as CFString
+        if IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleDisplaySleep as CFString,
+                                       IOPMAssertionLevel(kIOPMAssertionLevelOn), reason, &id) == kIOReturnSuccess {
+            screenSaverAssertion = id
+        }
+    }
+
+    private func releaseScreenSaverSuspension() {
+        guard screenSaverAssertion != 0 else { return }
+        IOPMAssertionRelease(screenSaverAssertion)
+        screenSaverAssertion = 0
+    }
+
+    // MARK: - XTEST
+
+    /// Input injected at the protocol level, which is the point: it is
+    /// deterministic, unlike replaying synthetic events through the window
+    /// server, and it cannot leave a modifier stuck in macOS.
+    ///
+    /// Scope, deliberately: **key events are really injected**, and
+    /// pointer events are accepted and traced without being injected.
+    /// Faking a button or motion event needs a pointer position model
+    /// (warping the real cursor, or a virtual one this server does not
+    /// have yet), and accepting silently is what a client expects from a
+    /// request with no reply - whereas an error would reach Xlib's default
+    /// handler and exit the process. Stated in the trace so nobody
+    /// concludes the injection is broken.
+    private func handleXTestRequest(minor: UInt8, body: [UInt8]) {
+        switch minor {
+        case X11XTestOpcode.getVersion:
+            // Reply: the major version rides the reply header's second
+            // byte (like `XkbUseExtension`'s `supported`), the minor is a
+            // CARD16 at the start of the fixed part.
+            let fw = X11ByteWriter(littleEndian: littleEndian)
+            fw.writeU16(2) // minor version
+            fw.writePadding(22)
+            sendReply(fixed24: fw, detail: 2) // major version 2
+        case X11XTestOpcode.compareCursor:
+            // "Is this window's cursor the one named?" This server has no
+            // per-window cursor model, so the honest answer is the one
+            // that makes a client stop asking: yes.
+            let fw = X11ByteWriter(littleEndian: littleEndian)
+            fw.writePadding(24)
+            sendReply(fixed24: fw, detail: 1) // same = True
+        case X11XTestOpcode.fakeInput:
+            handleXTestFakeInput(body: body)
+        case X11XTestOpcode.grabControl:
+            break // no reply; nothing here grabs the server
+        default:
+            // XTEST ends at GrabControl (3).
+            sendError(code: minor > 3 ? X11ErrorCode.request : X11ErrorCode.implementation,
+                      badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xtestExtension)
+        }
+    }
+
+    /// `XTestFakeInput`. Body layout, from `xXTestFakeInputReq` minus the
+    /// 4-byte request header: `type`(1), `detail`(1), pad(2), `time`(4),
+    /// `root`(4), pad(8), `rootX`(2), `rootY`(2), pad(8).
+    private func handleXTestFakeInput(body: [UInt8]) {
+        guard body.count >= 8 else { return }
+        let type = body[0]
+        let detail = body[1]
+
+        switch type {
+        case X11FakeInputType.keyPress, X11FakeInputType.keyRelease:
+            let pressed = type == X11FakeInputType.keyPress
+            if X11Trace.enabled {
+                MSLLog.line("x11", "xtestFakeKey keycode=\(detail) pressed=\(pressed)")
+            }
+            // Through the same path a real key takes, so auto-repeat
+            // shape, XI2-vs-core selection and ancestor propagation all
+            // behave identically - a test that went around them would be
+            // testing something other than what users get.
+            let transition = X11KeyboardState.shared.key(detail, pressed: pressed)
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let windowID = self.focusedWindowID() else { return }
+                self.deliverKey(transition, windowID: windowID, x: 0, y: 0)
+            }
+        default:
+            if X11Trace.enabled {
+                MSLLog.line("x11", "xtestFakeInput type=\(type) detail=\(detail) - accepted, NOT injected (pointer faking is not implemented)")
+            }
+        }
+    }
+
+    /// The window a faked key should go to: whichever of this host's
+    /// windows currently has AppKit key focus.
+    private func focusedWindowID() -> UInt32? {
+        if let view = NSApplication.shared.keyWindow?.contentView as? X11CanvasView {
+            return view.windowID
+        }
+        // No key window - fall back to any mapped top-level, so injection
+        // still works when focus sits outside this host.
+        return state.mappedTopLevelWindowID()
+    }
+
+    // MARK: - Small replies (doc 10 F10, doc 13 §2.4)
+
+    /// A reply whose whole fixed part is zeros. The protocol's shape is
+    /// satisfied, the client unblocks, and nothing is claimed.
+    private func sendEmptyReply(fixedZeroBytes: Int) {
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writePadding(fixedZeroBytes)
+        sendReply(fixed24: fw, detail: 0)
+    }
+
+    /// Which properties a window has. **This is what blocks `xprop`** -
+    /// without it there is no way to enumerate a window's properties at
+    /// all, so the standard tool for inspecting the thing this server
+    /// spends most of its property code on could not be pointed at it.
+    private func handleListProperties(body: [UInt8]) {
+        let wid = X11ByteReader(body, littleEndian: littleEndian).readU32()
+        // Sorted, not raw dictionary order - see the unordered-iteration
+        // class in doc 14 Part D. Two reads should not disagree.
+        let atoms = (state.window(wid)?.properties.keys.sorted()) ?? []
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writeU16(UInt16(clamping: atoms.count))
+        fw.writePadding(22)
+        let extra = X11ByteWriter(littleEndian: littleEndian)
+        for atom in atoms { extra.writeU32(atom) }
+        sendReply(fixed24: fw, extra: extra.bytes, detail: 0)
+    }
+
+    /// The 32-byte "which keys are down right now" vector.
+    ///
+    /// Qt re-syncs modifier state from this on focus-in. Answered from
+    /// the same pressed-key set the core events are built from, so it
+    /// cannot disagree with them.
+    private func handleQueryKeymap() {
+        let keys = X11KeyboardState.shared.keymapVector
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writePadding(24)
+        sendReply(fixed24: fw, extra: keys, detail: 0)
+    }
+
+    /// No core fonts are listed. An empty list is a real answer - "nothing
+    /// matched your pattern" - where the error this used to send made Tk
+    /// and Motif clients take a failure path instead.
+    /// max-names(2) pattern-length(2) pattern. Answers from
+    /// `X11FontCatalog` - see there for why "no fonts" wasn't good enough.
+    private func handleListFonts(body: [UInt8]) {
+        let (maxNames, pattern) = Self.fontPattern(body, littleEndian: littleEndian)
+        let names = X11FontCatalog.matching(pattern, max: maxNames)
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writeU16(UInt16(names.count)) // number of names
+        fw.writePadding(22)
+        let extra = X11ByteWriter(littleEndian: littleEndian)
+        for name in names {
+            let bytes = Array(name.utf8.prefix(255))
+            extra.writeU8(UInt8(bytes.count))
+            extra.writeBytes(bytes)
+        }
+        extra.writePadding((4 - extra.bytes.count % 4) % 4)
+        sendReply(fixed24: fw, extra: extra.bytes)
+    }
+
+    private static func fontPattern(_ body: [UInt8], littleEndian: Bool) -> (Int, String) {
+        guard body.count >= 4 else { return (0, "") }
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        let maxNames = Int(r.readU16())
+        let length = min(Int(r.readU16()), body.count - 4)
+        return (maxNames, String(decoding: body[4..<(4 + length)], as: UTF8.self))
+    }
+
+    /// `ListFontsWithInfo` answers with a *series* of replies, one per
+    /// font (its FONTINFO - the same metrics `QueryFont` gives, since every
+    /// name is the same real font - and its name), terminated by one whose
+    /// name length is zero. The fixed part is 60 bytes, so these are
+    /// written directly rather than through `sendReply(fixed24:)`.
+    private func handleListFontsWithInfo(body: [UInt8]) {
+        let (maxNames, pattern) = Self.fontPattern(body, littleEndian: littleEndian)
+        let names = X11FontCatalog.matching(pattern, max: maxNames)
+        for (i, name) in names.enumerated() {
+            let bytes = Array(name.utf8.prefix(255))
+            let padded = bytes + [UInt8](repeating: 0, count: (4 - bytes.count % 4) % 4)
+            writeFull(fontInfoReply(nameLength: UInt8(bytes.count), repliesHint: UInt32(names.count - i - 1),
+                                    trailing: padded))
+        }
+        writeFull(fontInfoReply(nameLength: 0, repliesHint: 0, trailing: []))
+    }
+
+    private func fontInfoReply(nameLength: UInt8, repliesHint: UInt32, trailing: [UInt8]) -> [UInt8] {
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU8(1) // Reply
+        w.writeU8(nameLength)
+        w.writeU16(stampSequence)
+        w.writeU32(UInt32(7 + trailing.count / 4)) // (60 - 32) / 4 + name
+        writeCharInfo(into: w) // min-bounds
+        w.writePadding(4)
+        writeCharInfo(into: w) // max-bounds
+        w.writePadding(4)
+        w.writeU16(0) // min-char-or-byte2
+        w.writeU16(255) // max-char-or-byte2
+        w.writeU16(32) // default-char
+        w.writeU16(0) // number of FONTPROPs
+        w.writeU8(0) // draw-direction
+        w.writeU8(0) // min-byte1
+        w.writeU8(0) // max-byte1
+        w.writeU8(1) // all-chars-exist
+        w.writeI16(Self.fakeFontAscent)
+        w.writeI16(Self.fakeFontDescent)
+        w.writeU32(repliesHint)
+        w.writeBytes(trailing)
+        return w.bytes
+    }
+
+    /// Echoes the requested size back, which is what "best" means for a
+    /// server with no hardware constraints to impose.
+    private func handleQueryBestSize(detail: UInt8, body: [UInt8]) {
+        // `class` is an enumeration: Cursor, Tile, Stipple. Anything else is
+        // BadValue - measured against Xvfb, which refuses it while mslgd
+        // used to answer happily (xdiff `querybestsize`, 2026-09-28).
+        guard detail <= 2 else {
+            return sendError(code: X11ErrorCode.value, badValue: UInt32(detail),
+                             minorOpcode: 0, majorOpcode: 97)
+        }
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        r.skip(4) // drawable
+        let width = r.readU16()
+        let height = r.readU16()
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writeU16(width)
+        fw.writeU16(height)
+        fw.writePadding(20)
+        sendReply(fixed24: fw, detail: 0)
+    }
+
+    /// Auto-repeat on, everything else at its protocol default. The one
+    /// field that matters is `global_auto_repeat`: a client told repeat is
+    /// OFF may implement its own repeat timer on top of the server's.
+    private func handleGetKeyboardControl() {
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writeU32(0) // led-mask
+        fw.writeU8(0) // key-click-percent
+        fw.writeU8(50) // bell-percent
+        fw.writeU16(400) // bell-pitch
+        fw.writeU16(100) // bell-duration
+        fw.writePadding(2)
+        // The 32-byte auto-repeat bit vector straddles the fixed/extra
+        // boundary: 12 bytes of fields above + 12 of it make the 24-byte
+        // fixed part, and the other 20 are the reply's extra (length 5).
+        // This used to put 14 bytes in the fixed part - 26, not 24 - and
+        // `sendReply`'s precondition killed the whole app host: every
+        // Firefox launch died on its first GetKeyboardControl
+        // ("Exiting due to channel error" in the guest).
+        fw.writeBytes([UInt8](repeating: 0xFF, count: 12))
+        sendReply(fixed24: fw, extra: [UInt8](repeating: 0xFF, count: 20), detail: 1) // detail = global-auto-repeat On
+    }
+
+    /// Acceleration 1:1, no threshold - this server does not accelerate.
+    private func handleGetPointerControl() {
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writeU16(1) // acceleration numerator
+        fw.writeU16(1) // acceleration denominator
+        fw.writeU16(0) // threshold
+        fw.writePadding(18)
+        sendReply(fixed24: fw, detail: 0)
+    }
+
+    /// The identity map, one entry per button this server's pointer has.
+    ///
+    /// An EMPTY map - which is what `sendEmptyReply` would have produced
+    /// here - tells Qt the pointer has **zero buttons**, which is worse
+    /// than the error it replaced. The length lives in the reply's detail
+    /// byte, and the entries follow.
+    private func handleGetPointerMapping() {
+        let map: [UInt8] = Array(1...UInt8(Self.pointerButtonLabels.count))
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writePadding(24)
+        var padded = map
+        padded += [UInt8](repeating: 0, count: X11Wire.pad(map.count) - map.count)
+        sendReply(fixed24: fw, extra: padded, detail: UInt8(map.count))
+    }
+
+    /// Really copies the GC, rather than accepting and ignoring it. Tk and
+    /// Motif build derived GCs this way constantly, and a copy that
+    /// silently did nothing left the destination at its defaults.
+    private func handleCopyGC(body: [UInt8]) {
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        let srcID = r.readU32()
+        let dstID = r.readU32()
+        // value-mask follows; this copies the components this server
+        // actually models, which is the same set `applyGCValues` acts on.
+        guard let src = state.gc(srcID) else { return }
+        let dst = state.gc(dstID) ?? state.makeGC(id: dstID)
+        dst.foreground = src.foreground
+        dst.background = src.background
+        dst.font = src.font
+        dst.clipRectanglesRaw = src.clipRectanglesRaw
+        dst.clipOrigin = src.clipOrigin
+        dst.function = src.function
     }
 
     // MARK: - Window requests
@@ -471,7 +1810,7 @@ final class X11Connection: NSObject {
         let y = r.readI16()
         let width = max(1, r.readU16())
         let height = max(1, r.readU16())
-        r.skip(2) // border-width
+        let borderWidth = r.readU16()
         // `class`: 0 CopyFromParent, 1 InputOutput, 2 InputOnly. Read and
         // DISCARDED until 2026-09-06, which put invisible windows on screen:
         // an InputOnly window has no pixels at all - it exists purely to
@@ -483,16 +1822,22 @@ final class X11Connection: NSObject {
         // Mission Control tile and Dock-menu row.
         let windowClass = r.readU16()
         let inputOnly = windowClass == 2
-        r.skip(4) // visual
+        let requestedVisual = r.readU32() // 0 = CopyFromParent
         let valueMask = r.readU32()
 
         var eventMask: UInt32 = 0
         var backgroundPixel: UInt32 = 0x00FF_FFFF
+        /// `nil` = not specified (so the pixel applies); 0 = None;
+        /// 1 = ParentRelative; anything else is a pixmap id.
+        var backgroundPixmap: UInt32?
+        var bitGravity: UInt8 = 0
         var overrideRedirect = false
         for bit: UInt32 in [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000] {
             guard valueMask & bit != 0 else { continue }
             let value = r.readU32()
-            if bit == 0x02 { backgroundPixel = value }
+            if bit == 0x01 { backgroundPixmap = value } // 0 = None, 1 = ParentRelative
+            if bit == 0x02 { backgroundPixel = value; backgroundPixmap = nil }
+            if bit == 0x10 { bitGravity = UInt8(truncatingIfNeeded: value) }
             if bit == 0x200 { overrideRedirect = value != 0 } // CWOverrideRedirect
             if bit == 0x800 { eventMask = value }
         }
@@ -532,14 +1877,34 @@ final class X11Connection: NSObject {
             cascadedX = offset.x
             cascadedY = offset.y
         }
-        let frame = CGRect(x: cascadedX, y: cascadedY, width: Double(width), height: Double(height))
+        // Same bound as `CreatePixmap`, same reason - `X11CanvasView.init`
+        // allocates a bitmap from these CARD16s. Clamped rather than
+        // refused, because a window is a thing the user can see and a
+        // `BadWindow` here would lose it entirely; a pixmap is invisible
+        // scratch space, so refusing that one is the kinder answer.
+        let boundedWidth = min(Int(width), Self.maxDrawableSide)
+        let boundedHeight = min(Int(height), Self.maxDrawableSide)
+        let frame = CGRect(x: cascadedX, y: cascadedY, width: Double(boundedWidth), height: Double(boundedHeight))
         let record = state.makeWindow(id: wid, parent: parent, isTopLevel: isTopLevel, frame: frame)
         record.eventMask = eventMask
         record.backgroundPixel = backgroundPixel
+        record.backgroundNone = backgroundPixmap == 0
+        record.backgroundParentRelative = backgroundPixmap == 1
+        record.bitGravity = bitGravity
         record.overrideRedirect = overrideRedirect
         record.inputOnly = inputOnly
+        record.borderWidth = borderWidth
+        // Remembered for GetWindowAttributes: GLX clients look up their
+        // config by the window's visual, and there are many now.
+        record.visual = requestedVisual != 0 ? requestedVisual : (parentRecord?.visual ?? 0)
         X11Trace.eventMask(windowID: wid, mask: eventMask, source: "CreateWindow")
         X11Trace.geometry("create", windowID: wid, x: Int(cascadedX), y: Int(cascadedY), width: Int(width), height: Int(height))
+
+        if let parentRecord {
+            deliverSelected(parentRecord, mask: 0x0008_0000, // SubstructureNotify
+                            createNotifyBytes(parent: parent, window: wid, frame: record.frame,
+                                              borderWidth: borderWidth, overrideRedirect: overrideRedirect))
+        }
 
         // `.sync`, not `.async` - confirmed live this is a real race, not
         // just a style choice: every drawing handler (`ImageText8`,
@@ -552,15 +1917,73 @@ final class X11Connection: NSObject {
         // landed yet by the time the first draw request checked it,
         // silently dropping every one of them (`record.view == nil`, a
         // quiet early return, no error). `.sync` blocks this thread
-        // briefly (once per window - not a hot path) but guarantees
+        // briefly but guarantees
         // `record.view`/`record.nsWindow` are already visible to every
         // other thread by the time this function returns.
+        //
+        // That comment used to read "once per window - not a hot path",
+        // and the premise holds only for the toolkit generation this
+        // server was tested against. An Xt/Motif/Tk app makes one X
+        // window per WIDGET: measured 2026-09-23, xcalc issues **69**
+        // `CreateWindow` requests where Mousepad (GTK3) issues **4**.
+        // Each is a full barrier onto the main queue, and its cost is not
+        // only the work below but whatever drawing the app had already
+        // queued there - which, for a toolkit that interleaves creation
+        // and drawing, is a lot.
+        //
+        // So the expensive part is built HERE, on this thread, and the
+        // barrier does only what genuinely needs AppKit: wiring up the
+        // view and window objects. The bitmap allocation and its fill
+        // never needed main at all.
+        //
+        // **Measured 2026-09-23, and the barrier turns out NOT to be the
+        // bottleneck** - which is worth stating plainly, because the
+        // obvious next step (queue drawing against the record and replay
+        // it once the view lands, removing the barrier entirely) is a
+        // large change and this is the evidence against doing it.
+        // `X11Trace.createWindowBarrier` over xcalc's 69 `CreateWindow`s:
+        //
+        //   median wait 0.005ms, and only 2 of 69 waits exceed 1ms
+        //   the whole run totals ~84ms, but 80ms of that is TWO windows:
+        //     wid 904 (the first top-level) work=19.4ms - AppKit building
+        //       the first NSWindow, on main because it has to be
+        //     wid 905 wait=60.3ms - queued behind exactly that
+        //   the other 67 windows cost ~1ms between them
+        //   bitmap allocation: 0.23ms across all 69, i.e. the move off
+        //     the barrier above did its job and is not worth revisiting
+        //
+        // Removing the barrier would not touch the 80ms, because that is
+        // NSWindow creation itself, not waiting for a queue. The audit's
+        // mechanism is real but it was already spent by the two fixes
+        // above. Caveat worth keeping: xcalc front-loads its creations
+        // with an idle main queue, so a toolkit that interleaves creation
+        // with heavy drawing could still see real waits - untestable here
+        // because no Tk is installed in the guest.
+        let bitmapStart = CFAbsoluteTimeGetCurrent()
+        let backingContext = makeFlippedBitmapContext(width: boundedWidth, height: boundedHeight)
+        let bitmapMS = (CFAbsoluteTimeGetCurrent() - bitmapStart) * 1000
+        // Split the barrier's cost into the wait (everything queued on main
+        // ahead of us) and the work (the block itself). They call for
+        // different fixes, so a single total would not tell us which.
+        let barrierRequested = CFAbsoluteTimeGetCurrent()
+        var barrierEntered = barrierRequested
         let eventSink = self
         DispatchQueue.main.sync {
-            let view = X11CanvasView(width: Int(width), height: Int(height))
+            barrierEntered = CFAbsoluteTimeGetCurrent()
+            // One fill, not two: this used to fill white inside
+            // `X11CanvasView.init` and then immediately fill again with
+            // the real background pixel - two full passes over the same
+            // buffer, per window, inside the barrier. A background of
+            // `None` (0) gets the plain white this has always started
+            // with - not "undefined" - because a transparent canvas shows
+            // the desktop through the window, which reads as broken. What
+            // F5 changed is that `ClearArea` no longer REPAINTS white over
+            // a None background later; the initial fill is unchanged.
+            let view = X11CanvasView(width: boundedWidth, height: boundedHeight,
+                                     context: backingContext,
+                                     background: backgroundPixmap == 0 ? nil : backgroundPixel)
             view.windowID = wid
             view.eventSink = eventSink
-            view.fillWithColor(backgroundPixel)
             record.view = view
 
             if isTopLevel && !inputOnly {
@@ -589,6 +2012,7 @@ final class X11Connection: NSObject {
                 // Cmd-\` cycling or the Window menu) is the correct
                 // AppKit shape for this.
                 let window = self.makeTopLevelWindow(frame: frame, overrideRedirect: overrideRedirect)
+                view.displayScale = X11DisplayScale.factor
                 window.contentView = view
                 record.nsWindow = window
             } else if !isTopLevel {
@@ -605,6 +2029,13 @@ final class X11Connection: NSObject {
             // class. `handleMapWindow`'s `record.nsWindow?` calls are
             // already optional, so mapping one is a no-op that still sends
             // the `MapNotify` the client expects.
+        }
+        if X11Trace.enabled {
+            let done = CFAbsoluteTimeGetCurrent()
+            X11Trace.createWindowBarrier(windowID: wid,
+                                         waitMS: (barrierEntered - barrierRequested) * 1000,
+                                         workMS: (done - barrierEntered) * 1000,
+                                         bitmapMS: bitmapMS)
         }
     }
 
@@ -649,7 +2080,7 @@ final class X11Connection: NSObject {
         guard record.overrideRedirect != overrideRedirect else { return }
         record.overrideRedirect = overrideRedirect
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] overrideRedirect wid=\(record.id) -> \(overrideRedirect) topLevel=\(record.isTopLevel) hasWindow=\(record.nsWindow != nil)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "overrideRedirect wid=\(record.id) -> \(overrideRedirect) topLevel=\(record.isTopLevel) hasWindow=\(record.nsWindow != nil)")
         }
         guard record.isTopLevel, !record.inputOnly, record.nsWindow != nil else { return }
         let wid = record.id
@@ -672,6 +2103,7 @@ final class X11Connection: NSObject {
 
             let window = self.makeTopLevelWindow(frame: record.frame, overrideRedirect: overrideRedirect)
             if !overrideRedirect { window.title = title }
+            view.displayScale = X11DisplayScale.factor
             window.contentView = view
             record.nsWindow = window
             for child in children { window.addChildWindow(child, ordered: .above) }
@@ -692,6 +2124,23 @@ final class X11Connection: NSObject {
     /// needs - shared by `handleMapWindow` and `handleMapSubwindows`
     /// (`MapSubwindows` maps every child the exact same way, just for
     /// several windows in one request instead of one).
+    /// Reorders a parent's subviews to match the model's stacking order.
+    ///
+    /// `addSubview` appends on top, which is right for a newly created
+    /// window and wrong for everything else - so without this, restacking
+    /// changed what `QueryTree` reports and nothing on screen.
+    private func restackViews(ofParent parent: UInt32) {
+        let ordered = state.children(ofParent: parent).compactMap { $0.view }
+        guard let parentView = state.window(parent)?.view, !ordered.isEmpty else { return }
+        DispatchQueue.main.async {
+            var below: NSView?
+            for view in ordered where view.superview === parentView {
+                parentView.addSubview(view, positioned: .above, relativeTo: below)
+                below = view
+            }
+        }
+    }
+
     private func mapChild(_ record: X11State.WindowRecord) {
         guard !record.isTopLevel else { return }
         record.mapped = true
@@ -703,8 +2152,15 @@ final class X11Connection: NSObject {
             view.frame = record.frame
             if view.superview !== parentView { parentView.addSubview(view) }
         }
-        if record.eventMask & 0x0002_0000 != 0 { // StructureNotifyMask
-            sendMapNotify(windowID: record.id)
+        // Mapping a child puts it at the top of its siblings, and this
+        // used to be skipped entirely when the view was already parented -
+        // so a toolkit that unmaps and re-maps a child to bring it forward
+        // (a common way to swap one panel for another) got no change at
+        // all on screen.
+        state.restack(record.id, parent: record.parent, mode: .above, sibling: nil)
+        restackViews(ofParent: record.parent)
+        deliverStructureEvent(window: record.id, parent: record.parent) { [weak self] eventWindow in
+            self?.mapNotifyBytes(eventWindow: eventWindow, window: record.id) ?? []
         }
         let shouldExpose = record.eventMask & 0x0000_8000 != 0 // ExposureMask
         X11Trace.mapExpose(windowID: record.id, sent: shouldExpose, eventMask: record.eventMask)
@@ -776,7 +2232,7 @@ final class X11Connection: NSObject {
         guard childWindow.parent !== ownerWindow else { return }
         ownerWindow.addChildWindow(childWindow, ordered: .above)
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] attachOwner child=\(record.id) owner=\(ownerID) via=\(ownerVia) overrideRedirect=\(record.overrideRedirect) ownerFrame=\(owner.frame)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "attachOwner child=\(record.id) owner=\(ownerID) via=\(ownerVia) overrideRedirect=\(record.overrideRedirect) ownerFrame=\(owner.frame)")
         }
     }
 
@@ -809,7 +2265,17 @@ final class X11Connection: NSObject {
             // `makeKeyAndOrderFront` alone does.
             NSApplication.shared.activate(ignoringOtherApps: true)
             record.nsWindow?.orderFrontRegardless()
-            record.nsWindow?.makeKeyAndOrderFront(nil)
+            // An override-redirect popup - tooltip, Firefox tab preview,
+            // menu - is shown WITHOUT taking key, as in X11, where such a
+            // window never gets the input focus. Taking key made the main
+            // window resign it: its title bar went grey for every tooltip,
+            // and (with the old key-window tracking areas) the app was told
+            // the pointer had left, hid the popup, and re-showed it ~40
+            // times a second. A popup that really wants the keyboard (a
+            // menu) grabs it, and `keyboardGrabbed` makes it key then.
+            if !record.overrideRedirect || record.wantsKeyboard {
+                record.nsWindow?.makeKeyAndOrderFront(nil)
+            }
             // `makeKeyAndOrderFront` alone only makes the WINDOW key - it
             // does NOT promote this window's view to first responder.
             // Keyboard events (`keyDown`/`keyUp`) follow the responder
@@ -880,8 +2346,8 @@ final class X11Connection: NSObject {
                 }
             }
         }
-        if record.eventMask & 0x0002_0000 != 0 { // StructureNotifyMask
-            sendMapNotify(windowID: wid)
+        deliverStructureEvent(window: wid, parent: record.parent) { [weak self] eventWindow in
+            self?.mapNotifyBytes(eventWindow: eventWindow, window: wid) ?? []
         }
         // Confirmed live this is NOT optional: a client like `xterm` draws
         // its initial content ONLY in response to being told "you're
@@ -918,7 +2384,18 @@ final class X11Connection: NSObject {
     private func handleUnmapWindow(body: [UInt8]) {
         let wid = X11ByteReader(body, littleEndian: littleEndian).readU32()
         guard let record = state.window(wid) else { return }
+        let wasMapped = record.mapped
         record.mapped = false
+        record.wantsKeyboard = false // a popup shown again must grab again to get the keyboard
+        // Sent before the AppKit work below, and only for a window that
+        // was actually mapped - the protocol says an unmap of an already
+        // unmapped window is a no-op, and `handleReparentWindow` unmaps
+        // unconditionally on its way through.
+        if wasMapped {
+            deliverStructureEvent(window: wid, parent: record.parent) { [weak self] eventWindow in
+                self?.unmapNotifyBytes(eventWindow: eventWindow, window: wid) ?? []
+            }
+        }
         // A window that is no longer on screen cannot still contain the
         // pointer, and AppKit will never send it the matching `mouseExited`
         // - leaving `pointerInside` set would make the Enter after a remap
@@ -1006,7 +2483,7 @@ final class X11Connection: NSObject {
         if wasMapped { handleUnmapWindow(body: idBytes.bytes) }
 
         let oldParent = record.parent
-        record.parent = newParent
+        state.reparent(wid, from: oldParent, to: newParent) // sets record.parent too
         record.frame.origin = CGPoint(x: Double(x), y: Double(y))
         let frame = record.frame
         if record.isTopLevel {
@@ -1026,6 +2503,8 @@ final class X11Connection: NSObject {
                     window.orderOut(nil)
                     window.close()
                 }
+                // A child is laid out in its parent's X11 bounds: unscaled.
+                record.view?.displayScale = 1
                 record.view?.frame = frame
             }
         } else {
@@ -1035,7 +2514,7 @@ final class X11Connection: NSObject {
             }
         }
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] reparent wid=\(wid) from=\(oldParent) to=\(newParent) at=(\(x),\(y)) wasMapped=\(wasMapped)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "reparent wid=\(wid) from=\(oldParent) to=\(newParent) at=(\(x),\(y)) wasMapped=\(wasMapped)")
         }
 
         let structureNotify: UInt32 = 0x0002_0000, substructureNotify: UInt32 = 0x0008_0000
@@ -1050,19 +2529,94 @@ final class X11Connection: NSObject {
         if wasMapped && !toRoot { mapChild(record) }
     }
 
+    /// `CirculateWindow`: RaiseLowest (0) moves the bottom child to the top,
+    /// LowerHighest (1) the top child to the bottom. Simplified the way the
+    /// rest of this server's stacking is: every child counts, not only the
+    /// occluded ones. It had no handler at all, and fell through to
+    /// BadImplementation.
+    private func handleCirculateWindow(direction: UInt8, body: [UInt8]) {
+        // RaiseLowest (0) or LowerHighest (1) - nothing else exists.
+        guard direction <= 1 else {
+            return sendError(code: X11ErrorCode.value, badValue: UInt32(direction),
+                             minorOpcode: 0, majorOpcode: 13)
+        }
+        let parent = X11ByteReader(body, littleEndian: littleEndian).readU32()
+        let children = state.children(ofParent: parent)
+        guard children.count > 1 else { return }
+        if direction == 0, let lowest = children.first {
+            state.restack(lowest.id, parent: parent, mode: .above, sibling: nil)
+        } else if direction == 1, let highest = children.last {
+            state.restack(highest.id, parent: parent, mode: .below, sibling: nil)
+        }
+    }
+
     private func handleDestroyWindow(body: [UInt8]) {
         let wid = X11ByteReader(body, littleEndian: littleEndian).readU32()
+        // "If the window is the root, the request has no effect" (the spec).
+        guard wid != rootWindowID else { return }
         // Real X11 destroys the whole subtree, not just `wid` - a client
         // tearing down a shell window expects its content windows to go
         // with it, not linger as orphaned, still-tracked records nothing
         // will ever reference again.
-        for child in state.children(ofParent: wid) { destroyWindowRecursive(child.id) }
         destroyWindowRecursive(wid)
     }
 
+    /// Destroys `wid` and its whole subtree, children first.
+    ///
+    /// Iterative with a visited set, not recursive: a recursive walk died
+    /// of stack overflow on a subtree that led back to itself (window 0 and
+    /// the synthetic root), and a legitimately deep tree - Tk makes one
+    /// window per widget - must not be able to exhaust a thread's stack.
     private func destroyWindowRecursive(_ wid: UInt32) {
-        for child in state.children(ofParent: wid) { destroyWindowRecursive(child.id) }
+        var order: [UInt32] = []
+        var seen: Set<UInt32> = [rootWindowID]
+        var stack: [UInt32] = [wid]
+        while let next = stack.popLast() {
+            guard seen.insert(next).inserted else { continue }
+            order.append(next)
+            stack.append(contentsOf: state.children(ofParent: next).map(\.id))
+        }
+        // Children before parents, so every DestroyNotify can still find
+        // its parent's record.
+        for id in order.reversed() { destroyOneWindow(id) }
+    }
+
+    private func destroyOneWindow(_ wid: UInt32) {
+        // While the record still exists: the event's recipients are chosen
+        // from this window's event mask and its parent's, and both are
+        // about to be unreachable.
+        let parent = state.window(wid)?.parent
+        // "DestroyWindow ... if the window is mapped, an UnmapWindow request
+        // is performed automatically" - so a mapped window generates
+        // UnmapNotify BEFORE DestroyNotify. Without it a client tracking
+        // visibility is left believing a destroyed child is still on screen
+        // (xdiff `events.substructure`, 2026-09-28).
+        if state.window(wid)?.mapped == true {
+            state.window(wid)?.mapped = false
+            deliverStructureEvent(window: wid, parent: parent) { [weak self] eventWindow in
+                self?.unmapNotifyBytes(eventWindow: eventWindow, window: wid) ?? []
+            }
+        }
+        deliverStructureEvent(window: wid, parent: parent) { [weak self] eventWindow in
+            self?.destroyNotifyBytes(eventWindow: eventWindow, window: wid) ?? []
+        }
+        // Asked before the removal, which drops them silently. A watcher
+        // has to hear that the selection it cared about lost its owner -
+        // that is the whole point of `SelectionWindowDestroy`.
+        let ownedSelections = state.selectionsOwned(by: wid)
         guard let record = state.removeWindow(wid) else { return }
+        xfixesLock.lock()
+        xfixesSelectionWatches.removeValue(forKey: wid)
+        xfixesLock.unlock()
+        for owned in ownedSelections {
+            broadcastXFixesSelectionNotify(
+                selection: owned.selection, owner: 0,
+                subtype: isDisconnecting ? X11XFixesSelectionEvent.selectionClientClose
+                                         : X11XFixesSelectionEvent.selectionWindowDestroy,
+                mask: isDisconnecting ? X11XFixesSelectionEvent.selectionClientCloseMask
+                                      : X11XFixesSelectionEvent.selectionWindowDestroyMask,
+                selectionTime: owned.time)
+        }
         if record.isTopLevel {
             DispatchQueue.main.async {
                 self.detachFromOwnerWindow(record) // see `attachToOwnerWindow`
@@ -1083,18 +2637,67 @@ final class X11Connection: NSObject {
         let oldFrame = record.frame
         let oldSize = oldFrame.size
         var frame = record.frame
-        for bit: UInt32 in [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40] {
-            guard valueMask & bit != 0 else { continue }
-            let raw = r.readU32()
-            switch bit {
-            case 0x01: frame.origin.x = Double(Int32(bitPattern: raw))
-            case 0x02: frame.origin.y = Double(Int32(bitPattern: raw))
-            case 0x04: frame.size.width = Double(raw)
-            case 0x08: frame.size.height = Double(raw)
-            default: break // border-width/sibling/stack-mode - not tracked in this skeleton
+        var sibling: UInt32?
+        var stackMode: X11State.StackMode?
+        // Read the whole list first, then validate, then apply - the same
+        // read-validate-apply the GC and window-attribute paths use. An
+        // erroring request that had already written `frame` and
+        // `borderWidth` left the record disagreeing with the real NSWindow
+        // and no `ConfigureNotify` to reconcile them, and the NEXT configure
+        // then computed `geometryChanged` against that bogus record. That is
+        // the stale-configure class this file has been bitten by before.
+        var values: [UInt32: UInt32] = [:]
+        var borderWidth: UInt16?
+        for bit: UInt32 in [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40] where valueMask & bit != 0 {
+            values[bit] = r.readU32()
+        }
+        if let raw = values[0x40] {
+            // Above, Below, TopIf, BottomIf, Opposite - a sixth value used
+            // to parse as nil and be silently skipped.
+            guard raw <= 4, let mode = X11State.StackMode(rawValue: UInt8(truncatingIfNeeded: raw)) else {
+                return sendError(code: X11ErrorCode.value, badValue: raw,
+                                 minorOpcode: 0, majorOpcode: X11Opcode.configureWindow)
+            }
+            stackMode = mode
+        }
+        if let named = values[0x20] {
+            sibling = named
+            // A named sibling must actually BE a sibling - same parent as
+            // the window being stacked. mslgd silently ignored one that was
+            // not (xdiff `window.stacking_modes`, 2026-09-29), so "raise me
+            // above that window" quietly did nothing instead of telling the
+            // client its assumption was wrong.
+            //
+            // Only this client's own ids are judged: with the per-app
+            // process split another client's window is legitimately absent
+            // from this `X11State`, and refusing it would break the very
+            // cross-client case the policy in `invalidResourceError` exists
+            // to protect.
+            if isOwnID(named) {
+                guard let siblingRecord = state.window(named), siblingRecord.parent == record.parent,
+                      named != wid else {
+                    return sendError(code: X11ErrorCode.match, badValue: named,
+                                     minorOpcode: 0, majorOpcode: X11Opcode.configureWindow)
+                }
             }
         }
+        // Everything validated - now apply.
+        if let v = values[0x01] { frame.origin.x = Double(Int32(bitPattern: v)) }
+        if let v = values[0x02] { frame.origin.y = Double(Int32(bitPattern: v)) }
+        if let v = values[0x04] { frame.size.width = Double(v) }
+        if let v = values[0x08] { frame.size.height = Double(v) }
+        if let v = values[0x10] { borderWidth = UInt16(truncatingIfNeeded: v) }
+        if let borderWidth { record.borderWidth = borderWidth }
         record.frame = frame
+
+        // Stack-mode used to be read only to keep the value list aligned,
+        // which made `XRaiseWindow` and `XLowerWindow` total no-ops - and
+        // those are how Qt and GTK3 bring a panel, sidebar or overlay to
+        // the front. Applied to both the model and the actual view order.
+        if let stackMode {
+            state.restack(wid, parent: record.parent, mode: stackMode, sibling: sibling)
+            restackViews(ofParent: record.parent)
+        }
         X11Trace.geometry("configure(mask=0x\(String(valueMask, radix: 16)))", windowID: wid, x: Int(frame.origin.x), y: Int(frame.origin.y), width: Int(frame.width), height: Int(frame.height))
         // A request that changes neither position nor size (stack-mode or
         // border-width only, or the same values again) must not touch AppKit
@@ -1107,7 +2710,13 @@ final class X11Connection: NSObject {
         let geometryChanged = Int(frame.origin.x) != Int(oldFrame.origin.x) || Int(frame.origin.y) != Int(oldFrame.origin.y)
             || Int(frame.width) != Int(oldSize.width) || Int(frame.height) != Int(oldSize.height)
         if geometryChanged { DispatchQueue.main.async {
-            record.view?.resize(width: Int(frame.width), height: Int(frame.height))
+            // Bit-gravity: `Forget` (the protocol default, and what this
+            // server reports) means the contents are undefined after a
+            // resize. The whole-window Expose below is the other half of
+            // this and is not optional - see `X11CanvasView.resize`.
+            record.view?.resize(width: Int(frame.width), height: Int(frame.height),
+                                preserveContent: record.bitGravity != 0,
+                                background: record.backgroundNone ? nil : record.backgroundPixel)
             if record.isTopLevel {
                 // `NSWindow.setFrame(_:display:)`, unlike the `contentRect:`
                 // parameter to `NSWindow(contentRect:styleMask:...)` used at
@@ -1178,8 +2787,11 @@ final class X11Connection: NSObject {
         // `xterm` (and most real clients) expect a `ConfigureNotify` after
         // any actual geometry change, mapped or not - some redraw logic
         // is gated on receiving one, not just on `Expose`.
-        if record.eventMask & 0x0002_0000 != 0 { // StructureNotifyMask
-            sendConfigureNotify(record)
+        // To the window's StructureNotify selectors AND its parent's
+        // SubstructureNotify ones - the parent half was missing, so a
+        // container never heard its children resize.
+        deliverStructureEvent(window: wid, parent: record.isTopLevel ? nil : record.parent) { eventWindow in
+            self.configureNotifyBytes(record, eventWindow: eventWindow)
         }
         // See `windowDidResize`'s doc comment - the exact same "growing a
         // window reveals a region nothing has ever painted, and
@@ -1197,8 +2809,15 @@ final class X11Connection: NSObject {
         // the user's exact "cutoff, fixes the moment I slightly resize
         // it" report. `windowDidResize` had this fix already; this path
         // never did.
+        //
+        // Now on ANY size change, not only a grow. A shrink used to send
+        // nothing, on the reasoning that no new area became visible - true
+        // while the old pixels were preserved, false now that a `Forget`
+        // resize discards them. A window cleared with nothing telling the
+        // client to paint it is simply blank. The reference damages the
+        // entire new area after every resize for the same reason.
         if record.eventMask & 0x0000_8000 != 0, // ExposureMask
-           frame.width > oldSize.width || frame.height > oldSize.height {
+           Int(frame.width) != Int(oldSize.width) || Int(frame.height) != Int(oldSize.height) {
             sendExposeEvent(windowID: wid, width: UInt16(clamping: Int(frame.width)), height: UInt16(clamping: Int(frame.height)))
         }
         // Same "a region is becoming visible with nothing telling the
@@ -1226,10 +2845,38 @@ final class X11Connection: NSObject {
 
     private func handleGetGeometry(body: [UInt8]) {
         let drawable = X11ByteReader(body, littleEndian: littleEndian).readU32()
-        let frame = state.window(drawable)?.frame ?? CGRect(x: 0, y: 0, width: 1, height: 1)
+        // A pixmap is a drawable and `GetGeometry` takes a DRAWABLE, but
+        // this only ever consulted windows - so every pixmap was answered
+        // 1x1, depth 24, while the trace line below already looked the
+        // pixmap up to label it. Cairo, Tk, Motif and Qt all ask a
+        // drawable they did not create for its own size, and then lay out
+        // whatever they derived from it at that size.
+        let window = state.window(drawable)
+        let pixmap = window == nil ? state.pixmap(drawable) : nil
+        let frame: CGRect
+        let depth: UInt8
+        if drawable == rootWindowID {
+            // The root is a drawable clients legitimately ask about, and
+            // it is not in `state.window` - so it fell through to the 1x1
+            // fallback. `xwininfo -root` printed "Width: 1  Height: 1"
+            // against this server, which is the shape of every layout
+            // decision a client derives from the root's size being wrong.
+            let (screenW, screenH) = Self.mainScreenSizeInPixels()
+            frame = CGRect(x: 0, y: 0, width: Double(screenW), height: Double(screenH))
+            depth = 24
+        } else if let window {
+            frame = window.frame
+            depth = 24
+        } else if let pixmap {
+            frame = CGRect(x: 0, y: 0, width: Double(pixmap.pixelWidth), height: Double(pixmap.pixelHeight))
+            depth = pixmap.depth
+        } else {
+            frame = CGRect(x: 0, y: 0, width: 1, height: 1)
+            depth = 24
+        }
         if X11Trace.enabled {
-            let kind = state.window(drawable) != nil ? "window" : (state.pixmap(drawable) != nil ? "pixmap" : "unknown")
-            FileHandle.standardError.write("[x11] getGeometry drawable=\(drawable) kind=\(kind) -> \(frame)\n".data(using: .utf8)!)
+            let kind = window != nil ? "window" : (pixmap != nil ? "pixmap" : "unknown")
+            MSLLog.line("x11", "getGeometry drawable=\(drawable) kind=\(kind) -> \(frame) depth=\(depth)")
         }
         let fw = X11ByteWriter(littleEndian: littleEndian)
         fw.writeU32(rootWindowID)
@@ -1237,9 +2884,9 @@ final class X11Connection: NSObject {
         fw.writeI16(Int16(clamping: Int(frame.origin.y)))
         fw.writeU16(UInt16(clamping: Int(frame.width)))
         fw.writeU16(UInt16(clamping: Int(frame.height)))
-        fw.writeU16(0) // border-width
+        fw.writeU16(window?.borderWidth ?? 0)
         fw.writePadding(10)
-        sendReply(fixed24: fw, detail: 24) // detail byte here is the drawable's depth
+        sendReply(fixed24: fw, detail: depth) // detail byte here is the drawable's depth
     }
 
     /// `QueryTree` - a window's root, parent, and direct children.
@@ -1264,19 +2911,65 @@ final class X11Connection: NSObject {
         sendReply(fixed24: fw, extra: extra.bytes)
     }
 
+    /// Every value-mask bit a window attribute list defines, low to high.
+    private static let windowValueBits: [UInt32] = [
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000,
+    ]
+
+    /// The enumerated window attributes. Gravities and backing-store decide
+    /// how a window survives being covered and resized; mslgd accepted any
+    /// value (xdiff `window.attribute_enums`, 2026-09-29), so a client's own
+    /// bug surfaced later as a rendering fault with nothing pointing back.
+    private static let windowEnumRanges: [UInt32: ClosedRange<UInt32>] = [
+        0x10: 0...10,   // bit-gravity: Forget ... StaticGravity
+        0x20: 0...10,   // win-gravity: Unmap ... StaticGravity
+        0x40: 0...2,    // backing-store: NotUseful, WhenMapped, Always
+    ]
+
     private func handleChangeWindowAttributes(body: [UInt8]) {
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let wid = r.readU32()
         let valueMask = r.readU32()
         guard let record = state.window(wid) else { return }
+        // Read first, validate, then apply - same reason as `applyGCValues`:
+        // a window left half-changed behind an error is worse than either
+        // outcome on its own.
+        var attributes: [UInt32: UInt32] = [:]
+        for bit in Self.windowValueBits where valueMask & bit != 0 {
+            attributes[bit] = r.readU32()
+        }
+        for (bit, range) in Self.windowEnumRanges {
+            guard let value = attributes[bit], !range.contains(value) else { continue }
+            return sendError(code: X11ErrorCode.value, badValue: value,
+                             minorOpcode: 0, majorOpcode: currentOpcode)
+        }
         var overrideRedirect: Bool?
-        for bit: UInt32 in [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000] {
-            guard valueMask & bit != 0 else { continue }
-            let value = r.readU32()
-            if bit == 0x02 { record.backgroundPixel = value }
+        for bit in Self.windowValueBits {
+            guard let value = attributes[bit] else { continue }
+            // GTK sets these after creation far more often than at it -
+            // measured: every `background-pixmap` in a GIMP + Mousepad
+            // session arrived here, none at `CreateWindow` - so fixing one
+            // loop and not the other would have fixed nothing.
+            if bit == 0x01 {
+                record.backgroundNone = value == 0
+                record.backgroundParentRelative = value == 1
+            }
+            if bit == 0x02 {
+                record.backgroundPixel = value
+                record.backgroundNone = false
+                record.backgroundParentRelative = false
+            }
+            if bit == 0x10 { record.bitGravity = UInt8(truncatingIfNeeded: value) }
             if bit == 0x200 { overrideRedirect = value != 0 } // CWOverrideRedirect
             if bit == 0x800 {
-                record.eventMask = value
+                if wid >> 21 == clientIndex || wid == rootWindowID {
+                    record.eventMask = value
+                } else if value == 0 {
+                    record.otherClientMasks.removeValue(forKey: clientIndex)
+                } else {
+                    record.otherClientMasks[clientIndex] = value
+                }
                 X11Trace.eventMask(windowID: wid, mask: value, source: "ChangeWindowAttributes")
             }
         }
@@ -1295,13 +2988,27 @@ final class X11Connection: NSObject {
         let record = state.window(wid)
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(1) // Reply
-        w.writeU8(1) // backing-store: WhenMapped
-        w.writeU16(sequenceNumber)
+        // `NotUseful`, matching what the connection setup advertises at
+        // screen level (`backing-stores: Never`). Claiming WhenMapped here
+        // told clients this server would preserve obscured content for
+        // them, which it does not promise to.
+        w.writeU8(0) // backing-store: NotUseful
+        w.writeU16(stampSequence)
         w.writeU32(3) // reply length: (44 - 32) / 4
-        w.writeU32(visualID)
+        w.writeU32(record.flatMap { $0.visual != 0 ? $0.visual : nil } ?? visualID)
         w.writeU16(1) // class: InputOutput
-        w.writeU8(0) // bit-gravity
-        w.writeU8(0) // win-gravity
+        // Forget (0) is the protocol default for bit-gravity and is
+        // honest about what happens on resize here. NorthWest (1) is the
+        // default for WIN-gravity; 0 means UnmapGravity, which says a
+        // child gets UNMAPPED when its parent resizes - `xwininfo` duly
+        // reported "Window Gravity State: UnmapGravity" for every window.
+        // The bit-gravity the window was actually created with, not a
+        // constant: it is honoured for real now (campaign F5), and a client
+        // that sets NorthWest and reads back Forget has to assume the server
+        // will not preserve its pixels and redraw everything itself (xdiff
+        // `window.attributes`, 2026-09-28).
+        w.writeU8(record?.bitGravity ?? 0) // bit-gravity
+        w.writeU8(1) // win-gravity: NorthWest
         w.writeU32(0) // backing-planes
         w.writeU32(0) // backing-pixel
         w.writeU8(0) // save-under
@@ -1309,8 +3016,10 @@ final class X11Connection: NSObject {
         w.writeU8((record?.mapped ?? false) ? 2 : 0) // map-state: Viewable / Unmapped
         w.writeU8((record?.overrideRedirect ?? false) ? 1 : 0) // override-redirect
         w.writeU32(colormapID)
-        w.writeU32(0x01FF_FFFF) // all-event-masks: everything this server understands
-        w.writeU32(record?.eventMask ?? 0)
+        let mine = record.map { wid >> 21 == clientIndex || wid == rootWindowID ? $0.eventMask : $0.otherClientMasks[clientIndex] ?? 0 } ?? 0
+        let all = record.map { $0.otherClientMasks.values.reduce($0.eventMask, |) } ?? 0
+        w.writeU32(all) // all-event-masks: the union over every selecting client
+        w.writeU32(mine) // your-event-mask: this client's own selection
         w.writeU16(0) // do-not-propagate-mask
         w.writePadding(2)
         writeFull(w.bytes)
@@ -1335,7 +3044,51 @@ final class X11Connection: NSObject {
         applyGCValues(valueMask: valueMask, reader: r, into: record)
     }
 
+    /// The enumerated GC attributes and their legal ranges, by value-mask
+    /// bit. Real values from `<X11/X.h>`; anything outside the range is
+    /// `BadValue`.
+    ///
+    /// mslgd accepted every one of these silently (xdiff `gc.attributes`,
+    /// 2026-09-29). That is worse than it sounds: an illegal fill-style or
+    /// arc-mode is a client bug that then shows up as wrong *drawing* much
+    /// later, with nothing connecting it back to the request that caused it.
+    private static let gcEnumRanges: [UInt32: ClosedRange<UInt32>] = [
+        0x01: 0...15,       // function: GXclear ... GXset
+        0x20: 0...2,        // line-style: Solid, OnOffDash, DoubleDash
+        0x40: 0...3,        // cap-style: NotLast, Butt, Round, Projecting
+        0x80: 0...2,        // join-style: Miter, Round, Bevel
+        0x100: 0...3,       // fill-style: Solid, Tiled, Stippled, OpaqueStippled
+        0x200: 0...1,       // fill-rule: EvenOdd, Winding
+        0x8000: 0...1,      // subwindow-mode: ClipByChildren, IncludeInferiors
+        0x40_0000: 0...1,   // arc-mode: Chord, PieSlice
+    ]
+
+    /// Every value-mask bit a GC defines, low to high - the order the
+    /// values arrive in on the wire.
+    private static let gcValueBits: [UInt32] = [
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800,
+        0x1000, 0x2000, 0x4000, 0x8000, 0x1_0000, 0x2_0000, 0x4_0000, 0x8_0000,
+        0x10_0000, 0x20_0000, 0x40_0000,
+    ]
+
     private func applyGCValues(valueMask: UInt32, reader r: X11ByteReader, into record: X11State.GCRecord) {
+        // Read the whole list first, then validate, then apply. Validating
+        // as we go would leave a GC half-changed behind the error, and a
+        // client that gets an error reasonably assumes nothing happened.
+        var values: [UInt32: UInt32] = [:]
+        for bit in Self.gcValueBits where valueMask & bit != 0 {
+            values[bit] = r.readU32()
+        }
+        for (bit, range) in Self.gcEnumRanges {
+            guard let value = values[bit], !range.contains(value) else { continue }
+            sendError(code: X11ErrorCode.value, badValue: value,
+                      minorOpcode: 0, majorOpcode: currentOpcode)
+            return
+        }
+        applyValidatedGCValues(values, into: record)
+    }
+
+    private func applyValidatedGCValues(_ values: [UInt32: UInt32], into record: X11State.GCRecord) {
         // GCClipMask (bit 19, 0x8_0000): a client sets this to reset the
         // GC's clip - either to `None` (fully unclipped) or to an
         // arbitrary bitmap pixmap mask, which this server doesn't
@@ -1354,13 +3107,27 @@ final class X11Connection: NSObject {
         // value (None or a real pixmap) clears our rectangle-based clip -
         // a stale WRONG clip is worse than no clip, and a real bitmap
         // clip mask isn't implemented here regardless.
-        for bit: UInt32 in [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x100, 0x200, 0x400, 0x800, 0x1000, 0x2000, 0x4000, 0x8000, 0x1_0000, 0x2_0000, 0x4_0000, 0x8_0000, 0x10_0000, 0x20_0000, 0x40_0000] {
-            guard valueMask & bit != 0 else { continue }
-            let value = r.readU32()
+        for bit in Self.gcValueBits {
+            guard let value = values[bit] else { continue }
+            if bit == 0x01 { record.function = UInt8(truncatingIfNeeded: value) } // GCFunction
             if bit == 0x04 { record.foreground = value }
             if bit == 0x08 { record.background = value }
             if bit == 0x4000 { record.font = value } // GCFont
-            if bit == 0x8_0000 { record.clipRectangles = nil }
+            if bit == 0x100 { record.fillStyle = UInt8(truncatingIfNeeded: value) } // GCFillStyle
+            if bit == 0x400 { record.tile = value } // GCTile
+            if bit == 0x800 { record.stipple = value } // GCStipple
+            if bit == 0x1000 { record.tsOrigin.x = Double(Int32(bitPattern: value)) } // GCTileStipXOrigin
+            if bit == 0x2000 { record.tsOrigin.y = Double(Int32(bitPattern: value)) } // GCTileStipYOrigin
+            if bit == 0x1_0000 { record.graphicsExposures = value != 0 } // GCGraphicsExposures
+            // GCClipXOrigin / GCClipYOrigin - signed, in a CARD32 slot.
+            // Dropping these was the half of F4 that reaches GTK and Qt:
+            // a toolkit reusing one GC across widgets sets the rectangles
+            // once and then moves them with the origin.
+            if bit == 0x2_0000 { record.clipOrigin.x = Double(Int32(bitPattern: value)) }
+            if bit == 0x4_0000 { record.clipOrigin.y = Double(Int32(bitPattern: value)) }
+            // The mask reset clears the rectangles but NOT the origin,
+            // which persists in its own right.
+            if bit == 0x8_0000 { record.clipRectanglesRaw = nil }
         }
     }
 
@@ -1373,7 +3140,15 @@ final class X11Connection: NSObject {
     /// does exactly this routinely (clip to a widget's damaged region,
     /// draw, then clip-to-nothing/reset) - so `nil` (not an empty array)
     /// specifically means "no clip" throughout this file.
-    private func handleSetClipRectangles(body: [UInt8]) {
+    private func handleSetClipRectangles(ordering: UInt8, body: [UInt8]) {
+        // Unsorted, YSorted, YXSorted, YXBanded. The ordering is only a
+        // promise about the list, so this server can ignore what it says -
+        // but a fifth value is still `BadValue`, because a client sending
+        // one has a bug worth hearing about.
+        guard ordering <= 3 else {
+            return sendError(code: X11ErrorCode.value, badValue: UInt32(ordering),
+                             minorOpcode: 0, majorOpcode: X11Opcode.setClipRectangles)
+        }
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let gcId = r.readU32()
         let originX = Double(r.readI16())
@@ -1383,11 +3158,15 @@ final class X11Connection: NSObject {
         while r.remaining >= 8 {
             let x = r.readI16(); let y = r.readI16()
             let w = r.readU16(); let h = r.readU16()
-            rects.append(CGRect(x: originX + Double(x), y: originY + Double(y), width: Double(w), height: Double(h)))
+            rects.append(CGRect(x: Double(x), y: Double(y), width: Double(w), height: Double(h)))
         }
-        gc.clipRectangles = rects.isEmpty ? nil : rects
+        // Rectangles stored unshifted, origin stored beside them - so a
+        // later `ChangeGC(clip-x-origin)` moves them, which it could not
+        // do when the origin was baked in here.
+        gc.clipRectanglesRaw = rects.isEmpty ? nil : rects
+        gc.clipOrigin = CGPoint(x: originX, y: originY)
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] setClipRectangles gc=\(gcId) origin=(\(originX),\(originY)) rects=\(rects)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "setClipRectangles gc=\(gcId) origin=(\(originX),\(originY)) rects=\(rects)")
         }
     }
 
@@ -1414,9 +3193,12 @@ final class X11Connection: NSObject {
         let blue = r.readU16()
         let pixel = (UInt32(red >> 8) << 16) | (UInt32(green >> 8) << 8) | UInt32(blue >> 8)
         let fw = X11ByteWriter(littleEndian: littleEndian)
-        fw.writeU16(red)
-        fw.writeU16(green)
-        fw.writeU16(blue)
+        // The colour the pixel actually shows (8 bits per channel,
+        // widened as QueryColors does), not the request echoed back: a
+        // client comparing the two decides whether it got an exact match.
+        fw.writeU16((red >> 8) * 257)
+        fw.writeU16((green >> 8) * 257)
+        fw.writeU16((blue >> 8) * 257)
         fw.writePadding(2)
         fw.writeU32(pixel)
         fw.writePadding(12)
@@ -1523,15 +3305,103 @@ final class X11Connection: NSObject {
         guard let target = state.drawable(drawableId) else { return }
         let color = state.gc(gcId)?.foreground ?? 0x0000_0000
         let clip = state.gc(gcId)?.clipRectangles
+        let function = state.gc(gcId)?.function ?? 3
         var rects: [CGRect] = []
         while r.remaining >= 8 {
             let x = r.readI16(); let y = r.readI16()
             let w = r.readU16(); let h = r.readU16()
             rects.append(CGRect(x: Double(x), y: Double(y), width: Double(w), height: Double(h)))
         }
-        DispatchQueue.main.async {
-            for rect in rects { target.fillWithColor(color, rect: rect, clip: clip) }
+        if let pattern = fillPattern(gcId) {
+            DispatchQueue.main.async {
+                for rect in rects {
+                    Self.fillPatterned(target.bitmapContext, pattern, area: rect, clip: clip, function: function) { ctx in
+                        ctx.addRect(rect)
+                    }
+                    target.notifyChanged(damage: rect)
+                }
+            }
+            return
         }
+        DispatchQueue.main.async {
+            for rect in rects {
+                target.fillWithColor(color, rect: rect, clip: clip,
+                                     blend: Self.blendMode(forFunction: function))
+            }
+        }
+    }
+
+    /// A GC's non-solid fill, resolved at request time (the pixmaps are
+    /// looked up now, as the protocol says: later changes to the GC don't
+    /// affect this request). nil for FillSolid or a missing pixmap.
+    struct FillPattern {
+        let style: UInt8
+        let source: X11Drawable
+        let foreground: UInt32
+        let background: UInt32
+        let origin: CGPoint
+    }
+
+    private func fillPattern(_ gcId: UInt32) -> FillPattern? {
+        guard let gc = state.gc(gcId), gc.fillStyle != 0 else { return nil }
+        let id = gc.fillStyle == 1 ? gc.tile : gc.stipple
+        guard let source = state.drawable(id) else { return nil }
+        return FillPattern(style: gc.fillStyle, source: source, foreground: gc.foreground,
+                           background: gc.background, origin: gc.tsOrigin)
+    }
+
+    /// Fills the shape `addShape` adds, through `pattern`: a tile's own
+    /// pixels, or the stipple's set bits in the foreground (unset bits in
+    /// the background for FillOpaqueStippled, untouched for FillStippled),
+    /// anchored at the TS origin. Built pixel by pixel over the shape's
+    /// bounding box and drawn unscaled, so it is exact.
+    static func fillPatterned(_ ctx: CGContext, _ pattern: FillPattern, area: CGRect, clip: [CGRect]?,
+                              function: UInt8, addShape: (CGContext) -> Void) {
+        let box = area.integral.intersection(CGRect(x: 0, y: 0, width: ctx.width, height: ctx.height))
+        guard !box.isNull, box.width >= 1, box.height >= 1 else { return }
+        let w = Int(box.width), h = Int(box.height)
+        let src = pattern.source.bitmapContext
+        let sw = pattern.source.pixelWidth, sh = pattern.source.pixelHeight
+        guard sw > 0, sh > 0, let srcBase = src.data else { return }
+        let srcRow = src.bytesPerRow
+        let s = srcBase.bindMemory(to: UInt8.self, capacity: srcRow * sh)
+        var out = [UInt8](repeating: 0, count: w * h * 4)
+        func rgba(_ pixel: UInt32) -> (UInt8, UInt8, UInt8) {
+            (UInt8((pixel >> 16) & 0xFF), UInt8((pixel >> 8) & 0xFF), UInt8(pixel & 0xFF))
+        }
+        let fg = rgba(pattern.foreground), bg = rgba(pattern.background)
+        let ox = Int(pattern.origin.x), oy = Int(pattern.origin.y)
+        for row in 0..<h {
+            let y = Int(box.minY) + row
+            let sy = ((y - oy) % sh + sh) % sh
+            for col in 0..<w {
+                let x = Int(box.minX) + col
+                let sx = ((x - ox) % sw + sw) % sw
+                let si = sy * srcRow + sx * 4
+                let o = (row * w + col) * 4
+                if pattern.style == 1 {
+                    out[o] = s[si]; out[o + 1] = s[si + 1]; out[o + 2] = s[si + 2]; out[o + 3] = 255
+                } else if s[si + 3] >= 128 { // a set stipple bit (see bitmapBytes)
+                    out[o] = fg.0; out[o + 1] = fg.1; out[o + 2] = fg.2; out[o + 3] = 255
+                } else if pattern.style == 3 {
+                    out[o] = bg.0; out[o + 1] = bg.1; out[o + 2] = bg.2; out[o + 3] = 255
+                }
+            }
+        }
+        guard let provider = CGDataProvider(data: Data(out) as CFData),
+              let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                                  space: x11DeviceRGB, bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                                  provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        else { return }
+        ctx.saveGState()
+        if let clip { ctx.clip(to: clip) }
+        ctx.beginPath()
+        addShape(ctx)
+        ctx.clip(using: .evenOdd)
+        ctx.setBlendMode(blendMode(forFunction: function))
+        ctx.interpolationQuality = .none
+        drawImageTopLeftOriented(image, in: box, on: ctx)
+        ctx.restoreGState()
     }
 
     /// `ClearArea` (opcode 61) - `detail`'s bit 0 is the request's own
@@ -1567,7 +3437,19 @@ final class X11Connection: NSObject {
         let fullWidth = w == 0 ? max(0, record.frame.width - Double(x)) : Double(w)
         let fullHeight = h == 0 ? max(0, record.frame.height - Double(y)) : Double(h)
         let requestedRect = CGRect(x: Double(x), y: Double(y), width: fullWidth, height: fullHeight)
-        DispatchQueue.main.async { record.view?.fillWithColor(bg, rect: requestedRect) }
+        // A window whose background is None (or ParentRelative) must have
+        // its contents LEFT ALONE - the fill is what was painting white
+        // over correct content on every `XClearArea` from a GTK client.
+        //
+        // The Expose below still goes out, and that is not an oversight:
+        // the doc comment above records that the *Expose* half of this
+        // handler was the live fix for galculator's blank button labels -
+        // GTK erases and then waits for the repaint cue. An early return
+        // here that skipped both would put those blank labels straight
+        // back.
+        if !record.backgroundNone && !record.backgroundParentRelative {
+            DispatchQueue.main.async { record.view?.fillWithColor(bg, rect: requestedRect) }
+        }
         if detail & 0x1 != 0 {
             // `Expose`'s x/y/width/height are all unsigned (`CARD16`) -
             // clip the requested rect to the window's own visible bounds
@@ -1598,9 +3480,24 @@ final class X11Connection: NSObject {
         let srcX = r.readI16(); let srcY = r.readI16()
         let dstX = r.readI16(); let dstY = r.readI16()
         let w = r.readU16(); let h = r.readU16()
-        guard let srcDrawable = state.drawable(src), let dstDrawable = state.drawable(dst) else { return }
+        // A silent return here answers NOTHING: not the `NoExpose` this
+        // handler owes further down, and not an error. Xt, Motif and Tk
+        // clients block waiting for that NoExpose, so a CopyArea naming a
+        // pixmap an earlier request in the same burst already freed - routine
+        // during GIMP layer churn - hung them forever. Real Xorg answers
+        // BadDrawable, so do that.
+        guard let srcDrawable = state.drawable(src), let dstDrawable = state.drawable(dst) else {
+            // Not for the root window, which has no backing drawable
+            // here: turning that into an error would kill clients that
+            // copy to or from it, where before they merely drew nothing.
+            guard src != rootWindowID, dst != rootWindowID else { return }
+            sendError(code: X11ErrorCode.drawable,
+                      badValue: state.drawable(src) == nil ? src : dst,
+                      minorOpcode: 0, majorOpcode: X11Opcode.copyArea)
+            return
+        }
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] copyArea gc=\(gcId) src=\(src) dst=\(dst) srcXY=(\(srcX),\(srcY)) dstXY=(\(dstX),\(dstY)) wh=(\(w),\(h)) clipRects=\(String(describing: state.gc(gcId)?.clipRectangles))\n".data(using: .utf8)!)
+            MSLLog.line("x11", "copyArea gc=\(gcId) src=\(src) dst=\(dst) srcXY=(\(srcX),\(srcY)) dstXY=(\(dstX),\(dstY)) wh=(\(w),\(h)) function=\(state.gc(gcId)?.function ?? 3) clipRects=\(String(describing: state.gc(gcId)?.clipRectangles))")
         }
         // Resolved synchronously, same reasoning as `handleRenderComposite`'s
         // own doc comment on why: reading GC state (or a drawable, by ID)
@@ -1608,6 +3505,21 @@ final class X11Connection: NSObject {
         // have already run and mutated/removed it - reads whatever the
         // state happens to be LATER, not what it was for THIS request.
         let clipRects = state.gc(gcId)?.clipRectangles
+        // `CopyArea`'s GC components include **function**, not just the
+        // clip, and this handler used to ignore it: a GXxor blit was drawn
+        // as GXcopy. `beginCoreStroke` has honoured `function` for the
+        // `Poly*` handlers all along; this path and `PutImage` were simply
+        // never wired to `blendMode(forFunction:)`. XOR blitting is the
+        // classic way to draw something that must be undrawn without
+        // repainting what is beneath it - rubber bands, drag outlines.
+        //
+        // Found while chasing Krita's dotted magenta brush outline
+        // (2026-09-23), which turned out NOT to be this: the trace showed
+        // every one of those blits at `function=3`. Krita's software canvas
+        // XORs the outline into its own buffer before uploading it, so the
+        // bytes arrived already dotted. See `Guest/init/msl-eglsize.c` for
+        // what that actually was. This stays because the spec requires it.
+        let function = state.gc(gcId)?.function ?? 3
         DispatchQueue.main.async {
             // `CGImage.cropping(to:)` on a `makeImage()` snapshot of THIS
             // server's own `bitmapContext`s addresses the image using the
@@ -1653,13 +3565,203 @@ final class X11Connection: NSObject {
             if let clipRects {
                 ctx.saveGState()
                 ctx.clip(to: clipRects)
-                drawImageTopLeftOriented(cropped, in: dstRect, on: ctx)
+                Self.withFunction(function, on: ctx) { drawImageTopLeftOriented(cropped, in: dstRect, on: ctx) }
                 ctx.restoreGState()
             } else {
-                drawImageTopLeftOriented(cropped, in: dstRect, on: ctx)
+                Self.withFunction(function, on: ctx) { drawImageTopLeftOriented(cropped, in: dstRect, on: ctx) }
             }
-            dstDrawable.notifyChanged()
+            // `dstRect` is exactly what was touched. `CopyArea` is how
+            // GDK flushes its offscreen buffer, so this is one of the two
+            // paths a real repaint actually travels.
+            dstDrawable.notifyChanged(damage: dstRect)
         }
+        // The protocol requires every `CopyArea` through a GC with
+        // `graphics-exposures` set to be answered with either
+        // `GraphicsExpose` events or exactly one `NoExpose` - and that GC
+        // component DEFAULTS to True, so "we never set it" is not a reason
+        // to skip it. Xt, Motif and Tk clients block waiting for it before
+        // continuing a redraw, which is a large part of why xclock, xcalc,
+        // gitk and IDLE half-draw here.
+        //
+        // Unconditionally `NoExpose`, and that is not a shortcut: the
+        // source of a copy in this server is always a live in-memory
+        // bitmap, never an obscured window or freed backing store, so
+        // there is never a region the server failed to copy. Once the GC's
+        // `graphics-exposures` bit is actually tracked (doc 10 F4) this
+        // should be gated on it.
+        if state.gc(gcId)?.graphicsExposures ?? true {
+            // **Not unconditionally NoExpose.** The old reasoning - "the
+            // source is always a live in-memory bitmap, never obscured, so
+            // nothing can fail to copy" - holds for OBSCURED regions but
+            // not for a source rectangle reaching outside the source
+            // drawable. Those pixels do not exist, and a client told
+            // `NoExpose` believes the whole area arrived, so it never
+            // repaints the part that did not: stale pixels that persist
+            // until something else happens to damage them.
+            // (xdiff `image.copyarea_expose_events`: Xorg sends 13, this
+            // sent 14, for both partly- and wholly-outside sources.)
+            let uncovered = Self.uncoveredDestinationRects(
+                srcX: Int(srcX), srcY: Int(srcY), dstX: Int(dstX), dstY: Int(dstY),
+                w: Int(w), h: Int(h),
+                sourceWidth: srcDrawable.pixelWidth, sourceHeight: srcDrawable.pixelHeight)
+            if uncovered.isEmpty {
+                sendNoExpose(drawable: dst, majorOpcode: X11Opcode.copyArea)
+            } else {
+                for (index, rect) in uncovered.enumerated() {
+                    sendGraphicsExpose(drawable: dst, rect: rect,
+                                       count: UInt16(uncovered.count - index - 1),
+                                       majorOpcode: X11Opcode.copyArea)
+                }
+            }
+        }
+    }
+
+    /// The parts of a copy's DESTINATION that its source could not fill,
+    /// because the source rectangle reached outside the source drawable.
+    /// Returned as up to four strips (above, below, left, right), which is
+    /// what a real server's region subtraction degenerates to for one
+    /// rectangle clipped against another.
+    static func uncoveredDestinationRects(srcX: Int, srcY: Int, dstX: Int, dstY: Int,
+                                          w: Int, h: Int,
+                                          sourceWidth: Int, sourceHeight: Int)
+        -> [(x: Int, y: Int, w: Int, h: Int)] {
+        let availX = max(srcX, 0), availY = max(srcY, 0)
+        let availRight = min(srcX + w, sourceWidth)
+        let availBottom = min(srcY + h, sourceHeight)
+        // Nothing of the source rectangle exists: the whole destination is
+        // uncovered.
+        guard availRight > availX, availBottom > availY else {
+            return w > 0 && h > 0 ? [(dstX, dstY, w, h)] : []
+        }
+        // Covered part, expressed in destination coordinates.
+        let offX = dstX - srcX, offY = dstY - srcY
+        let cx = availX + offX, cy = availY + offY
+        let cw = availRight - availX, ch = availBottom - availY
+        var out: [(x: Int, y: Int, w: Int, h: Int)] = []
+        if cy > dstY { out.append((dstX, dstY, w, cy - dstY)) }
+        if cy + ch < dstY + h { out.append((dstX, cy + ch, w, dstY + h - (cy + ch))) }
+        if cx > dstX { out.append((dstX, cy, cx - dstX, ch)) }
+        if cx + cw < dstX + w { out.append((cx + cw, cy, dstX + w - (cx + cw), ch)) }
+        return out.filter { $0.w > 0 && $0.h > 0 }
+    }
+
+    private func sendGraphicsExpose(drawable: UInt32, rect: (x: Int, y: Int, w: Int, h: Int),
+                                    count: UInt16, majorOpcode: UInt8) {
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU8(13) // GraphicsExpose
+        w.writePadding(1)
+        w.writeU16(stampSequence)
+        w.writeU32(drawable)
+        w.writeU16(UInt16(clamping: rect.x))
+        w.writeU16(UInt16(clamping: rect.y))
+        w.writeU16(UInt16(clamping: rect.w))
+        w.writeU16(UInt16(clamping: rect.h))
+        w.writeU16(0) // minor-opcode
+        w.writeU16(count)
+        w.writeU8(majorOpcode)
+        w.writePadding(11)
+        writeFull(w.bytes)
+    }
+
+    /// `CopyPlane` (63): one bit plane of the source, as foreground where
+    /// set and background where clear. How Xaw, Tk and Motif draw every
+    /// 1-bit bitmap - icons, check marks, xeyes' and xlogo's shapes, Tk
+    /// `-bitmap` images. It was not dispatched at all, so all of them drew
+    /// nothing. A depth-1 source's bit is its alpha (see `bitmapBytes`);
+    /// a deeper one's is `pixel & bit-plane`.
+    private func handleCopyPlane(body: [UInt8]) {
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        let src = r.readU32(), dst = r.readU32(), gcId = r.readU32()
+        let srcX = Int(r.readI16()), srcY = Int(r.readI16())
+        let dstX = Int(r.readI16()), dstY = Int(r.readI16())
+        let w = Int(r.readU16()), h = Int(r.readU16())
+        let plane = r.readU32()
+        guard let source = state.drawable(src), let target = state.drawable(dst) else {
+            // Neither NoExpose nor an error used to go out here, and Xt,
+            // Motif and Tk block waiting for that NoExpose.
+            // Not for the root window, which has no backing drawable
+            // here: turning that into an error would kill clients that
+            // copy to or from it, where before they merely drew nothing.
+            guard src != rootWindowID, dst != rootWindowID else { return }
+            sendError(code: X11ErrorCode.drawable,
+                      badValue: state.drawable(src) == nil ? src : dst,
+                      minorOpcode: 0, majorOpcode: X11Opcode.copyPlane)
+            return
+        }
+        // "exactly one bit set, and that bit a plane of the source" - plane
+        // was read and never looked at (xdiff `image.copyarea_edges`: zero,
+        // two-bit and above-depth planes all answered "Ok").
+        let sourceDepth = Int(state.pixmap(src)?.depth ?? 24)
+        guard plane != 0, plane & (plane &- 1) == 0,
+              plane.trailingZeroBitCount < sourceDepth else {
+            sendError(code: X11ErrorCode.value, badValue: plane,
+                      minorOpcode: 0, majorOpcode: X11Opcode.copyPlane)
+            return
+        }
+        guard w > 0, h > 0 else { return }
+        let gc = state.gc(gcId)
+        let fg = gc?.foreground ?? 0, bg = gc?.background ?? 0xFFFFFF
+        let clip = gc?.clipRectangles
+        let function = gc?.function ?? 3
+        let sourceIsBitmap = state.pixmap(src)?.depth == 1
+        DispatchQueue.main.async {
+            let sctx = source.bitmapContext
+            guard let base = sctx.data else { return }
+            let sw = source.pixelWidth, sh = source.pixelHeight, row = sctx.bytesPerRow
+            let sp = base.bindMemory(to: UInt8.self, capacity: row * sh)
+            var out = [UInt8](repeating: 0, count: w * h * 4)
+            for y in 0..<h {
+                let sy = srcY + y
+                guard sy >= 0, sy < sh else { continue }
+                for x in 0..<w {
+                    let sx = srcX + x
+                    guard sx >= 0, sx < sw else { continue }
+                    let i = sy * row + sx * 4
+                    let set: Bool
+                    if sourceIsBitmap {
+                        set = sp[i + 3] >= 128
+                    } else {
+                        let pixel = UInt32(sp[i]) << 16 | UInt32(sp[i + 1]) << 8 | UInt32(sp[i + 2])
+                        set = pixel & plane != 0
+                    }
+                    let c = set ? fg : bg
+                    let o = (y * w + x) * 4
+                    out[o] = UInt8((c >> 16) & 0xFF); out[o + 1] = UInt8((c >> 8) & 0xFF)
+                    out[o + 2] = UInt8(c & 0xFF); out[o + 3] = 255
+                }
+            }
+            guard let provider = CGDataProvider(data: Data(out) as CFData),
+                  let image = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                                      space: x11DeviceRGB,
+                                      bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                                      provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+            else { return }
+            let rect = CGRect(x: dstX, y: dstY, width: w, height: h)
+            let ctx = target.bitmapContext
+            ctx.saveGState()
+            if let clip { ctx.clip(to: clip) }
+            ctx.setBlendMode(Self.blendMode(forFunction: function))
+            ctx.interpolationQuality = .none
+            drawImageTopLeftOriented(image, in: rect, on: ctx)
+            ctx.restoreGState()
+            target.notifyChanged(damage: rect)
+        }
+        if gc?.graphicsExposures ?? true {
+            sendNoExpose(drawable: dst, majorOpcode: 63)
+        }
+    }
+
+    /// "The copy you asked for succeeded in full." 32 bytes, event code 14.
+    private func sendNoExpose(drawable: UInt32, minorOpcode: UInt16 = 0, majorOpcode: UInt8) {
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU8(14) // NoExpose
+        w.writePadding(1)
+        w.writeU16(stampSequence)
+        w.writeU32(drawable)
+        w.writeU16(minorOpcode)
+        w.writeU8(majorOpcode)
+        w.writePadding(21) // 1 + 1 + 2 + 4 + 2 + 1 = 11 bytes written, 32 total
+        writeFull(w.bytes)
     }
 
     private func handleCreatePixmap(detail: UInt8, body: [UInt8]) {
@@ -1668,11 +3770,23 @@ final class X11Connection: NSObject {
         r.skip(4) // drawable (depth/screen context) - unused, only the one TrueColor format exists
         let width = Int(r.readU16())
         let height = Int(r.readU16())
+        // `BadAlloc` is exactly what this error code is for, and it is a
+        // far better answer than the force-unwrapped `CGContext` that used
+        // to trap and take the host process - and every one of that app's
+        // windows - with it.
+        guard width > 0, height > 0,
+              width <= Self.maxDrawableSide, height <= Self.maxDrawableSide else {
+            if X11Trace.enabled {
+                MSLLog.line("x11", "createPixmap REFUSED id=\(pid) w=\(width) h=\(height)")
+            }
+            sendError(code: X11ErrorCode.alloc, badValue: pid, minorOpcode: 0, majorOpcode: X11Opcode.createPixmap)
+            return
+        }
         // The header's second byte is the depth. Storage is RGBA whatever it
         // is; it's recorded so GetImage can return alpha for depth 32.
         _ = state.makePixmap(id: pid, width: width, height: height, depth: detail)
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] createPixmap id=\(pid) w=\(width) h=\(height) depth=\(detail)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "createPixmap id=\(pid) w=\(width) h=\(height) depth=\(detail)")
         }
     }
 
@@ -1730,8 +3844,78 @@ final class X11Connection: NSObject {
         let leftPad = Int(r.readU8()) // only meaningful for a bitmap
         let depth = r.readU8()
         r.skip(2) // unused
-        // At depth 1 there is only one plane, so Bitmap (0), XYPixmap (1)
-        // and ZPixmap (2) all carry the same bits.
+        // Bitmap (0), XYPixmap (1), ZPixmap (2) - nothing else exists, and
+        // an unknown format used to be dropped in silence (xdiff
+        // `image.formats`, 2026-09-29).
+        guard detail <= 2 else {
+            return sendError(code: X11ErrorCode.value, badValue: UInt32(detail),
+                             minorOpcode: 0, majorOpcode: X11Opcode.putImage)
+        }
+        // XYBitmap carries exactly one plane, so its depth must be 1
+        // whatever the destination is.
+        guard detail != 0 || depth == 1 else {
+            return sendError(code: X11ErrorCode.match, badValue: 0,
+                             minorOpcode: 0, majorOpcode: X11Opcode.putImage)
+        }
+        // For the other two the depth must be the drawable's own: writing
+        // 8-bit rows into a 24-bit drawable is not a conversion request,
+        // it is a client bug, and a real server says so.
+        //
+        // Only for PIXMAPS, whose depth is known exactly. A window's depth
+        // here is a property of its visual and is not tracked with the same
+        // confidence, and a wrong `BadMatch` would refuse a request a real
+        // client sends - worse than the leniency it would replace, which is
+        // the rule this campaign has settled on everywhere else.
+        if detail != 0, let pixmap = state.pixmap(drawableId), depth != pixmap.depth {
+            return sendError(code: X11ErrorCode.match, badValue: 0,
+                             minorOpcode: 0, majorOpcode: X11Opcode.putImage)
+        }
+        // **The image data must be exactly the size the header describes.**
+        // None of this was checked, so a request claiming 4000x4000 with
+        // eight bytes behind it was accepted and quietly drew nothing
+        // (xdiff `image.putimage_edges`: six BadLength and two BadMatch
+        // cases all answered "Ok"). A real server refuses, and it matters
+        // here more than most places - a wrong size means every later byte
+        // of that request was interpreted as pixels.
+        //
+        // ZPixmap packs `width` pixels at the format's bits-per-pixel and
+        // pads each scanline to 32 bits; Bitmap and XYPixmap pack one bit
+        // per pixel, `leftPad` bits of padding first, one plane for Bitmap
+        // and `depth` planes for XYPixmap.
+        let bitsPerPixel: Int
+        switch depth {
+        case 1: bitsPerPixel = 1
+        case 4: bitsPerPixel = 4
+        case 8: bitsPerPixel = 8
+        default: bitsPerPixel = 32   // this server declares 32bpp for 24 and 32
+        }
+        // left-pad is only defined for the bit formats, and must be zero
+        // for ZPixmap.
+        guard detail != 2 || leftPad == 0 else {
+            return sendError(code: X11ErrorCode.match, badValue: 0,
+                             minorOpcode: 0, majorOpcode: X11Opcode.putImage)
+        }
+        // For the bit formats it must be smaller than one scanline unit.
+        guard detail == 2 || leftPad < 32 else {
+            return sendError(code: X11ErrorCode.match, badValue: UInt32(leftPad),
+                             minorOpcode: 0, majorOpcode: X11Opcode.putImage)
+        }
+        let declaredBytes: Int
+        if detail == 2 {
+            declaredBytes = height * X11Wire.pad((width * bitsPerPixel + 7) / 8)
+        } else {
+            let planes = detail == 0 ? 1 : Int(depth)
+            declaredBytes = planes * height * X11Wire.pad((width + leftPad + 7) / 8)
+        }
+        // The body is padded to a 4-byte boundary on the wire, so compare
+        // padded sizes - anything else is a genuine length error.
+        if X11Wire.pad(declaredBytes) != X11Wire.pad(r.remaining) {
+            return sendError(code: X11ErrorCode.length, badValue: UInt32(truncatingIfNeeded: declaredBytes),
+                             minorOpcode: 0, majorOpcode: X11Opcode.putImage)
+        }
+
+        // At depth 1 there is only one plane, so all three formats carry
+        // the same bits; past that only ZPixmap is understood here.
         guard detail == 2 || depth == 1, width > 0, height > 0 else {
             X11Trace.putImage(drawableID: drawableId, width: width, height: height, depth: depth, outcome: "dropped: format/size")
             return
@@ -1782,9 +3966,23 @@ final class X11Connection: NSObject {
             X11Trace.putImage(drawableID: drawableId, width: width, height: height, depth: depth, outcome: "dropped: byte mismatch got=\(pixelBytes.count) expected=\(expectedBytes)")
             return
         }
-        X11Trace.putImage(drawableID: drawableId, width: width, height: height, depth: depth, outcome: "ok x=\(dstX) y=\(dstY)")
+        X11Trace.putImage(drawableID: drawableId, width: width, height: height, depth: depth,
+                          outcome: "ok x=\(dstX) y=\(dstY) function=\(state.gc(gcId)?.function ?? 3)")
+        // Small uploads - cursors, brush outlines, icons - are exactly the
+        // ones that come out wrong without anything else looking broken,
+        // and the only way to tell "the client sent this" from "we drew it
+        // wrong" is the raw bytes. Trace-only, and capped, so a normal run
+        // never touches the disk.
+        if X11Trace.enabled, width <= 64, height <= 64 {
+            X11Trace.dumpSmallUpload(pixelBytes, drawableID: drawableId, width: width, height: height,
+                                     depth: depth, rowBytes: rowBytes, littleEndian: littleEndian)
+        }
         let isLittleEndian = littleEndian
         let clip = state.gc(gcId)?.clipRectangles
+        // `PutImage`'s GC components include **function** too; see
+        // `handleCopyArea`. Uploading a tile and then copying it are two
+        // halves of one overlay, so the two have to agree on it.
+        let function = state.gc(gcId)?.function ?? 3
         DispatchQueue.main.async {
             guard let provider = CGDataProvider(data: Data(pixelBytes) as CFData) else { return }
             let image: CGImage?
@@ -1893,10 +4091,16 @@ final class X11Connection: NSObject {
             // unnoticed all session because every prior `PutImage` test
             // also happened to go through exactly one `CopyArea`, itself
             // carrying the identical extra flip, and two of them cancel).
+            let damaged = CGRect(x: Double(dstX), y: Double(dstY),
+                                 width: Double(width), height: Double(height))
             withClip(clip, on: target.bitmapContext) {
-                drawImageTopLeftOriented(image, in: CGRect(x: Double(dstX), y: Double(dstY), width: Double(width), height: Double(height)), on: target.bitmapContext)
+                Self.withFunction(function, on: target.bitmapContext) {
+                    drawImageTopLeftOriented(image, in: damaged, on: target.bitmapContext)
+                }
             }
-            target.notifyChanged()
+            // The other repaint path, and the heavy one: every pixel a
+            // client uploads arrives through here.
+            target.notifyChanged(damage: damaged)
         }
     }
 
@@ -1935,6 +4139,10 @@ final class X11Connection: NSObject {
     /// endian) - anything written by a real `PutImage` and read back via
     /// `GetImage` round-trips byte-for-byte (regression test:
     /// `x11-tests/09_getimage_roundtrip.c`).
+    /// 4096 x 4096: past this an unknown drawable's GetImage is BadMatch
+    /// rather than a black image hundreds of megabytes long.
+    static let maxGetImagePixels = 4096 * 4096
+
     private func handleGetImage(detail: UInt8, body: [UInt8]) {
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let drawableId = r.readU32()
@@ -1942,35 +4150,184 @@ final class X11Connection: NSObject {
         let y = Int(r.readI16())
         let width = Int(r.readU16())
         let height = Int(r.readU16())
-        // planemask (4 bytes) - unused, this server has no notion of a
-        // partial-plane read; every GetImage answers with all planes.
+        // ZPixmap ignores plane-mask (this server has no partial-plane read
+        // for it), but XYPixmap is DEFINED by it: it selects which planes
+        // come back, and how many.
+        let planeMask = r.remaining >= 4 ? r.readU32() : UInt32.max
 
-        guard detail == 2 else {
-            sendError(code: X11ErrorCode.implementation, badValue: 0, minorOpcode: 0, majorOpcode: X11Opcode.getImage)
+        // XYPixmap (1) and ZPixmap (2) are the only formats GetImage
+        // defines - XYBitmap is a PutImage-only format. A third value is
+        // `BadValue`, not `BadImplementation`: the latter makes Xlib's
+        // default error handler exit the process (see the doc-10 note
+        // above), so it is the worst possible answer to a typo.
+        guard detail == 1 || detail == 2 else {
+            return sendError(code: X11ErrorCode.value, badValue: UInt32(detail),
+                             minorOpcode: 0, majorOpcode: X11Opcode.getImage)
+        }
+        // An id that names no drawable is `BadDrawable`, exactly as Xorg
+        // answers (xdiff `image.getimage_leniency`). This used to send a
+        // black image instead, on an "always answer, never hang the client"
+        // policy - but an ERROR IS AN ANSWER: xcb delivers it against the
+        // request's sequence and `_XReply` returns with it. The leniency
+        // bought nothing and hid real client bugs behind plausible black
+        // pixels.
+        guard let target = state.drawable(drawableId) else {
+            // The root window has no backing drawable here, but reading it
+            // is what every screenshot tool does, so it keeps the old
+            // black-image answer rather than becoming an error that Xlib's
+            // default handler would exit the client on.
+            if drawableId == rootWindowID, width > 0, height > 0,
+               width * height <= Self.maxGetImagePixels {
+                let fw = X11ByteWriter(littleEndian: littleEndian)
+                fw.writeU32(0) // visual = None
+                fw.writePadding(20)
+                sendReply(fixed24: fw,
+                          extra: [UInt8](repeating: 0, count: height * X11Wire.pad(width * 4)),
+                          detail: 24)
+                return
+            }
+            sendError(code: X11ErrorCode.drawable, badValue: drawableId,
+                      minorOpcode: 0, majorOpcode: X11Opcode.getImage)
             return
         }
-        guard width > 0, height > 0, let target = state.drawable(drawableId) else {
-            // Still a REPLY, not silence - a missing/zero-size source is
-            // reported as an all-black image of the requested size rather
-            // than hanging the client (same "always answer" policy
-            // `handleGetGeometry` already uses for a missing window).
+        // Pixmaps: "BadMatch if the given rectangle is not wholly
+        // contained within the drawable", as in Xorg. Windows stay lenient
+        // (padded beyond the edge) because clients here do read windows
+        // before their first ConfigureNotify - Tk's Xft fallback reads text
+        // areas of a still-1x1 window (seen replaying IDLE) - but never at
+        // an absurd size: the fuzzer's 55399x2694 read of a window built a
+        // 600 MB reply.
+        // A zero-width or zero-height read is legal and gets an empty reply
+        // - but one carrying the DRAWABLE's depth, not a fixed 24, or the
+        // client mis-sizes every later read of that drawable.
+        if width <= 0 || height <= 0 {
             let fw = X11ByteWriter(littleEndian: littleEndian)
             fw.writeU32(0) // visual = None
             fw.writePadding(20)
-            let blackBytes = [UInt8](repeating: 0, count: X11Wire.pad(max(width, 0) * 4) * max(height, 0))
-            sendReply(fixed24: fw, extra: blackBytes, detail: 24)
+            sendReply(fixed24: fw, extra: [], detail: (target as? X11Pixmap)?.depth ?? 24)
+            return
+        }
+        let isWindow = state.window(drawableId) != nil
+        // A negative origin is BadMatch everywhere, window or not - the
+        // leniency below is about reading PAST the far edge, never about
+        // starting outside the drawable.
+        guard x >= 0, y >= 0 else {
+            sendError(code: X11ErrorCode.match, badValue: 0, minorOpcode: 0, majorOpcode: X11Opcode.getImage)
+            return
+        }
+        let inside = x + width <= target.pixelWidth && y + height <= target.pixelHeight
+        guard inside || (isWindow && width * height <= Self.maxGetImagePixels) else {
+            sendError(code: X11ErrorCode.match, badValue: 0, minorOpcode: 0, majorOpcode: X11Opcode.getImage)
             return
         }
 
-        // A depth-32 pixmap is ARGB: its fourth byte is alpha, not pad. See
-        // `zPixmapBytes` for the GTK3 popover-menu bug this was.
-        let depth: UInt8 = (target as? X11Pixmap)?.depth == 32 ? 32 : 24
-        let pixels = Self.zPixmapBytes(from: target.bitmapContext, sourceWidth: target.pixelWidth, sourceHeight: target.pixelHeight,
-                                       x: x, y: y, width: width, height: height, includeAlpha: depth == 32)
+        // The drawable's real depth, not always 24-or-32. A depth-1
+        // pixmap (window shapes, cursor masks, stipples) must come back
+        // one BIT per pixel and a depth-8 one (an A8 coverage mask, which
+        // this server's RENDER path creates constantly) one BYTE - both
+        // used to be answered at 32 bits per pixel and misparsed by
+        // exactly the byte ratio.
+        let pixmapDepth = (target as? X11Pixmap)?.depth
+        let depth: UInt8 = {
+            switch pixmapDepth {
+            case 1: return 1
+            case 8: return 8
+            case 32: return 32
+            default: return 24
+            }
+        }()
+
+        // Read on MAIN, like every draw. This was the one request in this
+        // file that touched a bitmap from the connection thread, and the
+        // canonical client idiom is *draw into a pixmap, then GetImage it
+        // back* - so the read overtook the draws it was meant to observe
+        // and the reply went out with whatever was in the buffer at that
+        // instant. It is also a plain data race: `ctx.data` is walked byte
+        // by byte while main may be writing the same allocation, and
+        // `makeImage()` elsewhere makes that allocation copy-on-write, so
+        // the bytes under the pointer can change mid-loop.
+        //
+        // Not a deadlock risk, despite how it reads: this file already
+        // does `DispatchQueue.main.sync` from this same thread in half a
+        // dozen places, and `writeFull` was deliberately made non-blocking
+        // (the socket gets `O_NONBLOCK`) so main never waits on the
+        // connection thread. The `Thread.isMainThread` branch is for the
+        // in-process hosting path, where this can already be main.
+        let readPixels: () -> [UInt8] = {
+            switch depth {
+            case 1:
+                return Self.bitmapBytes(from: target.bitmapContext, sourceWidth: target.pixelWidth,
+                                        sourceHeight: target.pixelHeight, x: x, y: y, width: width, height: height)
+            case 8:
+                return Self.eightBitBytes(from: target.bitmapContext, sourceWidth: target.pixelWidth,
+                                          sourceHeight: target.pixelHeight, x: x, y: y, width: width, height: height)
+            default:
+                return Self.zPixmapBytes(from: target.bitmapContext, sourceWidth: target.pixelWidth,
+                                         sourceHeight: target.pixelHeight, x: x, y: y,
+                                         width: width, height: height, includeAlpha: depth == 32)
+            }
+        }
+        var pixels = Thread.isMainThread ? readPixels() : DispatchQueue.main.sync(execute: readPixels)
+        // XYPixmap is a DIFFERENT layout, not a different name for the same
+        // bytes: one bitmap per plane instead of one word per pixel. This
+        // used to answer `BadImplementation`; widening the guard without
+        // converting would have been worse still - a reply in the wrong
+        // format, presented as success, which Xlib would parse as an
+        // XYPixmap over a buffer a third the size it expects.
+        if detail == 1, depth > 1 {
+            pixels = Self.xyPixmapBytes(fromZPixmap: pixels, width: width, height: height,
+                                        depth: depth, planeMask: planeMask,
+                                        lsbFirst: littleEndian)
+        }
         let fw = X11ByteWriter(littleEndian: littleEndian)
         fw.writeU32(0) // visual - None, matches this server's other Pixmap/Window-agnostic replies
         fw.writePadding(20)
         sendReply(fixed24: fw, extra: pixels, detail: depth) // detail: depth
+    }
+
+    /// Re-packs ZPixmap bytes as **XYPixmap**: one bitmap per plane,
+    /// most-significant plane first, and only the planes `planeMask` asks
+    /// for. Each scanline is padded to the 32 bits this server advertises
+    /// as `bitmap-format-scanline-pad`.
+    ///
+    /// Rarely used - every modern toolkit asks for ZPixmap - but a legal
+    /// request, and the only safe answer to a legal request is a correct
+    /// reply: Xlib's default error handler exits the process on **any**
+    /// protocol error, so refusing is not a softer option than answering.
+    static func xyPixmapBytes(fromZPixmap z: [UInt8], width: Int, height: Int,
+                              depth: UInt8, planeMask: UInt32, lsbFirst: Bool) -> [UInt8] {
+        let bytesPerPixel = depth == 8 ? 1 : 4
+        let sourceStride = X11Wire.pad(width * bytesPerPixel)
+        let planeStride = X11Wire.pad((width + 7) / 8)
+        // Only planes the drawable actually has; a mask bit above its depth
+        // names no plane at all.
+        let depthMask: UInt32 = depth >= 32 ? .max : (1 << UInt32(depth)) - 1
+        let planes = (0..<Int(depth)).reversed().filter { planeMask & depthMask & (1 << UInt32($0)) != 0 }
+        var out = [UInt8](repeating: 0, count: planes.count * height * planeStride)
+        var planeBase = 0
+        for plane in planes {
+            for row in 0..<height {
+                let sourceRow = row * sourceStride
+                let destinationRow = planeBase + row * planeStride
+                for column in 0..<width {
+                    let offset = sourceRow + column * bytesPerPixel
+                    guard offset + bytesPerPixel <= z.count else { continue }
+                    // Little-endian pixel value, matching `zPixmapBytes`'
+                    // own B G R X order.
+                    var value: UInt32 = 0
+                    for byte in 0..<bytesPerPixel {
+                        value |= UInt32(z[offset + byte]) << (8 * UInt32(byte))
+                    }
+                    guard value & (1 << UInt32(plane)) != 0 else { continue }
+                    let destination = destinationRow + column / 8
+                    guard destination < out.count else { continue }
+                    let bit = lsbFirst ? column % 8 : 7 - column % 8
+                    out[destination] |= UInt8(1 << UInt8(bit))
+                }
+            }
+            planeBase += height * planeStride
+        }
+        return out
     }
 
     /// ZPixmap bytes (32 bits per pixel, B G R X) for a region of a
@@ -1987,6 +4344,66 @@ final class X11Connection: NSObject {
     /// popover: every click in a popover menu went to the window underneath,
     /// the menu closed, and no item ever activated (gtk3-widget-factory's
     /// hamburger menu, 2026-09-15).
+    /// `GetImage` bytes for a **depth-1** drawable: one bit per pixel,
+    /// rows padded to 32 bits, LSB first.
+    ///
+    /// Depth-1 pixmaps are window shapes, cursor masks and stipples, and
+    /// this server advertises both a depth-1 pixmap format and an A1
+    /// picture format - so clients do create them, and every one of them
+    /// used to be answered with 32 bits per pixel and misparsed by exactly
+    /// the byte ratio.
+    ///
+    /// The bit comes from the **alpha** channel, not luminance: a depth-1
+    /// drawable here is coverage, and `CGContextClipToMask` reads alpha
+    /// (the same reason depth-8 coverage lives in alpha - see
+    /// `X11GetImageAlphaTests`).
+    static func bitmapBytes(from ctx: CGContext, sourceWidth: Int, sourceHeight: Int,
+                            x: Int, y: Int, width: Int, height: Int) -> [UInt8] {
+        let rowBytes = ((width + 31) / 32) * 4
+        var bits = [UInt8](repeating: 0, count: rowBytes * height)
+        guard let base = ctx.data else { return bits }
+        let srcBytesPerRow = ctx.bytesPerRow
+        let srcPtr = base.bindMemory(to: UInt8.self, capacity: srcBytesPerRow * sourceHeight)
+        for row in 0..<height {
+            let srcY = y + row
+            guard srcY >= 0, srcY < sourceHeight else { continue }
+            let srcRowStart = srcY * srcBytesPerRow
+            for col in 0..<width {
+                let srcX = x + col
+                guard srcX >= 0, srcX < sourceWidth else { continue }
+                guard srcPtr[srcRowStart + srcX * 4 + 3] >= 128 else { continue }
+                bits[row * rowBytes + col / 8] |= UInt8(1 << (col % 8))
+            }
+        }
+        return bits
+    }
+
+    /// `GetImage` bytes for a **depth-8** drawable: one byte per pixel,
+    /// rows padded to 32 bits.
+    ///
+    /// Depth 8 here means an A8 coverage mask, which this server's own
+    /// RENDER path creates constantly - so the alpha channel is the value,
+    /// not a colour component.
+    static func eightBitBytes(from ctx: CGContext, sourceWidth: Int, sourceHeight: Int,
+                              x: Int, y: Int, width: Int, height: Int) -> [UInt8] {
+        let rowBytes = X11Wire.pad(width)
+        var pixels = [UInt8](repeating: 0, count: rowBytes * height)
+        guard let base = ctx.data else { return pixels }
+        let srcBytesPerRow = ctx.bytesPerRow
+        let srcPtr = base.bindMemory(to: UInt8.self, capacity: srcBytesPerRow * sourceHeight)
+        for row in 0..<height {
+            let srcY = y + row
+            guard srcY >= 0, srcY < sourceHeight else { continue }
+            let srcRowStart = srcY * srcBytesPerRow
+            for col in 0..<width {
+                let srcX = x + col
+                guard srcX >= 0, srcX < sourceWidth else { continue }
+                pixels[row * rowBytes + col] = srcPtr[srcRowStart + srcX * 4 + 3]
+            }
+        }
+        return pixels
+    }
+
     static func zPixmapBytes(from ctx: CGContext, sourceWidth: Int, sourceHeight: Int,
                              x: Int, y: Int, width: Int, height: Int, includeAlpha: Bool) -> [UInt8] {
         let rowBytes = X11Wire.pad(width * 4)
@@ -2019,6 +4436,7 @@ final class X11Connection: NSObject {
         guard let target = state.drawable(drawableId) else { return }
         let color = state.gc(gcId)?.foreground ?? 0x0000_0000
         let clip = state.gc(gcId)?.clipRectangles
+        let function = state.gc(gcId)?.function ?? 3
         var points: [CGPoint] = []
         var last = CGPoint.zero
         while r.remaining >= 4 {
@@ -2034,10 +4452,7 @@ final class X11Connection: NSObject {
         guard points.count >= 2 else { return }
         DispatchQueue.main.async {
             let ctx = target.bitmapContext
-            ctx.saveGState()
-            if let clip { ctx.clip(to: clip) }
-            ctx.setStrokeColor(x11Color(red: CGFloat((color >> 16) & 0xFF) / 255, green: CGFloat((color >> 8) & 0xFF) / 255, blue: CGFloat(color & 0xFF) / 255))
-            ctx.setLineWidth(1)
+            Self.beginCoreStroke(ctx, color: color, clip: clip, function: function, isBitmap: target.isBitmap)
             ctx.beginPath()
             ctx.move(to: points[0])
             for point in points.dropFirst() { ctx.addLine(to: point) }
@@ -2049,6 +4464,80 @@ final class X11Connection: NSObject {
 
     /// `PolyPoint` (opcode 64, `XDrawPoints`): one pixel per point in the
     /// GC foreground. Tk draws with it; BadImplementation killed IDLE.
+    /// Sets `ctx` up to draw an X11 **core** line, which is a different
+    /// thing from a nice-looking line.
+    ///
+    /// Two corrections, and they only work together:
+    ///
+    /// - **Antialiasing off.** The core protocol has no notion of it - a
+    ///   line is a set of pixels, on or off. A `CGBitmapContext`
+    ///   antialiases by default, and `setShouldAntialias` appeared exactly
+    ///   once in this whole directory, in the *text* path, turning it
+    ///   **on**. Every frame, separator and box an Xt/Motif/Tk app drew
+    ///   came out soft.
+    /// - **A half-pixel offset.** CoreGraphics centres a stroke on its
+    ///   path, so a 1px line at an integer coordinate straddles the
+    ///   boundary between two pixel rows and covers each of them half -
+    ///   which, with antialiasing on, renders as two rows of ~50% grey
+    ///   instead of one solid row. Translating the CTM by half a pixel
+    ///   puts the path down the middle of a pixel instead of its edge.
+    ///
+    /// Fixing either one alone just gives a different wrong answer: no
+    /// antialiasing without the offset rounds the straddled line onto an
+    /// arbitrary one of the two rows.
+    ///
+    /// Undone by the matching `restoreGState()` each caller already has.
+    /// The blend mode for a GC's `function`.
+    ///
+    /// `GXxor` (6) is the one that matters. It is how Xt, Motif, Tk and
+    /// xterm draw rubber bands, selection outlines and text carets: draw
+    /// once to show, draw again over the same pixels to erase. Drawn as
+    /// `GXcopy` - which is what every function used to become - the second
+    /// draw paints the mark a second time instead of erasing it, so the
+    /// artifact is left behind **by construction**, not by accident.
+    ///
+    /// CoreGraphics has no bitwise XOR, and `CGBlendMode.xor` is
+    /// Porter-Duff alpha XOR, not this. `.difference` is the closest
+    /// honest match and preserves the property clients actually depend on:
+    /// it is an involution for a constant source, so drawing the same mark
+    /// twice restores what was underneath. The colour of a single XOR draw
+    /// will not match a real server for an arbitrary foreground; the
+    /// draw-twice-erases behaviour, which is the whole point of the idiom,
+    /// will.
+    static func blendMode(forFunction function: UInt8, isBitmap: Bool = false) -> CGBlendMode {
+        if function == 6 { return .difference }  // GXxor
+        // A depth-1 bitmap carries its bit in the alpha channel, so clearing
+        // one means painting alpha 0 - and source-over with alpha 0 changes
+        // nothing at all. `.copy` replaces the destination, which is what
+        // GXcopy means. Without this, clearing part of a mask silently did
+        // nothing and every stipple came out solid (xdiff `draw.copy_plane`).
+        return isBitmap ? .copy : .normal
+    }
+
+    /// Runs `draw` with a GC's `function` applied, for the blits -
+    /// `CopyArea` and `PutImage` - that honour it but never went through
+    /// `beginCoreStroke`. Plain `GXcopy` (the overwhelmingly common case)
+    /// touches no graphics state at all.
+    static func withFunction(_ function: UInt8, on ctx: CGContext, _ draw: () -> Void) {
+        let blend = blendMode(forFunction: function)
+        guard blend != .normal else { draw(); return }
+        ctx.saveGState()
+        ctx.setBlendMode(blend)
+        draw()
+        ctx.restoreGState()
+    }
+
+    private static func beginCoreStroke(_ ctx: CGContext, color: UInt32, clip: [CGRect]?,
+                                        function: UInt8 = 3, isBitmap: Bool = false) {
+        ctx.saveGState()
+        if let clip { ctx.clip(to: clip) } // before the offset: clip rects are in X11 coordinates
+        ctx.setBlendMode(blendMode(forFunction: function, isBitmap: isBitmap))
+        ctx.setShouldAntialias(false)
+        ctx.translateBy(x: 0.5, y: 0.5)
+        ctx.setStrokeColor(x11PixelColor(color, isBitmap: isBitmap))
+        ctx.setLineWidth(1)
+    }
+
     private func handlePolyPoint(detail: UInt8, body: [UInt8]) {
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let drawableId = r.readU32()
@@ -2056,6 +4545,7 @@ final class X11Connection: NSObject {
         guard let target = state.drawable(drawableId) else { return }
         let color = state.gc(gcId)?.foreground ?? 0x0000_0000
         let clip = state.gc(gcId)?.clipRectangles
+        let function = state.gc(gcId)?.function ?? 3
         var points: [CGPoint] = []
         var last = CGPoint.zero
         while r.remaining >= 4 {
@@ -2072,7 +4562,10 @@ final class X11Connection: NSObject {
             let ctx = target.bitmapContext
             ctx.saveGState()
             if let clip { ctx.clip(to: clip) }
-            ctx.setFillColor(x11Color(red: CGFloat((color >> 16) & 0xFF) / 255, green: CGFloat((color >> 8) & 0xFF) / 255, blue: CGFloat(color & 0xFF) / 255))
+            // A GXxor fill is how these same toolkits draw selection
+            // highlighting - draw once to show, again to clear.
+            ctx.setBlendMode(Self.blendMode(forFunction: function, isBitmap: target.isBitmap))
+            ctx.setFillColor(x11PixelColor(color, isBitmap: target.isBitmap))
             ctx.fill(points.map { CGRect(x: $0.x, y: $0.y, width: 1, height: 1) })
             ctx.restoreGState()
             target.notifyChanged()
@@ -2092,6 +4585,7 @@ final class X11Connection: NSObject {
         guard let target = state.drawable(drawableId) else { return }
         let color = state.gc(gcId)?.foreground ?? 0x0000_0000
         let clip = state.gc(gcId)?.clipRectangles
+        let function = state.gc(gcId)?.function ?? 3
         var rects: [CGRect] = []
         while r.remaining >= 8 {
             let x = r.readI16(); let y = r.readI16()
@@ -2101,10 +4595,17 @@ final class X11Connection: NSObject {
         guard !rects.isEmpty else { return }
         DispatchQueue.main.async {
             let ctx = target.bitmapContext
-            ctx.saveGState()
-            if let clip { ctx.clip(to: clip) }
-            ctx.setStrokeColor(x11Color(red: CGFloat((color >> 16) & 0xFF) / 255, green: CGFloat((color >> 8) & 0xFF) / 255, blue: CGFloat(color & 0xFF) / 255))
-            ctx.setLineWidth(1)
+            Self.beginCoreStroke(ctx, color: color, clip: clip, function: function, isBitmap: target.isBitmap)
+            // X11 traces the outline through [x,y] -> [x+w,y] ->
+            // [x+w,y+h] -> [x,y+h], covering w+1 by h+1 PIXELS even
+            // though the rectangle is w by h. `CGRect(x, y, w, h)` has
+            // exactly those four corners, so the path was never wrong -
+            // what was wrong is that CoreGraphics centres a stroke on it,
+            // so the coverage fell half onto the row outside. The
+            // half-pixel offset in `beginCoreStroke` is what puts it back
+            // on x...x+w inclusive, which is the X11 answer.
+            // (`PolyFillRectangle` fills exactly w by h and is already
+            // right - only the outline has the extra pixel.)
             for rect in rects { ctx.stroke(rect) }
             ctx.restoreGState()
             target.notifyChanged()
@@ -2118,6 +4619,7 @@ final class X11Connection: NSObject {
         guard let target = state.drawable(drawableId) else { return }
         let color = state.gc(gcId)?.foreground ?? 0x0000_0000
         let clip = state.gc(gcId)?.clipRectangles
+        let function = state.gc(gcId)?.function ?? 3
         var segments: [(CGPoint, CGPoint)] = []
         while r.remaining >= 8 {
             let x1 = r.readI16(); let y1 = r.readI16()
@@ -2127,10 +4629,7 @@ final class X11Connection: NSObject {
         guard !segments.isEmpty else { return }
         DispatchQueue.main.async {
             let ctx = target.bitmapContext
-            ctx.saveGState()
-            if let clip { ctx.clip(to: clip) }
-            ctx.setStrokeColor(x11Color(red: CGFloat((color >> 16) & 0xFF) / 255, green: CGFloat((color >> 8) & 0xFF) / 255, blue: CGFloat(color & 0xFF) / 255))
-            ctx.setLineWidth(1)
+            Self.beginCoreStroke(ctx, color: color, clip: clip, function: function, isBitmap: target.isBitmap)
             ctx.beginPath()
             for (p1, p2) in segments {
                 ctx.move(to: p1)
@@ -2181,6 +4680,7 @@ final class X11Connection: NSObject {
         guard let target = state.drawable(drawableId) else { return }
         let color = state.gc(gcId)?.foreground ?? 0x0000_0000
         let clip = state.gc(gcId)?.clipRectangles
+        let function = state.gc(gcId)?.function ?? 3
         var paths: [[CGPoint]] = []
         while r.remaining >= 12 {
             let x = r.readI16(); let y = r.readI16()
@@ -2192,10 +4692,7 @@ final class X11Connection: NSObject {
         guard !paths.isEmpty else { return }
         DispatchQueue.main.async {
             let ctx = target.bitmapContext
-            ctx.saveGState()
-            if let clip { ctx.clip(to: clip) }
-            ctx.setStrokeColor(x11Color(red: CGFloat((color >> 16) & 0xFF) / 255, green: CGFloat((color >> 8) & 0xFF) / 255, blue: CGFloat(color & 0xFF) / 255))
-            ctx.setLineWidth(1)
+            Self.beginCoreStroke(ctx, color: color, clip: clip, function: function, isBitmap: target.isBitmap)
             for pts in paths {
                 ctx.beginPath()
                 ctx.move(to: pts[0])
@@ -2221,6 +4718,7 @@ final class X11Connection: NSObject {
         guard let target = state.drawable(drawableId) else { return }
         let color = state.gc(gcId)?.foreground ?? 0x0000_0000
         let clip = state.gc(gcId)?.clipRectangles
+        let function = state.gc(gcId)?.function ?? 3
         var polygons: [[CGPoint]] = []
         while r.remaining >= 12 {
             let x = r.readI16(); let y = r.readI16()
@@ -2230,11 +4728,24 @@ final class X11Connection: NSObject {
             if pts.count >= 3 { polygons.append(pts) }
         }
         guard !polygons.isEmpty else { return }
+        if let pattern = fillPattern(gcId) {
+            let area = polygons.flatMap { $0 }.reduce(CGRect.null) { $0.union(CGRect(origin: $1, size: .zero)) }
+            DispatchQueue.main.async {
+                Self.fillPatterned(target.bitmapContext, pattern, area: area, clip: clip, function: function) { ctx in
+                    for pts in polygons { ctx.addLines(between: pts); ctx.closePath() }
+                }
+                target.notifyChanged()
+            }
+            return
+        }
         DispatchQueue.main.async {
             let ctx = target.bitmapContext
             ctx.saveGState()
             if let clip { ctx.clip(to: clip) }
-            ctx.setFillColor(x11Color(red: CGFloat((color >> 16) & 0xFF) / 255, green: CGFloat((color >> 8) & 0xFF) / 255, blue: CGFloat(color & 0xFF) / 255))
+            // A GXxor fill is how these same toolkits draw selection
+            // highlighting - draw once to show, again to clear.
+            ctx.setBlendMode(Self.blendMode(forFunction: function, isBitmap: target.isBitmap))
+            ctx.setFillColor(x11PixelColor(color, isBitmap: target.isBitmap))
             for pts in polygons {
                 ctx.beginPath()
                 ctx.move(to: pts[0])
@@ -2257,6 +4768,7 @@ final class X11Connection: NSObject {
         guard let target = state.drawable(drawableId) else { return }
         let color = state.gc(gcId)?.foreground ?? 0x0000_0000
         let clip = state.gc(gcId)?.clipRectangles
+        let function = state.gc(gcId)?.function ?? 3
         var points: [CGPoint] = []
         var last = CGPoint.zero
         while r.remaining >= 4 {
@@ -2268,16 +4780,35 @@ final class X11Connection: NSObject {
             last = point
         }
         guard points.count >= 3 else { return }
+        if let pattern = fillPattern(gcId) {
+            let area = points.reduce(CGRect.null) { $0.union(CGRect(origin: $1, size: .zero)) }
+            DispatchQueue.main.async {
+                Self.fillPatterned(target.bitmapContext, pattern, area: area, clip: clip, function: function) { ctx in
+                    ctx.addLines(between: points); ctx.closePath()
+                }
+                target.notifyChanged()
+            }
+            return
+        }
         DispatchQueue.main.async {
             let ctx = target.bitmapContext
             ctx.saveGState()
             if let clip { ctx.clip(to: clip) }
-            ctx.setFillColor(x11Color(red: CGFloat((color >> 16) & 0xFF) / 255, green: CGFloat((color >> 8) & 0xFF) / 255, blue: CGFloat(color & 0xFF) / 255))
+            // A GXxor fill is how these same toolkits draw selection
+            // highlighting - draw once to show, again to clear.
+            ctx.setBlendMode(Self.blendMode(forFunction: function, isBitmap: target.isBitmap))
+            ctx.setFillColor(x11PixelColor(color, isBitmap: target.isBitmap))
             ctx.beginPath()
             ctx.move(to: points[0])
             for point in points.dropFirst() { ctx.addLine(to: point) }
             ctx.closePath()
-            ctx.fillPath()
+            // Even-odd, because that is the GC's documented default for
+            // `fill-rule` and `fillPath()` is nonzero winding. They differ
+            // only for self-intersecting polygons - stars, some chart
+            // shapes, complex glyph outlines - which is why this survived.
+            // (Only here: `PolyFillArc` and RENDER's trapezoids are
+            // genuinely winding.)
+            ctx.fillPath(using: .evenOdd)
             ctx.restoreGState()
             target.notifyChanged()
         }
@@ -2340,7 +4871,7 @@ final class X11Connection: NSObject {
             DispatchQueue.main.async {
                 target.drawText(text, x: Int16(clamping: drawX), y: y, foreground: foreground, background: nil, clip: clip)
             }
-            penX += Int32(len) * Int32(X11FakeFont.charWidth)
+            penX += Int32(len) * Int32(X11FakeFont.cellWidth) // the width QueryFont/QueryTextExtents report
         }
     }
 
@@ -2378,7 +4909,63 @@ final class X11Connection: NSObject {
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let owner = r.readU32()
         let selection = r.readU32()
-        state.setSelectionOwner(selection, owner: owner)
+        let time = r.readU32() // was skipped entirely, which is why TIMESTAMP had nothing to return
+        guard let previous = state.claimSelection(selection, owner: owner, time: time) else {
+            if X11Trace.enabled {
+                MSLLog.line("x11", "setSelectionOwner IGNORED (stale time \(time))")
+            }
+            return
+        }
+        // The previous owner is told it lost the selection - unless the new
+        // owner belongs to the same client (spec). Without it, a GTK app
+        // kept drawing its selection highlight and answering requests for
+        // a selection someone else now held.
+        if previous != 0, previous >> 21 != owner >> 21 || owner == 0,
+           let previousConnection = state.connection(forWindow: previous) {
+            previousConnection.deliverSelectionClear(owner: previous, selection: selection)
+        }
+        // Everyone watching this selection through XFIXES hears about it,
+        // on every connection - a copy in one Linux app has to reach a
+        // clipboard viewer running in another.
+        broadcastXFixesSelectionNotify(selection: selection, owner: owner,
+                                       subtype: X11XFixesSelectionEvent.setSelectionOwner,
+                                       mask: X11XFixesSelectionEvent.setSelectionOwnerMask,
+                                       selectionTime: time)
+        // A client taking CLIPBOARD is someone pressing Copy in a Linux
+        // app. Ask it for the text now and put that on the Mac's
+        // pasteboard - see `X11Clipboard` for why this is eager, and why
+        // the owner window is never checked for being a top-level one
+        // (GTK and Qt both own selections with an unmapped utility window).
+        guard selection == state.clipboard.clipboardAtom(), owner != 0 else { return }
+        guard let target = state.clipboard.targetForGuestClaim(owner: owner) else { return }
+        askOwnerForClipboard(owner: owner, target: target)
+    }
+
+    /// Sends the `SelectionRequest` that starts a guest-to-Mac copy. The
+    /// requestor is MSL's own reserved window, so the answer arrives in
+    /// `handleChangeProperty` on a window no client owns.
+    private func askOwnerForClipboard(owner: UInt32, target: UInt32) {
+        guard let ownerConnection = state.connection(forWindow: owner) else { return }
+        ownerConnection.sendSelectionRequest(owner: owner,
+                                             requestor: X11Clipboard.requestorWindowID,
+                                             selection: state.clipboard.clipboardAtom(),
+                                             target: target,
+                                             property: state.clipboard.propertyAtom())
+    }
+
+    /// `SelectionClear` (event 29) - tells a client it no longer owns a
+    /// selection, which is what the Mac taking the clipboard means for
+    /// whichever Linux app had it.
+    func deliverSelectionClear(owner: UInt32, selection: UInt32) {
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU8(29)
+        w.writePadding(1)
+        w.writeU16(stampSequence)
+        w.writeU32(currentX11Timestamp)
+        w.writeU32(owner)
+        w.writeU32(selection)
+        w.writePadding(16)
+        writeFull(w.bytes)
     }
 
     private func handleGetSelectionOwner(body: [UInt8]) {
@@ -2397,6 +4984,13 @@ final class X11Connection: NSObject {
         let property = r.readU32()
 
         let owner = state.selectionOwner(selection)
+        // MSL owns it on the Mac's behalf: answer from the pasteboard
+        // instead of looking for a client that does not exist.
+        if owner == X11Clipboard.macOwnerWindowID {
+            answerFromMacClipboard(requestor: requestor, selection: selection,
+                                   target: target, property: property)
+            return
+        }
         guard owner != 0, let ownerConnection = state.connection(forWindow: owner) else {
             // No owner (or its connection is already gone) - ICCCM says
             // to notify with `property = None` rather than leave the
@@ -2405,6 +4999,49 @@ final class X11Connection: NSObject {
             return
         }
         ownerConnection.sendSelectionRequest(owner: owner, requestor: requestor, selection: selection, target: target, property: property)
+    }
+
+    /// Serves a conversion request out of the Mac's pasteboard.
+    ///
+    /// This is MSL standing in for a selection owner, so it has to behave
+    /// like one: `TARGETS` lists what can be produced, `TIMESTAMP` answers
+    /// with when ownership was taken, a target that cannot be produced gets
+    /// `property = None`, and every path ends in a `SelectionNotify` -
+    /// a requestor left without one waits forever.
+    private func answerFromMacClipboard(requestor: UInt32, selection: UInt32,
+                                        target: UInt32, property: UInt32) {
+        let clipboard = state.clipboard
+        // The Mac owning the clipboard is the precondition, not it holding
+        // *text*: an image-only copy is a perfectly good selection, and
+        // requiring text made MSL refuse every request for one.
+        guard clipboard.payloadForGuest() != nil, property != 0,
+              let record = state.window(requestor) else {
+            sendSelectionNotify(requestor: requestor, selection: selection, target: target, property: 0)
+            return
+        }
+
+        if target == clipboard.targetsAtom() {
+            var bytes: [UInt8] = []
+            let w = X11ByteWriter(littleEndian: littleEndian)
+            for atom in clipboard.offeredTargets() { w.writeU32(atom) }
+            bytes = w.bytes
+            record.properties[property] = (type: 4, format: 32, data: bytes) // 4 = ATOM
+        } else if target == clipboard.timestampAtom() {
+            // When ownership was taken, not now - see
+            // `X11State.setSelectionOwner`. MSL's own claim records its
+            // time through the same path, so this is a real answer for
+            // both directions.
+            let w = X11ByteWriter(littleEndian: littleEndian)
+            w.writeU32(state.selectionTime(selection))
+            record.properties[property] = (type: 5, format: 32, data: w.bytes) // 5 = INTEGER
+        } else if let produced = clipboard.data(for: target) {
+            record.properties[property] = (type: produced.type, format: produced.format, data: produced.data)
+        } else {
+            sendSelectionNotify(requestor: requestor, selection: selection, target: target, property: 0)
+            return
+        }
+        sendPropertyNotify(record, atom: property, state: 0) // 0 = NewValue
+        sendSelectionNotify(requestor: requestor, selection: selection, target: target, property: property)
     }
 
     /// Generic synthetic-event delivery - real clients use this for the
@@ -2417,10 +5054,181 @@ final class X11Connection: NSObject {
     /// (`PointerWindow`/`InputFocus`) aren't resolved to a real window -
     /// an edge case no client in this project's actual test coverage
     /// relies on.
+    /// A window-manager request sent to the root: minimise, maximise,
+    /// fullscreen, raise or close.
+    ///
+    /// `WM_CHANGE_STATE` is ICCCM and every toolkit sends it unconditionally;
+    /// the `_NET_*` ones are EWMH and a client only sends them if it believes
+    /// a WM supports them. Acting on whatever arrives costs nothing and is
+    /// what makes a GTK titlebar's buttons real. **Deliberately without
+    /// advertising `_NET_SUPPORTED`**: claiming EWMH support and then not
+    /// honouring every part of it regressed galculator once already (see
+    /// `handleGetProperty`'s note), and GTK's no-WM fallback path is
+    /// well-exercised. Acting on a request is safe; claiming to is not.
+    /// Maximise or un-maximise a top-level, by moving it rather than by
+    /// asking AppKit to.
+    ///
+    /// `NSWindow.zoom(nil)` was the obvious implementation and is the wrong
+    /// one here. It restores the frame AppKit saved, and picks its direction
+    /// by comparing the window's current frame against the "standard frame"
+    /// it would zoom to - both assume the window's size is AppKit's to know.
+    /// A client's is not: GTK re-lays-out and resizes itself once it
+    /// believes it is maximised, the frame stops matching, and the next
+    /// request zooms a second time instead of going back. The window stayed
+    /// big ("only maximize is a bit iffy, it doesnt return to its orig size
+    /// upon reclick", 2026-09-28).
+    ///
+    /// So the pre-maximise frame is the server's to remember, and the new
+    /// geometry goes out through `handleConfigureWindow` - the same path a
+    /// real `ConfigureWindow` takes - so the view resizes, the `NSWindow`
+    /// frame follows, and the client gets its `ConfigureNotify` and `Expose`
+    /// exactly as it would for any other resize. Duplicating that here is
+    /// how the two drift apart.
+    private func setMaximised(_ maximised: Bool, wid: UInt32, record: X11State.WindowRecord) {
+        let target: CGRect
+        if maximised {
+            record.frameBeforeMaximise = record.frame
+            target = workAreaFrame(for: record)
+        } else {
+            // Nothing saved means the window was already maximised when this
+            // server first heard of it; there is no size to go back to, and
+            // guessing one would be worse than leaving it where it is.
+            guard let saved = record.frameBeforeMaximise else {
+                record.isMaximised = false
+                return
+            }
+            record.frameBeforeMaximise = nil
+            target = saved
+        }
+        record.isMaximised = maximised
+        // The client has to be TOLD, or it never believes the request took.
+        // GTK re-reads `_NET_WM_STATE` on `PropertyNotify` and nowhere else:
+        // without this the window resized correctly but Nautilus's own
+        // maximise button kept its un-maximised icon, and the next click on
+        // it sent "add maximised" a second time rather than "remove" - the
+        // window stayed big no matter how often it was clicked (confirmed
+        // live, 2026-09-28). `ewmhProperty` answers the read that follows.
+        sendPropertyNotify(record, atom: atom("_NET_WM_STATE"), state: 0) // 0 = NewValue
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU32(wid)
+        w.writeU16(0x0F) // x, y, width, height
+        w.writeU16(0)
+        w.writeU32(UInt32(bitPattern: Int32(target.origin.x)))
+        w.writeU32(UInt32(bitPattern: Int32(target.origin.y)))
+        w.writeU32(UInt32(max(1, target.width)))
+        w.writeU32(UInt32(max(1, target.height)))
+        handleConfigureWindow(body: w.bytes)
+    }
+
+    /// The largest content rect a top-level can actually occupy, in X11
+    /// coordinates: the screen's `visibleFrame` (so the window never lands
+    /// under the menu bar or the Dock) less the title bar, which AppKit adds
+    /// ABOVE the content and which would otherwise push the frame off the
+    /// top of the screen and be silently constrained straight back.
+    private func workAreaFrame(for record: X11State.WindowRecord) -> CGRect {
+        var frame = CGRect(x: 0, y: 0, width: 1920, height: 1080)
+        let read = {
+            let scale = X11DisplayScale.factor
+            guard let screen = Self.primaryScreen else { return }
+            let visible = screen.visibleFrame
+            // X11 y counts down from the top of the whole display, which is
+            // above the menu bar - see `cocoaScreenFrame(fromX11:)`.
+            let top = (screen.frame.maxY - visible.maxY) / scale
+            var titleBar = 0.0
+            if let window = record.nsWindow {
+                let probe = CGRect(x: 0, y: 0, width: 100, height: 100)
+                titleBar = probe.height - NSWindow.contentRect(forFrameRect: probe, styleMask: window.styleMask).height
+            }
+            frame = CGRect(x: (visible.minX / scale).rounded(), y: (top + titleBar / scale).rounded(),
+                           width: (visible.width / scale).rounded(),
+                           height: ((visible.height - titleBar) / scale).rounded())
+        }
+        if Thread.isMainThread { read() } else { DispatchQueue.main.sync(execute: read) }
+        return frame
+    }
+
+    private func handleWindowManagerRequest(_ event: [UInt8]) {
+        guard event.count >= 32, event[0] & 0x7F == 33, event[1] == 32 else { return } // ClientMessage, format 32
+        let r = X11ByteReader(Array(event[4...]), littleEndian: littleEndian)
+        let windowID = r.readU32()
+        let typeAtom = r.readU32()
+        let data = (0..<5).map { _ in r.readU32() }
+        guard let name = state.atomName(typeAtom), let record = state.window(windowID) else { return }
+        if X11Trace.enabled {
+            MSLLog.line("x11", "wm request \(name) window=\(windowID) data=\(data)")
+        }
+
+        func onWindow(_ body: @escaping (NSWindow) -> Void) {
+            DispatchQueue.main.async { if let window = record.nsWindow { body(window) } }
+        }
+
+        // The state has to read back truthfully, or a client asks again
+        // forever. `record` is the server's view; AppKit is the truth, and
+        // the two only diverge if the person uses the Mac's own titlebar.
+        switch name {
+        case "WM_CHANGE_STATE":
+            // IconicState (3) is "minimise me". NormalState (1) is "restore".
+            if data[0] == 3 {
+                record.isMinimised = true
+                onWindow { $0.miniaturize(nil) }
+            } else if data[0] == 1 {
+                record.isMinimised = false
+                onWindow { if $0.isMiniaturized { $0.deminiaturize(nil) } }
+            }
+        case "_NET_ACTIVE_WINDOW":
+            onWindow { $0.makeKeyAndOrderFront(nil) }
+        case "_NET_CLOSE_WINDOW":
+            // `performClose` runs the same path as the titlebar's own close
+            // button, so the WM_DELETE_WINDOW handshake a client asked for
+            // still happens rather than the window vanishing under it.
+            onWindow { $0.performClose(nil) }
+        case "_NET_WM_STATE":
+            let action = data[0] // 0 remove, 1 add, 2 toggle
+            // Resolved before the loop, whose own `atom` shadows `atom(_:)`.
+            let wmStateAtom = atom("_NET_WM_STATE")
+            for atom in [data[1], data[2]] where atom != 0 {
+                switch state.atomName(atom) {
+                case "_NET_WM_STATE_MAXIMIZED_VERT"?, "_NET_WM_STATE_MAXIMIZED_HORZ"?:
+                    // One resize for the pair: a client asks for VERT and
+                    // HORZ together and both name the same single action, so
+                    // only the first of the two is acted on.
+                    guard atom == data[1] else { continue }
+                    let want = action == 1 || (action == 2 && !record.isMaximised)
+                    guard want != record.isMaximised else { continue }
+                    setMaximised(want, wid: windowID, record: record)
+                case "_NET_WM_STATE_FULLSCREEN"?:
+                    let want = action == 1 || (action == 2 && !record.isFullScreen)
+                    guard want != record.isFullScreen else { continue }
+                    record.isFullScreen = want
+                    // Same reason as `setMaximised`: without the notify the
+                    // client never learns the toggle took, so its own next
+                    // "toggle" asks for the state it is already in.
+                    sendPropertyNotify(record, atom: wmStateAtom, state: 0) // 0 = NewValue
+                    onWindow { window in
+                        if want != window.styleMask.contains(.fullScreen) { window.toggleFullScreen(nil) }
+                    }
+                case "_NET_WM_STATE_HIDDEN"?:
+                    let want = action == 1 || (action == 2 && !record.isMinimised)
+                    guard want != record.isMinimised else { continue }
+                    record.isMinimised = want
+                    sendPropertyNotify(record, atom: wmStateAtom, state: 0) // 0 = NewValue
+                    onWindow { window in
+                        if want { window.miniaturize(nil) }
+                        else if window.isMiniaturized { window.deminiaturize(nil) }
+                    }
+                default:
+                    break
+                }
+            }
+        default:
+            break
+        }
+    }
+
     private func handleSendEvent(body: [UInt8]) {
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let destination = r.readU32()
-        r.skip(4) // event-mask - propagation-by-mask isn't implemented; delivered directly to `destination` only
+        let eventMask = r.readU32() // propagation up the tree isn't implemented; `destination` only
         let event = r.readBytes(32)
         // Root-targeted `SendEvent`s (`destination == rootWindowID`) are
         // EWMH client requests meant for a WINDOW MANAGER selecting
@@ -2437,9 +5245,60 @@ final class X11Connection: NSObject {
         // outright. No real WM is ever running here to actually act on
         // these, so dropping them is the correct degraded behavior, not
         // a workaround for a case that should otherwise be handled.
-        guard destination != rootWindowID, destination > 1,
-              let destConnection = state.connection(forWindow: destination) else { return }
+        // A `SelectionNotify` addressed to MSL's own requestor window is
+        // the second half of a guest-to-Mac copy. It matters most when it
+        // carries `property = None`: a client that cannot produce the
+        // target MSL asked for sends ONLY this, with no `ChangeProperty`
+        // before it, so without reading it here a refused conversion would
+        // never be noticed and the bridge would sit waiting on it.
+        if destination == X11Clipboard.requestorWindowID {
+            handleClipboardAnswer(event)
+            return
+        }
+        // A root-targeted ClientMessage is a request to the window manager.
+        // There is no separate WM here - but mslgd owns the real NSWindow, so
+        // it IS the window manager, and these are the only way a client-side
+        // decorated app (every GNOME/GTK app with its own titlebar buttons)
+        // can ask to be minimised or maximised. They used to be dropped, so
+        // those buttons did nothing at all.
+        if destination == rootWindowID {
+            handleWindowManagerRequest(event)
+            return
+        }
+        guard destination > 1 else { return }
+        // Empty mask: to the window's creator. Otherwise: to every client
+        // that selected any of those bits on it - which may not include
+        // the creator at all (the spec; a pager's ClientMessage to a
+        // window it watches used to land on the app instead).
+        if eventMask != 0, let record = state.window(destination) {
+            if record.eventMask & eventMask != 0 {
+                state.connection(forWindow: destination)?.deliverEvent(event)
+            }
+            for (index, selected) in record.otherClientMasks where selected & eventMask != 0 {
+                state.connection(forClientIndex: index)?.deliverEvent(event)
+            }
+            return
+        }
+        guard let destConnection = state.connection(forWindow: destination) else { return }
         destConnection.deliverEvent(event)
+    }
+
+    /// Reads a `SelectionNotify` sent to MSL's requestor window. A
+    /// non-zero property means the data already arrived through
+    /// `handleChangeProperty`; zero means the client refused that target,
+    /// and `STRING` is worth one more try before giving up.
+    private func handleClipboardAnswer(_ event: [UInt8]) {
+        guard event.count >= 32, event[0] & 0x7F == 31 else { return }
+        let r = X11ByteReader(Array(event[4..<32]), littleEndian: littleEndian)
+        _ = r.readU32() // time
+        _ = r.readU32() // requestor
+        _ = r.readU32() // selection
+        _ = r.readU32() // target
+        let property = r.readU32()
+        guard property == 0 else { return }
+        guard let fallback = state.clipboard.fallbackTarget(),
+              let owner = state.clipboard.pendingOwner else { return }
+        askOwnerForClipboard(owner: owner, target: fallback)
     }
 
     private func handleGetAtomName(body: [UInt8]) {
@@ -2462,12 +5321,49 @@ final class X11Connection: NSObject {
         let dataLenUnits = Int(r.readU32())
         let unitBytes = format == 32 ? 4 : (format == 16 ? 2 : 1)
         let data = r.readBytes(dataLenUnits * unitBytes)
-        // `mode` (Replace/Prepend/Append, the request's detail byte) is
-        // always treated as Replace - a known simplification; almost
-        // every real-world caller (window titles, WM_PROTOCOLS, ...) uses
-        // Replace anyway.
+        // `mode` is the request's detail byte: Replace (0), Prepend (1),
+        // Append (2). Append was once treated as Replace, "a known
+        // simplification" - xhell's 10,000 appends came back as ONE item.
+        // Anything that builds a property up in pieces (ICCCM INCR
+        // transfers, _NET_WM_STATE edits by some toolkits) was corrupted.
+        // MSL's own requestor window: this is a client answering the
+        // question `askOwnerForClipboard` asked, not a client property.
+        if wid == X11Clipboard.requestorWindowID {
+            switch state.clipboard.receivedConversion(type: type, format: format, data: data) {
+            case .done:
+                break
+            case .askAgain(let target):
+                // Either the TARGETS list just told MSL what this owner can
+                // produce, or one part of a copy arrived and another is
+                // still wanted - a copy that is both text and an image takes
+                // one conversion each.
+                if let owner = state.clipboard.pendingOwner {
+                    askOwnerForClipboard(owner: owner, target: target)
+                }
+            case .needsIncrAck(let next):
+                // The acknowledgement is owed first: without it the owner
+                // never writes the next chunk and the transfer stalls.
+                acknowledgeIncrChunk(property: property)
+                if let next, let owner = state.clipboard.pendingOwner {
+                    askOwnerForClipboard(owner: owner, target: next)
+                }
+            }
+            return
+        }
         guard let record = state.window(wid) else { return }
-        record.properties[property] = (type: type, format: format, data: data)
+        let mode = currentDetail
+        if mode != 0, let existing = record.properties[property] {
+            // Prepend/Append onto a property of a different type or format
+            // is BadMatch; onto a missing property it is plain Replace.
+            guard existing.type == type, existing.format == format else {
+                sendError(code: X11ErrorCode.match, badValue: 0, minorOpcode: 0, majorOpcode: X11Opcode.changeProperty)
+                return
+            }
+            record.properties[property] = (type: type, format: format,
+                                           data: mode == 1 ? data + existing.data : existing.data + data)
+        } else {
+            record.properties[property] = (type: type, format: format, data: data)
+        }
         if property == wmNormalHintsAtom, format == 32 {
             applyWMNormalHints(data, to: record)
         }
@@ -2479,6 +5375,27 @@ final class X11Connection: NSObject {
         }
         if property == Self.wmClassAtom {
             applyAppName(data, to: record)
+        }
+        // `_GTK_FRAME_EXTENTS` is one of doc 10 §2's three candidates for
+        // Nautilus's half-size sidebar: every GNOME app is client-side
+        // decorated, so GTK makes the toplevel LARGER than the visible
+        // window by an invisible shadow margin and publishes that margin
+        // here for the WM to subtract. With no WM and the property
+        // ignored, the window is sized to include a margin that should not
+        // be there.
+        //
+        // Traced rather than handled, because whether it matters at all
+        // depends on whether clients actually send it - and that cannot be
+        // answered from outside: each X tool gets its own host process and
+        // its own synthetic root (catch C5), so `xprop` cannot see another
+        // app's windows. The server is the only place that can see this.
+        if X11Trace.enabled, property == state.internAtom("_GTK_FRAME_EXTENTS", onlyIfExists: false) {
+            let values = stride(from: 0, to: min(data.count, 16), by: 4).map { offset -> UInt32 in
+                UInt32(data[offset]) | UInt32(data[offset + 1]) << 8
+                    | UInt32(data[offset + 2]) << 16 | UInt32(data[offset + 3]) << 24
+            }
+            FileHandle.standardError.write(
+                "[x11] _GTK_FRAME_EXTENTS wid=\(wid) left/right/top/bottom=\(values)\n".data(using: .utf8)!)
         }
         sendPropertyNotify(record, atom: property, state: 0) // 0 = NewValue
     }
@@ -2516,12 +5433,12 @@ final class X11Connection: NSObject {
         guard record.isTopLevel, !record.overrideRedirect else { return }
         guard let icon = X11WindowIcon.decode(data, littleEndian: littleEndian) else {
             if X11Trace.enabled {
-                FileHandle.standardError.write("[x11] icon wid=\(record.id) UNDECODABLE bytes=\(data.count)\n".data(using: .utf8)!)
+                MSLLog.line("x11", "icon wid=\(record.id) UNDECODABLE bytes=\(data.count)")
             }
             return
         }
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] icon wid=\(record.id) decoded \(Int(icon.size.width))x\(Int(icon.size.height)) from \(data.count) bytes\n".data(using: .utf8)!)
+            MSLLog.line("x11", "icon wid=\(record.id) decoded \(Int(icon.size.width))x\(Int(icon.size.height)) from \(data.count) bytes")
         }
         record.iconImage = icon
         X11WindowIcon.dumpForDebug(icon, windowID: record.id)
@@ -2544,7 +5461,7 @@ final class X11Connection: NSObject {
         guard let name = parts.count >= 2 ? parts[1] : parts.first, !name.isEmpty else { return }
         record.appName = name
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] wmClass wid=\(record.id) parts=\(parts) -> \(name)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "wmClass wid=\(record.id) parts=\(parts) -> \(name)")
         }
         DispatchQueue.main.async {
             X11DockIntegration.shared.setAppName(name, forWindow: record.id)
@@ -2622,16 +5539,76 @@ final class X11Connection: NSObject {
         }
     }
 
+    /// EWMH's window-manager properties, answered by the server itself.
+    ///
+    /// **mslgd is the window manager**: it owns the real `NSWindow`, and it is
+    /// the only thing that can minimise, maximise or raise one. Until it said
+    /// so, GTK saw no WM and took its no-WM fallback for everything - which is
+    /// why a client-side-decorated app's minimise button *withdrew* its own
+    /// window instead of asking to be iconified, and `GtkApplication` then
+    /// quit because its last window was gone. Measured 2026-09-28: clicking
+    /// minimise in GNOME Calculator exited the app.
+    ///
+    /// The last attempt at this was reverted because it advertised
+    /// `_NET_WM_STATE`/`_NET_WM_NAME` while answering neither, and a WM that
+    /// claims support it does not have leaves a client with no fallback -
+    /// galculator rendered a near-blank grid. So the rule here is: **advertise
+    /// exactly what `handleWindowManagerRequest` really honours, and nothing
+    /// else.** No `_NET_WORKAREA`, no desktops - a client asking for those
+    /// gets "absent", which is what it got before and handles fine.
+    private var ewmhSupportedAtoms: [String] {
+        ["_NET_SUPPORTING_WM_CHECK", "_NET_WM_NAME", "_NET_WM_STATE",
+         "_NET_WM_STATE_HIDDEN", "_NET_WM_STATE_MAXIMIZED_VERT", "_NET_WM_STATE_MAXIMIZED_HORZ",
+         "_NET_WM_STATE_FULLSCREEN", "_NET_ACTIVE_WINDOW", "_NET_CLOSE_WINDOW"]
+    }
+
+    private func atom(_ name: String) -> UInt32 { state.internAtom(name, onlyIfExists: false) }
+
+    private func ewmhProperty(window wid: UInt32, property: UInt32) -> (type: UInt32, format: UInt8, data: [UInt8])? {
+        func words(_ values: [UInt32], type: UInt32) -> (UInt32, UInt8, [UInt8]) {
+            let w = X11ByteWriter(littleEndian: littleEndian)
+            for value in values { w.writeU32(value) }
+            return (type, 32, w.bytes)
+        }
+        let windowType: UInt32 = 33 // WINDOW
+        let atomType: UInt32 = 4    // ATOM
+
+        if wid == rootWindowID {
+            if property == atom("_NET_SUPPORTING_WM_CHECK") { return words([wmCheckWindowID], type: windowType) }
+            if property == atom("_NET_SUPPORTED") {
+                return words(ewmhSupportedAtoms.map { atom($0) }, type: atomType)
+            }
+            return nil
+        }
+        if wid == wmCheckWindowID {
+            // The check window points at itself and carries the WM's name;
+            // a client that finds anything else concludes the WM is gone.
+            if property == atom("_NET_SUPPORTING_WM_CHECK") { return words([wmCheckWindowID], type: windowType) }
+            if property == atom("_NET_WM_NAME") { return (atom("UTF8_STRING"), 8, Array("MSL".utf8)) }
+            return nil
+        }
+        // A real window's current state, as the server understands it.
+        guard property == atom("_NET_WM_STATE"), let record = state.window(wid) else { return nil }
+        var states: [UInt32] = []
+        if record.isMinimised { states.append(atom("_NET_WM_STATE_HIDDEN")) }
+        if record.isMaximised {
+            states.append(atom("_NET_WM_STATE_MAXIMIZED_VERT"))
+            states.append(atom("_NET_WM_STATE_MAXIMIZED_HORZ"))
+        }
+        if record.isFullScreen { states.append(atom("_NET_WM_STATE_FULLSCREEN")) }
+        return words(states, type: atomType)
+    }
+
     private func handleGetProperty(detail: UInt8, body: [UInt8]) {
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let wid = r.readU32()
         let property = r.readU32()
         r.skip(4) // requested type - ignored, this always returns whatever's actually stored
-        r.skip(4) // long-offset - ignored, always returns from the start (simplification)
+        let longOffset = r.readU32()
         let longLength = r.readU32()
         let deleteFlag = detail != 0
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] getProperty wid=\(wid) rootWindowID=\(rootWindowID) property=\(property) name=\(state.atomName(property) ?? "?")\n".data(using: .utf8)!)
+            MSLLog.line("x11", "getProperty wid=\(wid) rootWindowID=\(rootWindowID) property=\(property) name=\(state.atomName(property) ?? "?")")
         }
 
         var replyType: UInt32 = 0
@@ -2659,18 +5636,43 @@ final class X11Connection: NSObject {
         // Reverted rather than fixed narrower, since it never achieved
         // its actual goal (the menu bug) and this server has no real use
         // for claiming EWMH WM presence otherwise.
-        if let record = state.window(wid), let prop = record.properties[property] {
+        // `bytes-after` is the whole point of this reply, not a detail.
+        //
+        // It used to be hardcoded to 0 with the value truncated to
+        // `long-length` and nothing else. That looks harmless until you
+        // notice how every toolkit reads a property whose size it does not
+        // know: `XGetWindowProperty` with `long_length = 0` first, to be
+        // TOLD the size by `bytes-after`, then again with a real length.
+        // Answering "0 bytes, and nothing follows" makes every one of those
+        // reads come back empty. It is why pasting into a Linux app
+        // returned nothing at all: `xclip` asked twice, exactly as
+        // specified, and was told twice that the property was empty.
+        var bytesAfter: UInt32 = 0
+        if let synthetic = ewmhProperty(window: wid, property: property) {
+            replyType = synthetic.type
+            replyFormat = synthetic.format
+            let read = X11PropertyRead(total: synthetic.data.count, longOffset: longOffset,
+                                       longLength: longLength, delete: false)
+            value = Array(synthetic.data[read.range])
+            bytesAfter = UInt32(read.bytesAfter)
+        } else if let record = state.window(wid), let prop = record.properties[property] {
             replyType = prop.type
             replyFormat = prop.format
-            value = Array(prop.data.prefix(Int(longLength) * 4))
-            if deleteFlag { record.properties.removeValue(forKey: property) }
+            let read = X11PropertyRead(total: prop.data.count, longOffset: longOffset,
+                                       longLength: longLength, delete: deleteFlag)
+            value = Array(prop.data[read.range])
+            bytesAfter = UInt32(read.bytesAfter)
+            if read.deletes {
+                record.properties.removeValue(forKey: property)
+                sendPropertyNotify(record, atom: property, state: 1) // 1 = Deleted
+            }
         }
         let unitBytes = replyFormat == 32 ? 4 : (replyFormat == 16 ? 2 : 1)
         let unitCount = replyFormat == 0 ? 0 : value.count / unitBytes
 
         let fw = X11ByteWriter(littleEndian: littleEndian)
         fw.writeU32(replyType)
-        fw.writeU32(0) // bytes-after - always 0 (this skeleton never returns a partial value)
+        fw.writeU32(bytesAfter)
         fw.writeU32(UInt32(unitCount))
         fw.writePadding(12)
         sendReply(fixed24: fw, extra: padded(value), detail: replyFormat)
@@ -2681,7 +5683,8 @@ final class X11Connection: NSObject {
         let wid = r.readU32()
         let property = r.readU32()
         guard let record = state.window(wid) else { return }
-        record.properties.removeValue(forKey: property)
+        // Only a property that existed generates PropertyNotify (spec).
+        guard record.properties.removeValue(forKey: property) != nil else { return }
         sendPropertyNotify(record, atom: property, state: 1) // 1 = Deleted
     }
 
@@ -2697,7 +5700,10 @@ final class X11Connection: NSObject {
             fw.writeU8(1) // present = True
             fw.writeU8(X11Opcode.renderExtension)
             fw.writeU8(0) // first-event - RENDER defines none this server generates
-            fw.writeU8(0) // first-error - no RENDER-specific errors implemented; never actually emitted
+            // A real base, not 0. `0` reads as "no errors registered", and
+            // it meant this server could not name `BadPicture` or
+            // `BadPictFormat` at all - so every bad id had to be accepted.
+            fw.writeU8(X11ExtensionBase.renderFirstError)
         } else if name == "BIG-REQUESTS" {
             fw.writeU8(1)
             fw.writeU8(X11Opcode.bigRequestsExtension)
@@ -2712,6 +5718,16 @@ final class X11Connection: NSObject {
             // `X11ExtensionBase`.
             fw.writeU8(X11ExtensionBase.xinputFirstEvent)
             fw.writeU8(X11ExtensionBase.xinputFirstError)
+        } else if name == "MIT-SCREEN-SAVER" {
+            fw.writeU8(1)
+            fw.writeU8(X11Opcode.screenSaverExtension)
+            fw.writeU8(0) // first-event - ScreenSaverNotify is never generated here
+            fw.writeU8(0) // first-error
+        } else if name == "XTEST" {
+            fw.writeU8(1)
+            fw.writeU8(X11Opcode.xtestExtension)
+            fw.writeU8(0) // first-event - XTEST defines none
+            fw.writeU8(0) // first-error - none implemented
         } else if name == "XKEYBOARD" {
             fw.writeU8(1)
             fw.writeU8(X11Opcode.xkbExtension)
@@ -2737,11 +5753,21 @@ final class X11Connection: NSObject {
             // only wants monitor/DPI info at startup.
             fw.writeU8(0)
             fw.writeU8(0)
+        } else if name == "GLX" {
+            fw.writeU8(1)
+            fw.writeU8(X11Opcode.glxExtension)
+            fw.writeU8(X11ExtensionBase.glxFirstEvent)
+            fw.writeU8(X11ExtensionBase.glxFirstError)
         } else if name == "XC-MISC" {
             fw.writeU8(1)
             fw.writeU8(X11Opcode.xcMiscExtension)
             fw.writeU8(0)
             fw.writeU8(0)
+        } else if name == "XFIXES" {
+            fw.writeU8(1)
+            fw.writeU8(X11Opcode.xfixesExtension)
+            fw.writeU8(X11ExtensionBase.xfixesFirstEvent)
+            fw.writeU8(X11ExtensionBase.xfixesFirstError)
         } else if name == "SHAPE" {
             fw.writeU8(1)
             fw.writeU8(X11Opcode.shapeExtension)
@@ -2755,7 +5781,7 @@ final class X11Connection: NSObject {
             fw.writeU8(X11ExtensionBase.shapeFirstEvent)
             fw.writeU8(0)
         } else {
-            fw.writeU8(0) // present = False - every other extension (SHM, XFIXES, ...) still unimplemented
+            fw.writeU8(0) // present = False - every other extension (SHM, DAMAGE, ...) still unimplemented
             fw.writeU8(0)
             fw.writeU8(0)
             fw.writeU8(0)
@@ -2764,10 +5790,32 @@ final class X11Connection: NSObject {
         sendReply(fixed24: fw)
     }
 
+    /// Every extension this server actually answers `present = 1` for.
+    ///
+    /// One list, used by both `ListExtensions` and - as a cross-check in
+    /// the tests - `QueryExtension`, so the two cannot drift apart.
+    static let advertisedExtensions = [
+        "RENDER", "BIG-REQUESTS", "XInputExtension", "XKEYBOARD", "RANDR", "XC-MISC", "SHAPE",
+        "XTEST", "MIT-SCREEN-SAVER", "GLX", "XFIXES",
+    ]
+
+    /// This answered "no extensions at all" while `QueryExtension` said
+    /// yes to seven of them - a direct contradiction, and the reason
+    /// `xdpyinfo` could not run against this server. A LISTofSTR is each
+    /// name prefixed by its own length byte, packed with no padding
+    /// between entries and the whole list padded to a 4-byte boundary.
     private func handleListExtensions() {
+        let names = Self.advertisedExtensions
+        let body = X11ByteWriter(littleEndian: littleEndian)
+        for name in names {
+            let bytes = Array(name.utf8)
+            body.writeU8(UInt8(bytes.count))
+            body.writeBytes(bytes)
+        }
+        body.writePadding(X11Wire.pad(body.bytes.count) - body.bytes.count)
         let fw = X11ByteWriter(littleEndian: littleEndian)
         fw.writePadding(24)
-        sendReply(fixed24: fw, detail: 0) // detail = number of STRs = 0
+        sendReply(fixed24: fw, extra: body.bytes, detail: UInt8(names.count))
     }
 
     // MARK: - BIG-REQUESTS extension
@@ -2835,9 +5883,60 @@ final class X11Connection: NSObject {
     /// only ever has the two devices to report anyway and GDK selects
     /// the same events on `AllMasterDevices` in practice. Enough for
     /// GDK's own X11 backend, not a general-purpose XI2 implementation.
+    /// XInput 1.x `ListInputDevices`: the two core devices, with the same
+    /// ids XI2 reports (2 pointer, 3 keyboard).
+    ///
+    /// It had no handler, so it got BadImplementation - and GTK2 sends it
+    /// at startup (`gdk_input_init`, looking for tablets), where that error
+    /// reaches GDK's default handler and aborts the app. Every GTK2 app in
+    /// MSL (Sylpheed, xzgv, xsane, ...) died on launch until this; found by
+    /// capturing real app sessions for the xhell replay suite.
+    ///
+    /// Layout (XIproto.h): fixed part is ndevices(1) + pad(23); then every
+    /// xDeviceInfo (type atom, id, num_classes, use, attached), then every
+    /// device's class infos in the same order, then every name as a STR.
+    /// GTK2 skips IsXPointer/IsXKeyboard devices, so listing only the core
+    /// pair is both honest and all it needs.
+    private func handleXIListInputDevices() {
+        // The core pair, then the two slave pointers with their XI1 device
+        // types (IsXExtensionPointer = 4). Chromium decides which device is
+        // a touchpad from exactly this type atom ("TOUCHPAD").
+        let buttons = UInt16(Self.pointerButtonLabels.count)
+        let devices: [(id: UInt8, use: UInt8, type: String?, name: String, isKeyboard: Bool)] = [
+            (2, 0, nil, "Virtual core pointer", false),        // IsXPointer
+            (3, 1, nil, "Virtual core keyboard", true),        // IsXKeyboard
+            (UInt8(XIDeviceUse.mslMouseID), 4, "MOUSE", "MSL Mouse", false),
+            (UInt8(XIDeviceUse.mslTouchpadID), 4, "TOUCHPAD", "MSL Touchpad", false),
+        ]
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writeU8(UInt8(devices.count)) // ndevices
+        fw.writePadding(23)
+        let extra = X11ByteWriter(littleEndian: littleEndian)
+        for d in devices { // xDeviceInfo: type(4) id(1) num_classes(1) use(1) attached(1)
+            extra.writeU32(d.type.map { state.internAtom($0, onlyIfExists: false) } ?? 0)
+            extra.writeU8(d.id); extra.writeU8(1); extra.writeU8(d.use); extra.writeU8(0)
+        }
+        for d in devices {
+            if d.isKeyboard { // KeyClass: class 0, length 8, min, max, num_keys, pad
+                extra.writeU8(0); extra.writeU8(8); extra.writeU8(8); extra.writeU8(255); extra.writeU16(248); extra.writePadding(2)
+            } else { // ButtonClass: class 1, length 4, num_buttons
+                extra.writeU8(1); extra.writeU8(4); extra.writeU16(buttons)
+            }
+        }
+        for d in devices {
+            let bytes = Array(d.name.utf8)
+            extra.writeU8(UInt8(bytes.count))
+            extra.writeBytes(bytes)
+        }
+        let used = extra.bytes.count
+        extra.writePadding((4 - used % 4) % 4)
+        sendReply(fixed24: fw, extra: extra.bytes, detail: XIOpcode.listInputDevices) // detail = RepType
+    }
+
     private func handleXInputRequest(minor: UInt8, body: [UInt8]) {
         switch minor {
         case XIOpcode.getExtensionVersion: handleXIGetExtensionVersion(body: body)
+        case XIOpcode.listInputDevices: handleXIListInputDevices()
         case XIOpcode.queryVersion: handleXIQueryVersion(body: body)
         case XIOpcode.queryDevice: handleXIQueryDevice(body: body)
         case XIOpcode.selectEvents: handleXISelectEvents(body: body)
@@ -2892,7 +5991,7 @@ final class X11Connection: NSObject {
         // not just this fallback - if a fresh "GDK exits right after an
         // XInputExtension BadImplementation" report shows up again, that
         // minor_code in the error message is where to look first.
-        default: sendError(code: X11ErrorCode.implementation, badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xinputExtension)
+        default: handleXIOtherRequest(minor: minor, body: body)
         }
     }
 
@@ -2927,9 +6026,19 @@ final class X11Connection: NSObject {
     /// actually implements (basic device enumeration + key/button/motion
     /// events), not the touch/gesture features 2.3/2.4 added.
     private func handleXIQueryVersion(body: [UInt8]) {
+        // The lower of the client's version and ours (2.2), as Xorg does:
+        // a client that asked for 2.0 must not be told 2.2 and then get
+        // 2.2-only event layouts it never agreed to parse.
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        let asked = (major: r.readU16(), minor: r.readU16())
+        // 2.4: smooth scrolling (2.1) and touchpad gestures (2.4) are real
+        // here now; touch (2.2) and barriers (2.3) are simply never sent.
+        let ours: (major: UInt16, minor: UInt16) = (2, 4)
+        let agreed = (asked.major, asked.minor) < (ours.major, ours.minor) && asked.major >= 2 ? asked : ours
+        xiVersion = agreed
         let fw = X11ByteWriter(littleEndian: littleEndian)
-        fw.writeU16(2) // major_version
-        fw.writeU16(2) // minor_version
+        fw.writeU16(agreed.major) // major_version
+        fw.writeU16(agreed.minor) // minor_version
         fw.writePadding(20)
         sendReply(fixed24: fw)
     }
@@ -2979,7 +6088,7 @@ final class X11Connection: NSObject {
     /// (`label4 == ButtonWheelUp || label4 == 0`), but a real server sends
     /// them and a toolkit that matches strictly on the atom then has
     /// something to match.
-    private static let pointerButtonLabels = [
+    static let pointerButtonLabels = [
         "Button Left", "Button Middle", "Button Right",
         "Button Wheel Up", "Button Wheel Down",
         "Button Horiz Wheel Left", "Button Horiz Wheel Right",
@@ -3047,7 +6156,12 @@ final class X11Connection: NSObject {
             w.writeU16(UInt16(2 + maskBytes / 4 + numButtons)) // length in 4-byte units: 2-unit header + bitmask + numButtons*4 bytes of labels
             w.writeU16(sourceid)
             w.writeU16(UInt16(numButtons))
-            w.writePadding(maskBytes) // button state bitmask - all zero, nothing currently pressed
+            // What is actually held, not zeros. A toolkit calls
+            // `XIQueryDevice` to re-sync after a grab or a focus change,
+            // and mid-drag it was being told nothing was pressed.
+            var stateMask = Self.xi2ButtonMask(pressedButtons)
+            stateMask += [UInt8](repeating: 0, count: max(0, maskBytes - stateMask.count))
+            w.writeBytes(Array(stateMask.prefix(maskBytes)))
             for label in labels { w.writeU32(state.internAtom(label, onlyIfExists: false)) }
             return w.bytes
         }
@@ -3073,75 +6187,109 @@ final class X11Connection: NSObject {
         // event's `event_x`/`event_y`, never through a valuator delta),
         // `label`/`min`/`max`/`resolution` all zero since nothing reads
         // them back for a relative axis.
-        func valuatorClass(sourceid: UInt16, number: UInt16) -> [UInt8] {
+        // Valuators labelled the way libinput labels a mouse and a
+        // touchpad. The labels are not cosmetic: Qt reads its starting
+        // scroll position from the value of "Rel Vert Scroll"/"Rel Horiz
+        // Scroll", and GTK maps "Rel X"/"Rel Y" to its X/Y axes.
+        let valuatorLabels = ["Rel X", "Rel Y", "Rel Horiz Scroll", "Rel Vert Scroll"]
+        func valuatorClass(sourceid: UInt16, number: UInt16, labelled: Bool, value: Double = 0) -> [UInt8] {
             let w = X11ByteWriter(littleEndian: littleEndian)
-            // type = XIValuatorClass. Real value from `XI2.h`: XIKeyClass=0,
-            // XIButtonClass=1, XIValuatorClass=2, XIScrollClass=3 - this
-            // was previously writing 3 (actually XIScrollClass), so GDK
-            // read every one of these as a bogus scroll-class announcement
-            // instead of a real axis and tried to register scroll
-            // valuators against it directly - explains the `_gdk_x11_
-            // device_xi2_add_scroll_valuator` assertion seen live with
-            // `mousepad` exactly (4 fake "scroll" entries x 2 devices = 8
-            // failed calls, matching the observed count precisely), since
-            // real XIValuatorClass entries never existed at all and
-            // `n_axes` for the device stayed 0.
             w.writeU16(2)
             w.writeU16(11) // length: 44 bytes / 4
             w.writeU16(sourceid)
             w.writeU16(number)
-            w.writeU32(0) // label = None
-            w.writeI32(0); w.writeU32(0) // min (FP3232)
-            w.writeI32(0); w.writeU32(0) // max (FP3232)
-            w.writeI32(0); w.writeU32(0) // value (FP3232)
+            w.writeU32(labelled ? state.internAtom(valuatorLabels[Int(number)], onlyIfExists: false) : 0)
+            w.writeI32(-1); w.writeU32(0) // min (FP3232): -1/-1 = unbounded, as relative axes report
+            w.writeI32(-1); w.writeU32(0) // max
+            Self.writeFP3232(value, into: w) // value: the live position, which Qt resyncs from
             w.writeU32(0) // resolution
             w.writeU8(0) // mode = ModeRelative
             w.writePadding(3)
             return w.bytes
         }
 
-        // 4 valuators, not 2: confirmed live `_gdk_x11_device_xi2_add_
-        // scroll_valuator` asserts (`n_valuator < gdk_device_get_n_axes`)
-        // trying to register scroll-wheel valuators at indices 2/3 - GDK
-        // unconditionally expects a master pointer to have X/Y motion
-        // PLUS horizontal/vertical scroll axes, not just the two motion
-        // axes a real touchpad/mouse's core motion alone would suggest.
-        func pointerClasses(sourceid: UInt16) -> [UInt8] {
-            buttonClass(sourceid: sourceid, labels: Self.pointerButtonLabels)
-                + valuatorClass(sourceid: sourceid, number: 0)
-                + valuatorClass(sourceid: sourceid, number: 1)
-                + valuatorClass(sourceid: sourceid, number: 2)
-                + valuatorClass(sourceid: sourceid, number: 3)
+        /// XIScrollClass (XI 2.1): type 3, 24 bytes.
+        func scrollClass(sourceid: UInt16, number: UInt16, vertical: Bool, increment: Double) -> [UInt8] {
+            let w = X11ByteWriter(littleEndian: littleEndian)
+            w.writeU16(3)
+            w.writeU16(6)
+            w.writeU16(sourceid)
+            w.writeU16(number)
+            w.writeU16(vertical ? 1 : 2) // XIScrollTypeVertical / Horizontal
+            w.writePadding(2)
+            w.writeU32(2) // XIScrollFlagPreferred
+            Self.writeFP3232(increment, into: w)
+            return w.bytes
         }
+
+        /// XIGestureClass (XI 2.4): type 9, 8 bytes.
+        func gestureClass(sourceid: UInt16) -> [UInt8] {
+            let w = X11ByteWriter(littleEndian: littleEndian)
+            w.writeU16(9)
+            w.writeU16(2)
+            w.writeU16(sourceid)
+            w.writeU8(2) // num_touches: pinch is two fingers
+            w.writePadding(1)
+            return w.bytes
+        }
+
+        /// Button + four valuators, then (by negotiated version) the
+        /// scroll classes and the gesture class. `scroller` is the slave
+        /// whose scroll position and increment the classes describe; nil
+        /// for a device without scrolling (the XTEST pointer).
+        func pointerClasses(sourceid: UInt16, scroller: UInt16?, gesture: Bool) -> (count: Int, bytes: [UInt8]) {
+            let position: (h: Double, v: Double) = scroller.map { state.scrollPosition(device: $0) } ?? (0, 0)
+            var bytes = buttonClass(sourceid: sourceid, labels: Self.pointerButtonLabels)
+                + valuatorClass(sourceid: sourceid, number: 0, labelled: true)
+                + valuatorClass(sourceid: sourceid, number: 1, labelled: true)
+                + valuatorClass(sourceid: sourceid, number: 2, labelled: scroller != nil, value: position.h)
+                + valuatorClass(sourceid: sourceid, number: 3, labelled: scroller != nil, value: position.v)
+            var count = 5
+            if let scroller, xiAtLeast(2, 1) {
+                let increment = X11ScrollTranslator.increment(scroller == XIDeviceUse.mslTouchpadID ? .touchpad : .wheel)
+                bytes += scrollClass(sourceid: sourceid, number: 2, vertical: false, increment: increment)
+                bytes += scrollClass(sourceid: sourceid, number: 3, vertical: true, increment: increment)
+                count += 2
+            }
+            if gesture, xiAtLeast(2, 4) {
+                bytes += gestureClass(sourceid: sourceid)
+                count += 1
+            }
+            return (count, bytes)
+        }
+        let master = pointerClasses(sourceid: XIDeviceUse.mslMouseID, scroller: XIDeviceUse.mslMouseID, gesture: false)
         writeDevice(
             id: XIDeviceUse.corePointerID, use: XIDeviceUse.masterPointer,
             attachment: XIDeviceUse.coreKeyboardID, name: "Virtual core pointer",
-            numClasses: 5, classBytes: pointerClasses(sourceid: XIDeviceUse.corePointerID)
+            numClasses: master.count, classBytes: master.bytes
         )
         writeDevice(
             id: XIDeviceUse.coreKeyboardID, use: XIDeviceUse.masterKeyboard,
             attachment: XIDeviceUse.corePointerID, name: "Virtual core keyboard",
             numClasses: 1, classBytes: keyClass(sourceid: XIDeviceUse.coreKeyboardID, keycodes: 8...255)
         )
-        // Every real X server also reports a pair of XTEST slave devices,
-        // attached to the two masters above - present unconditionally,
-        // independent of real hardware. GDK's XI2 device setup sizes its
-        // PER-DEVICE (not just per-master) valuator/axis table by walking
-        // every device this reply lists, including slaves - with no slave
-        // pointer ever listed, GDK fell back to a zero-axis device object
-        // for whichever slave it expected, so ANY later scroll-valuator
-        // registration on it hit `n_valuator < gdk_device_get_n_axes`
-        // (0 axes) - confirmed live: this GDK critical persisted even
-        // after the master pointer above already had all 4 valuators.
+        let xtest = pointerClasses(sourceid: XIDeviceUse.xtestPointerID, scroller: nil, gesture: false)
         writeDevice(
             id: XIDeviceUse.xtestPointerID, use: XIDeviceUse.slavePointer,
             attachment: XIDeviceUse.corePointerID, name: "Virtual core XTEST pointer",
-            numClasses: 5, classBytes: pointerClasses(sourceid: XIDeviceUse.xtestPointerID)
+            numClasses: xtest.count, classBytes: xtest.bytes
         )
         writeDevice(
             id: XIDeviceUse.xtestKeyboardID, use: XIDeviceUse.slaveKeyboard,
             attachment: XIDeviceUse.coreKeyboardID, name: "Virtual core XTEST keyboard",
             numClasses: 1, classBytes: keyClass(sourceid: XIDeviceUse.xtestKeyboardID, keycodes: 8...255)
+        )
+        let mouse = pointerClasses(sourceid: XIDeviceUse.mslMouseID, scroller: XIDeviceUse.mslMouseID, gesture: false)
+        writeDevice(
+            id: XIDeviceUse.mslMouseID, use: XIDeviceUse.slavePointer,
+            attachment: XIDeviceUse.corePointerID, name: "MSL Mouse",
+            numClasses: mouse.count, classBytes: mouse.bytes
+        )
+        let touchpad = pointerClasses(sourceid: XIDeviceUse.mslTouchpadID, scroller: XIDeviceUse.mslTouchpadID, gesture: true)
+        writeDevice(
+            id: XIDeviceUse.mslTouchpadID, use: XIDeviceUse.slavePointer,
+            attachment: XIDeviceUse.corePointerID, name: "MSL Touchpad",
+            numClasses: touchpad.count, classBytes: touchpad.bytes
         )
 
         let fw = X11ByteWriter(littleEndian: littleEndian)
@@ -3203,7 +6351,8 @@ final class X11Connection: NSObject {
     /// Sends one `XI_RawMotion` (called on the main thread by
     /// `X11PointerMonitor`, like every other input event).
     private func sendXIRawMotion(dx: Double, dy: Double) {
-        writeFull(Self.xiRawMotionEvent(sequence: sequenceNumber, time: currentX11Timestamp, dx: dx, dy: dy,
+        X11Perf.inputSent()
+        writeFull(Self.xiRawMotionEvent(sequence: stampSequence, time: currentX11Timestamp, dx: dx, dy: dy,
                                         littleEndian: littleEndian))
     }
 
@@ -3296,27 +6445,16 @@ final class X11Connection: NSObject {
     /// whole app).
     private func handleXIQueryPointer(body: [UInt8]) {
         let wid = X11ByteReader(body, littleEndian: littleEndian).readU32()
-        // `windowOrigin(_:)`, not `frame.origin` directly - correct for
-        // a top-level window either way, but `frame.origin` alone is only
-        // PARENT-relative for a child window (see `sendPointerEvent`'s
-        // doc comment for the sibling bug this was found alongside).
-        let origin = windowOrigin(wid)
-        var rootX = 0, rootY = 0
-        DispatchQueue.main.sync {
-            let screenHeight = NSScreen.main?.frame.height ?? 1080
-            let cocoa = NSEvent.mouseLocation
-            rootX = Int(cocoa.x)
-            rootY = Int(screenHeight - cocoa.y)
-        }
-        let winX = rootX - Int(origin.x)
-        let winY = rootY - Int(origin.y)
+        // Same answer as core QueryPointer - see `pointerQuery` for why the
+        // child matters.
+        let p = pointerQuery(for: wid)
         let fw = X11ByteWriter(littleEndian: littleEndian)
         fw.writeU32(rootWindowID)
-        fw.writeU32(0) // child = None
-        fw.writeI32(Int32(clamping: rootX) << 16) // root_x, FP1616
-        fw.writeI32(Int32(clamping: rootY) << 16) // root_y
-        fw.writeI32(Int32(clamping: winX) << 16) // win_x
-        fw.writeI32(Int32(clamping: winY) << 16) // win_y
+        fw.writeU32(p.child)
+        fw.writeI32(Int32(clamping: p.rootX) << 16) // root_x, FP1616
+        fw.writeI32(Int32(clamping: p.rootY) << 16) // root_y
+        fw.writeI32(Int32(clamping: p.winX) << 16) // win_x
+        fw.writeI32(Int32(clamping: p.winY) << 16) // win_y
 
         let extra = X11ByteWriter(littleEndian: littleEndian)
         extra.writeU16(0) // buttons_len
@@ -3344,6 +6482,14 @@ final class X11Connection: NSObject {
     /// (`handleGrabReply`) - single client, nothing to actually contend
     /// against, so every grab trivially succeeds.
     private func handleXIGrabDevice(body: [UInt8]) {
+        // window(4) time(4) cursor(4) deviceid(2): GTK grabs the master
+        // keyboard (3) separately from the pointer (2).
+        if body.count >= 14 {
+            let r = X11ByteReader(body, littleEndian: littleEndian)
+            let window = r.readU32()
+            r.skip(8)
+            if r.readU16() == XIDeviceUse.coreKeyboardID { keyboardGrabbed(window: window) }
+        }
         let fw = X11ByteWriter(littleEndian: littleEndian)
         fw.writePadding(24)
         sendReply(fixed24: fw, detail: 0) // detail: status = GrabSuccess
@@ -3373,7 +6519,9 @@ final class X11Connection: NSObject {
     /// `mods` carries the real keyboard state (`X11KeyboardState`); `group`
     /// stays 0 because the Mac layout's first group is always the active one.
     private func sendXIDeviceEvent(evtype: UInt16, detail: UInt32, deviceid: UInt16, windowID: UInt32, x: Int16, y: Int16,
-                                   mods: X11KeyboardSnapshot? = nil, buttons: Set<UInt8>? = nil) {
+                                   mods: X11KeyboardSnapshot? = nil, buttons: Set<UInt8>? = nil,
+                                   sourceid: UInt16? = nil, flags: UInt32 = 0,
+                                   valuators: [(number: UInt16, value: Double)] = [], time: UInt32? = nil) {
         // The modifier fields were all zero until 2026-09-14, and GTK3 reads
         // an XI2 event's modifier state from exactly these - so Ctrl, Shift
         // and Alt never reached any XI2 client's shortcut handling.
@@ -3387,11 +6535,13 @@ final class X11Connection: NSObject {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(35) // GenericEvent
         w.writeU8(X11Opcode.xinputExtension)
-        w.writeU16(sequenceNumber)
-        w.writeU32(13) // length: (80 + 4 - 32) / 4 - fixed part plus one button-mask unit
+        w.writeU16(stampSequence)
+        // Fixed part plus one button-mask unit, then (if any) one valuator
+        // mask unit and an FP3232 per valuator.
+        w.writeU32(UInt32(13 + (valuators.isEmpty ? 0 : 1 + 2 * valuators.count)))
         w.writeU16(evtype)
         w.writeU16(deviceid)
-        w.writeU32(currentX11Timestamp)
+        w.writeU32(time ?? currentX11Timestamp)
         w.writeU32(detail)
         w.writeU32(rootWindowID)
         w.writeU32(windowID) // event
@@ -3406,10 +6556,12 @@ final class X11Connection: NSObject {
         // "no button held": sliders couldn't be dragged, and clicks on
         // buttons and checkboxes didn't stick.
         w.writeU16(1) // buttons_len, in 4-byte units
-        w.writeU16(0) // valuators_len
-        w.writeU16(deviceid) // sourceid
+        w.writeU16(valuators.isEmpty ? 0 : 1) // valuators_len
+        // The physical (slave) device for pointer events - Qt and Chromium
+        // find scroll and gesture classes by sourceid. It was the master.
+        w.writeU16(sourceid ?? (deviceid == XIDeviceUse.corePointerID ? XIDeviceUse.mslMouseID : deviceid))
         w.writeU16(0) // pad0
-        w.writeU32(0) // flags
+        w.writeU32(flags)
         w.writeU32(UInt32(modState.baseMods)) // mods.base_mods
         w.writeU32(0) // mods.latched_mods
         w.writeU32(UInt32(modState.lockedMods)) // mods.locked_mods
@@ -3422,6 +6574,12 @@ final class X11Connection: NSObject {
         // press doesn't include its own button, a release does, motion
         // carries whatever is held.
         w.writeBytes(Self.xi2ButtonMask(buttons ?? pressedButtons))
+        if !valuators.isEmpty {
+            var mask: UInt32 = 0
+            for v in valuators { mask |= 1 << UInt32(v.number) }
+            w.writeU32(mask)
+            for v in valuators.sorted(by: { $0.number < $1.number }) { Self.writeFP3232(v.value, into: w) }
+        }
         writeFull(w.bytes)
     }
 
@@ -3449,23 +6607,68 @@ final class X11Connection: NSObject {
     /// (`XI2proto.h` literally `typedef`s `xXIFocusInEvent` to
     /// `xXIEnterEvent`), so they go out through here too - see
     /// `sendXIFocusEvent`.
+    /// Crossing (`XI_Enter`/`XI_Leave`) and focus (`XI_FocusIn`/
+    /// `XI_FocusOut`) events, which share `xXIEnterEvent`'s layout.
+    ///
+    /// Two fields here were zero until 2026-09-22, and both are the same
+    /// defect already fixed once in `sendXIDeviceEvent`:
+    ///
+    /// - **The button mask.** GDK3 builds its button state for XI2 events
+    ///   only from this, so a crossing that happened while a button was
+    ///   held reported nothing held: dragging a slider until the pointer
+    ///   left the widget, drag-and-drop entering a target, GTK menu
+    ///   tracking through a press-drag-release.
+    /// - **Modifier and group state**, for focus events. xorg fills these
+    ///   from the device's XKB state, but guards the whole block on
+    ///   `if (dev->key)` - so a *pointer* device writes zeros there and a
+    ///   keyboard does not. `sendXIFocusEvent` passes the core keyboard,
+    ///   which is why this fills them for that device only: matching the
+    ///   reference exactly rather than being generous with it.
+    ///
+    /// `length` moves 10 -> 11 in the same breath as the mask, and must:
+    /// it counts 4-byte units past the 32-byte header, and appending the
+    /// mask without it leaves every later event in the stream misframed.
     private func sendXICrossingEvent(evtype: UInt16, deviceid: UInt16, windowID: UInt32, x: Int16, y: Int16, detail: UInt8 = 3, focus: UInt8 = 0) {
         let origin = windowOrigin(windowID)
         let rootX = Int32(origin.x) + Int32(x)
         let rootY = Int32(origin.y) + Int32(y)
+        // Real state for a keyboard device, zeros for a pointer - see this
+        // function's doc comment for why the asymmetry is deliberate.
+        let modState = deviceid == XIDeviceUse.coreKeyboardID ? X11KeyboardState.shared.current : X11KeyboardSnapshot()
+        writeFull(Self.xiCrossingEventBytes(
+            evtype: evtype, deviceid: deviceid, sequence: stampSequence, time: currentX11Timestamp,
+            detail: detail, focus: focus, root: rootWindowID, event: windowID,
+            rootX: rootX, rootY: rootY, x: x, y: y,
+            mods: modState, buttons: pressedButtons, littleEndian: littleEndian))
+    }
+
+    /// `sendXICrossingEvent`'s bytes, built where a test can count them.
+    ///
+    /// Split out for one reason: the declared `length` and the actual byte
+    /// count are two numbers that must agree, written forty lines apart,
+    /// and when they disagreed the symptom was not "this event is wrong" -
+    /// it was every *subsequent* event in the stream being misframed, which
+    /// reads as arbitrary client misbehaviour. `sendConfigureNotify`'s doc
+    /// comment records this project living through exactly that once
+    /// already. `X11CampaignTier2Tests` now holds the two numbers together.
+    static func xiCrossingEventBytes(evtype: UInt16, deviceid: UInt16, sequence: UInt16, time: UInt32,
+                                     detail: UInt8, focus: UInt8, root: UInt32, event: UInt32,
+                                     rootX: Int32, rootY: Int32, x: Int16, y: Int16,
+                                     mods: X11KeyboardSnapshot, buttons: Set<UInt8>,
+                                     littleEndian: Bool) -> [UInt8] {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(35) // GenericEvent
         w.writeU8(X11Opcode.xinputExtension)
-        w.writeU16(sequenceNumber)
-        w.writeU32(10) // length: (72 - 32) / 4
+        w.writeU16(sequence)
+        w.writeU32(11) // length: (72 + 4 - 32) / 4 - fixed part plus one button-mask unit
         w.writeU16(evtype)
         w.writeU16(deviceid)
-        w.writeU32(currentX11Timestamp)
+        w.writeU32(time)
         w.writeU16(deviceid) // sourceid
         w.writeU8(0) // mode = XINotifyNormal
         w.writeU8(detail) // crossing: XINotifyNonlinear; focus: XINotifyAncestor
-        w.writeU32(rootWindowID)
-        w.writeU32(windowID) // event
+        w.writeU32(root)
+        w.writeU32(event)
         w.writeU32(0) // child = None
         w.writeI32(rootX << 16) // root_x, FP1616
         w.writeI32(rootY << 16) // root_y
@@ -3473,16 +6676,17 @@ final class X11Connection: NSObject {
         w.writeI32(Int32(y) << 16) // event_y
         w.writeU8(1) // same_screen
         w.writeU8(focus)
-        w.writeU16(0) // buttons_len
-        w.writeU32(0) // mods.base_mods
+        w.writeU16(1) // buttons_len, in 4-byte units
+        w.writeU32(UInt32(mods.baseMods)) // mods.base_mods
         w.writeU32(0) // mods.latched_mods
-        w.writeU32(0) // mods.locked_mods
-        w.writeU32(0) // mods.effective_mods
+        w.writeU32(UInt32(mods.lockedMods)) // mods.locked_mods
+        w.writeU32(UInt32(mods.effectiveMods)) // mods.effective_mods
         w.writeU8(0) // group.base_group
         w.writeU8(0) // group.latched_group
         w.writeU8(0) // group.locked_group
         w.writeU8(0) // group.effective_group
-        writeFull(w.bytes)
+        w.writeBytes(xi2ButtonMask(buttons))
+        return w.bytes
     }
 
     /// `XI_FocusIn`/`XI_FocusOut` (evtype 9/10). Confirmed live this is
@@ -3530,7 +6734,7 @@ final class X11Connection: NSObject {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(code)
         w.writeU8(3) // detail = NotifyNonlinear - see sendXICrossingEvent's doc comment
-        w.writeU16(sequenceNumber)
+        w.writeU16(stampSequence)
         w.writeU32(currentX11Timestamp)
         w.writeU32(rootWindowID)
         w.writeU32(windowID)
@@ -3574,7 +6778,7 @@ final class X11Connection: NSObject {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(code)
         w.writeU8(0) // detail = NotifyAncestor
-        w.writeU16(sequenceNumber)
+        w.writeU16(stampSequence)
         w.writeU32(windowID)
         w.writeU8(0) // mode = NotifyNormal
         w.writePadding(23)
@@ -3621,7 +6825,15 @@ final class X11Connection: NSObject {
     private func handleXkbRequest(minor: UInt8, body: [UInt8]) {
         switch minor {
         case XKBOpcode.useExtension: handleXkbUseExtension(body: body)
-        case XKBOpcode.getMap: handleXkbGetMap(body: body)
+        case XKBOpcode.getMap:
+            // XkbGetMap's body is a fixed 24 bytes. A short one is BadLength
+            // on a real server; mslgd read past the end and answered with a
+            // map built from zeroes (xdiff `xkb.shape`, 2026-09-28).
+            guard body.count >= 24 else {
+                return sendError(code: X11ErrorCode.length, badValue: UInt32(body.count),
+                                 minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xkbExtension)
+            }
+            handleXkbGetMap(body: body)
         case XKBOpcode.getNames: handleXkbGetNames(body: body)
         case XKBOpcode.getControls: handleXkbGetControls(body: body)
         case XKBOpcode.getState: handleXkbGetState(body: body)
@@ -3642,7 +6854,15 @@ final class X11Connection: NSObject {
         // Same defensive policy as `handleXInputRequest`'s own default -
         // see its doc comment for why silence (a hang) is worse than an
         // error here, even though an error isn't always safe either.
-        default: sendError(code: X11ErrorCode.implementation, badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xkbExtension)
+        default:
+            // XKB's last request is SetDebuggingFlags (101); past it there is
+            // nothing a client can mean, so BadRequest - the rule the core
+            // dispatcher and SHAPE already follow. Within the range it is a
+            // request this server has not implemented. (Xvfb answers
+            // BadRequest for minor 200; mslgd said BadImplementation -
+            // xdiff `errors.requests`, 2026-09-28.)
+            sendError(code: minor > 101 ? X11ErrorCode.request : X11ErrorCode.implementation,
+                      badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xkbExtension)
         }
     }
 
@@ -3652,7 +6872,7 @@ final class X11Connection: NSObject {
     private func handleXkbSelectEvents(body: [UInt8]) {
         xkbSelection.apply(body: body, littleEndian: littleEndian)
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] xkbSelectEvents newKeyboard=0x\(String(xkbSelection.newKeyboard, radix: 16)) map=0x\(String(xkbSelection.map, radix: 16)) state=0x\(String(xkbSelection.state, radix: 16))\n".data(using: .utf8)!)
+            MSLLog.line("x11", "xkbSelectEvents newKeyboard=0x\(String(xkbSelection.newKeyboard, radix: 16)) map=0x\(String(xkbSelection.map, radix: 16)) state=0x\(String(xkbSelection.state, radix: 16))")
         }
     }
 
@@ -3699,19 +6919,20 @@ final class X11Connection: NSObject {
     // its doc comment for why they used to disagree and what that broke.
 
     private func handleXkbGetMap(body: [UInt8]) {
-        writeFull(X11KeymapProvider.shared.keymap.getMapReply(body: body, sequence: sequenceNumber, littleEndian: littleEndian))
+        noteKeymapRead()
+        writeFull(X11KeymapProvider.shared.keymap.getMapReply(body: body, sequence: stampSequence, littleEndian: littleEndian))
     }
 
     private func handleXkbGetNames(body: [UInt8]) {
         let state = self.state
-        let reply = X11KeymapProvider.shared.keymap.getNamesReply(body: body, sequence: sequenceNumber, littleEndian: littleEndian) {
+        let reply = X11KeymapProvider.shared.keymap.getNamesReply(body: body, sequence: stampSequence, littleEndian: littleEndian) {
             state.internAtom($0, onlyIfExists: false)
         }
         writeFull(reply)
     }
 
     private func handleXkbGetControls(body: [UInt8]) {
-        writeFull(X11KeymapProvider.shared.keymap.getControlsReply(sequence: sequenceNumber, littleEndian: littleEndian))
+        writeFull(X11KeymapProvider.shared.keymap.getControlsReply(sequence: stampSequence, littleEndian: littleEndian))
     }
 
     /// The real state now - it was hard-coded to "nothing held", so a
@@ -3719,7 +6940,7 @@ final class X11Connection: NSObject {
     private func handleXkbGetState(body: [UInt8]) {
         var snapshot = X11KeyboardState.shared.current
         snapshot.buttons = Self.x11ButtonMask(pressedButtons)
-        writeFull(X11Keymap.getStateReply(snapshot, sequence: sequenceNumber, littleEndian: littleEndian))
+        writeFull(X11Keymap.getStateReply(snapshot, sequence: stampSequence, littleEndian: littleEndian))
     }
 
     /// `XkbGetCompatMap` and `XkbGetIndicatorMap` used to be errors, and
@@ -3728,11 +6949,11 @@ final class X11Connection: NSObject {
     /// showed it plainly: "Could not load indicator map", "Could not load
     /// compatibility map", then an empty keymap.
     private func handleXkbGetCompatMap(body: [UInt8]) {
-        writeFull(X11KeymapProvider.shared.keymap.getCompatMapReply(body: body, sequence: sequenceNumber, littleEndian: littleEndian))
+        writeFull(X11KeymapProvider.shared.keymap.getCompatMapReply(body: body, sequence: stampSequence, littleEndian: littleEndian))
     }
 
     private func handleXkbGetIndicatorMap(body: [UInt8]) {
-        writeFull(X11KeymapProvider.shared.keymap.getIndicatorMapReply(body: body, sequence: sequenceNumber, littleEndian: littleEndian))
+        writeFull(X11KeymapProvider.shared.keymap.getIndicatorMapReply(body: body, sequence: stampSequence, littleEndian: littleEndian))
     }
 
     /// Which indicators are lit: Caps Lock, when it is locked.
@@ -3746,7 +6967,7 @@ final class X11Connection: NSObject {
     /// GTK and Qt both turn on DetectableAutoRepeat through this at
     /// startup; it used to be answered with an error.
     private func handleXkbPerClientFlags(body: [UInt8]) {
-        let result = X11Keymap.perClientFlagsReply(body: body, current: xkbClientFlags, sequence: sequenceNumber, littleEndian: littleEndian)
+        let result = X11Keymap.perClientFlagsReply(body: body, current: xkbClientFlags, sequence: stampSequence, littleEndian: littleEndian)
         xkbClientFlags = result.flags
         writeFull(result.reply)
     }
@@ -3799,7 +7020,7 @@ final class X11Connection: NSObject {
         guard changed != 0, xkbSelection.state & UInt32(changed) != 0 else { return }
         writeFull(X11Keymap.stateNotify(after, changed: changed, keycode: transition.keycode,
                                         eventType: transition.pressed ? 2 : 3, eventBase: XKBEventCode.eventBase,
-                                        sequence: sequenceNumber, time: currentX11Timestamp, littleEndian: littleEndian))
+                                        sequence: stampSequence, time: currentX11Timestamp, littleEndian: littleEndian))
     }
 
     /// The user switched keyboard layout, or the Option key arrangement
@@ -3808,14 +7029,14 @@ final class X11Connection: NSObject {
     /// way the client re-reads the keymap and the next keystroke types in
     /// the new layout.
     private func keymapDidChange() {
-        writeFull(X11Keymap.mappingNotify(request: 1, sequence: sequenceNumber, littleEndian: littleEndian))
-        writeFull(X11Keymap.mappingNotify(request: 0, sequence: sequenceNumber, littleEndian: littleEndian))
+        writeFull(X11Keymap.mappingNotify(request: 1, sequence: stampSequence, littleEndian: littleEndian))
+        writeFull(X11Keymap.mappingNotify(request: 0, sequence: stampSequence, littleEndian: littleEndian))
         if xkbSelection.newKeyboard & 0x01 != 0 {
-            writeFull(X11Keymap.newKeyboardNotify(eventBase: XKBEventCode.eventBase, sequence: sequenceNumber,
+            writeFull(X11Keymap.newKeyboardNotify(eventBase: XKBEventCode.eventBase, sequence: stampSequence,
                                                   time: currentX11Timestamp, littleEndian: littleEndian))
         }
         if xkbSelection.map & X11Keymap.MapPart.all != 0 {
-            writeFull(X11Keymap.mapNotify(eventBase: XKBEventCode.eventBase, sequence: sequenceNumber,
+            writeFull(X11Keymap.mapNotify(eventBase: XKBEventCode.eventBase, sequence: stampSequence,
                                           time: currentX11Timestamp, littleEndian: littleEndian))
         }
     }
@@ -3856,8 +7077,143 @@ final class X11Connection: NSObject {
         case RandRRequest.getCrtcInfo: handleRRGetCrtcInfo(body: body)
         case RandRRequest.getOutputPrimary: handleRRGetOutputPrimary()
         case RandRRequest.getMonitors: handleRRGetMonitors()
-        default: sendError(code: X11ErrorCode.implementation, badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.randrExtension)
+        // RANDR 1.4: GPU "providers". This server has none, and saying so
+        // is the correct answer - it was BadImplementation, which Firefox's
+        // `glxtest` logged as a fatal-looking X error on every launch.
+        // Reply: timestamp(4) nProviders(2) pad(18), no list.
+        case RandRRequest.getProviders:
+            let w = X11ByteWriter(littleEndian: littleEndian)
+            w.writeU32(0)
+            w.writeU16(0)
+            w.writePadding(18)
+            sendReply(fixed24: w)
+        // The rest of what real clients read about a screen. Every one of
+        // these answered BadImplementation, and a client that gets an
+        // error for a query it assumes always works (Java AWT for
+        // GetScreenInfo, SDL for gamma, Chromium for output properties)
+        // often gives up on the display entirely.
+        case RandRRequest.getScreenInfo: handleRRGetScreenInfo()
+        case RandRRequest.setScreenConfig: handleRRSetScreenConfig()
+        case RandRRequest.listOutputProperties:
+            // No output properties (no EDID to offer): nAtoms 0.
+            let w = X11ByteWriter(littleEndian: littleEndian)
+            w.writeU16(0)
+            w.writePadding(22)
+            sendReply(fixed24: w)
+        case RandRRequest.getOutputProperty:
+            // The property does not exist: format 0, type None, no data.
+            let w = X11ByteWriter(littleEndian: littleEndian)
+            w.writeU32(0) // propertyType None
+            w.writeU32(0) // bytesAfter
+            w.writeU32(0) // nItems
+            w.writePadding(12)
+            sendReply(fixed24: w, detail: 0) // detail = format
+        case RandRRequest.changeOutputProperty, RandRRequest.deleteOutputProperty, RandRRequest.setCrtcGamma:
+            break // no reply; the Mac's display is not Linux's to change
+        case RandRRequest.getCrtcGammaSize:
+            let w = X11ByteWriter(littleEndian: littleEndian)
+            w.writeU16(UInt16(Self.gammaRampSize))
+            w.writePadding(22)
+            sendReply(fixed24: w)
+        case RandRRequest.getCrtcGamma: handleRRGetCrtcGamma()
+        case RandRRequest.getCrtcTransform: handleRRGetCrtcTransform()
+        case RandRRequest.getPanning: handleRRGetPanning()
+        default:
+            // RandR 1.6's last request is DeleteMonitor (44); 45 is a
+            // deliberately generous bound, since guessing high only costs a
+            // BadImplementation where BadRequest would do, and guessing low
+            // would refuse a request a future client really sends.
+            sendError(code: minor > 45 ? X11ErrorCode.request : X11ErrorCode.implementation,
+                      badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.randrExtension)
         }
+    }
+
+    /// Entries per channel in the (identity) gamma ramp this server reports.
+    static let gammaRampSize = 256
+
+    /// RANDR 1.1 `GetScreenInfo`: one size (the screen), one rate (60 Hz),
+    /// Rotate_0 only. Fixed part: root, timestamp, configTimestamp, nSizes,
+    /// sizeID, rotation, rate, nrateEnts, pad; then the sizes (w, h, mm w,
+    /// mm h) and, per size, a rate count followed by the rates.
+    private func handleRRGetScreenInfo() {
+        let (screenW, screenH) = Self.mainScreenSizeInPixels()
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU32(rootWindowID)
+        w.writeU32(currentX11Timestamp)
+        w.writeU32(currentX11Timestamp) // configTimestamp
+        w.writeU16(1)  // nSizes
+        w.writeU16(0)  // sizeID in use
+        w.writeU16(1)  // rotation: Rotate_0
+        w.writeU16(60) // rate
+        w.writeU16(2)  // nrateEnts: the count word + one rate
+        w.writePadding(2)
+        let extra = X11ByteWriter(littleEndian: littleEndian)
+        extra.writeU16(UInt16(clamping: screenW))
+        extra.writeU16(UInt16(clamping: screenH))
+        extra.writeU16(UInt16(clamping: Int(Double(screenW) * 0.264583)))
+        extra.writeU16(UInt16(clamping: Int(Double(screenH) * 0.264583)))
+        extra.writeU16(1)  // rates for size 0
+        extra.writeU16(60)
+        sendReply(fixed24: w, extra: extra.bytes, detail: 1) // detail = set of rotations: Rotate_0
+    }
+
+    /// Accepted and reported as done without changing anything: the Mac
+    /// decides its own display mode. Failing it made some games quit.
+    private func handleRRSetScreenConfig() {
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU32(currentX11Timestamp) // newTimestamp
+        w.writeU32(currentX11Timestamp) // newConfigTimestamp
+        w.writeU32(rootWindowID)
+        w.writeU16(0) // subpixelOrder: Unknown
+        w.writePadding(10)
+        sendReply(fixed24: w, detail: 0) // detail = status Success
+    }
+
+    /// An identity ramp, red then green then blue, 16-bit each.
+    private func handleRRGetCrtcGamma() {
+        let n = Self.gammaRampSize
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU16(UInt16(n))
+        w.writePadding(22)
+        let extra = X11ByteWriter(littleEndian: littleEndian)
+        for _ in 0..<3 {
+            for i in 0..<n { extra.writeU16(UInt16(i * 65535 / (n - 1))) }
+        }
+        sendReply(fixed24: w, extra: extra.bytes)
+    }
+
+    /// No transform: identity for both pending and current, no filters.
+    /// Layout: pendingTransform (9 x FIXED 16.16), hasTransforms(1) pad(3),
+    /// currentTransform (9 x FIXED), pad(4), four filter counts (u16).
+    private func handleRRGetCrtcTransform() {
+        let identity: [UInt32] = [65536, 0, 0, 0, 65536, 0, 0, 0, 65536]
+        let all = X11ByteWriter(littleEndian: littleEndian)
+        for v in identity { all.writeU32(v) }  // pending
+        all.writeU8(1); all.writePadding(3)    // hasTransforms (RANDR 1.3)
+        for v in identity { all.writeU32(v) }  // current
+        all.writePadding(4)
+        for _ in 0..<4 { all.writeU16(0) }     // filter name/param counts
+        let bytes = all.bytes                  // 88 = 24 fixed + 64 extra
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeBytes(Array(bytes[0..<24]))
+        sendReply(fixed24: w, extra: Array(bytes[24...]))
+    }
+
+    /// No panning: the panning area is the whole screen, no tracking area,
+    /// no borders. Layout: timestamp, left top width height, track left top
+    /// width height, border left top right bottom (the last two spill into
+    /// the reply's extra).
+    private func handleRRGetPanning() {
+        let (screenW, screenH) = Self.mainScreenSizeInPixels()
+        let all = X11ByteWriter(littleEndian: littleEndian)
+        all.writeU32(currentX11Timestamp)
+        all.writeU16(0); all.writeU16(0); all.writeU16(UInt16(clamping: screenW)); all.writeU16(UInt16(clamping: screenH))
+        for _ in 0..<4 { all.writeU16(0) } // tracking area
+        for _ in 0..<4 { all.writeI16(0) } // borders
+        let bytes = all.bytes              // 28 = 24 fixed + 4 extra
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeBytes(Array(bytes[0..<24]))
+        sendReply(fixed24: w, extra: Array(bytes[24...]), detail: 0) // detail = status Success
     }
 
     private func handleRRQueryVersion() {
@@ -4087,7 +7443,62 @@ final class X11Connection: NSObject {
     /// (this second half matters more in practice - an unshaped click-
     /// through is what makes a shaped popup/systray icon feel "off",
     /// more than the visual clipping alone).
+    /// SHAPE's `kind` (Bounding, Clip, Input) and `op` (Set, Union,
+    /// Intersect, Subtract, Invert) enumerations, and the window every one
+    /// of its requests names. mslgd checked none of them (xdiff `shape.*`,
+    /// 2026-09-29): a shape request for a window that does not exist was
+    /// accepted, and `QueryExtents` even answered with a fabricated extent
+    /// for one - which a client uses to lay out a popup.
+    private func shapeWindowIsValid(_ wid: UInt32, minor: UInt8) -> Bool {
+        guard windowIsMissing(wid) else { return true }
+        sendError(code: X11ErrorCode.window, badValue: wid,
+                  minorOpcode: UInt16(minor), majorOpcode: X11Opcode.shapeExtension)
+        return false
+    }
+
+    private func shapeEnumIsValid(_ value: UInt8, limit: UInt8, minor: UInt8) -> Bool {
+        guard value > limit else { return true }
+        sendError(code: X11ErrorCode.value, badValue: UInt32(value),
+                  minorOpcode: UInt16(minor), majorOpcode: X11Opcode.shapeExtension)
+        return false
+    }
+
     private func handleShapeRequest(minor: UInt8, body: [UInt8]) {
+        // Every SHAPE request except QueryVersion names a window, and the
+        // mutating ones also carry a kind and an op. Checked in one place
+        // rather than in each handler, because they disagree about where
+        // the window sits in the body and that is exactly how one gets
+        // missed.
+        switch minor {
+        case ShapeRequest.rectangles, ShapeRequest.combine:
+            guard body.count >= 8,
+                  shapeEnumIsValid(body[0], limit: 4, minor: minor),   // op
+                  shapeEnumIsValid(body[1], limit: 2, minor: minor),   // kind
+                  shapeWindowIsValid(X11ByteReader(Array(body[4..<8]), littleEndian: littleEndian).readU32(),
+                                     minor: minor) else { return }
+        case ShapeRequest.mask:
+            guard body.count >= 8,
+                  shapeEnumIsValid(body[0], limit: 4, minor: minor),
+                  shapeEnumIsValid(body[1], limit: 2, minor: minor),
+                  shapeWindowIsValid(X11ByteReader(Array(body[4..<8]), littleEndian: littleEndian).readU32(),
+                                     minor: minor) else { return }
+        case ShapeRequest.offset:
+            guard body.count >= 8,
+                  shapeEnumIsValid(body[0], limit: 2, minor: minor),   // kind only
+                  shapeWindowIsValid(X11ByteReader(Array(body[4..<8]), littleEndian: littleEndian).readU32(),
+                                     minor: minor) else { return }
+        case ShapeRequest.queryExtents, ShapeRequest.selectInput, ShapeRequest.inputSelected:
+            guard body.count >= 4,
+                  shapeWindowIsValid(X11ByteReader(Array(body[0..<4]), littleEndian: littleEndian).readU32(),
+                                     minor: minor) else { return }
+        case ShapeRequest.getRectangles:
+            guard body.count >= 5,
+                  shapeWindowIsValid(X11ByteReader(Array(body[0..<4]), littleEndian: littleEndian).readU32(),
+                                     minor: minor),
+                  shapeEnumIsValid(body[4], limit: 2, minor: minor) else { return }
+        default:
+            break
+        }
         switch minor {
         case ShapeRequest.queryVersion:
             let w = X11ByteWriter(littleEndian: littleEndian)
@@ -4111,19 +7522,34 @@ final class X11Connection: NSObject {
             sendReply(fixed24: w, detail: 0) // detail: enabled = False - ShapeSelectInput is a no-op above, nothing is ever actually "selected"
         case ShapeRequest.getRectangles: handleShapeGetRectangles(body: body)
         default:
-            sendError(code: X11ErrorCode.implementation, badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.shapeExtension)
+            // SHAPE 1.1 ends at minor 8: anything past it is a request no
+            // client can mean - BadRequest, like the core's unassigned opcodes.
+            sendError(code: minor > 8 ? X11ErrorCode.request : X11ErrorCode.implementation, badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.shapeExtension)
         }
     }
 
-    /// `ShapeRectangles` (minor 1) - wire layout: `window`(4) +
-    /// `ordering`(1, unused here - rect order never affects a union) +
-    /// pad(3) + `xOffset`(2) + `yOffset`(2), then `LISTofRECTANGLE` (8
-    /// bytes each). No reply per spec.
+    /// `ShapeRectangles` (minor 1): op(1) kind(1) ordering(1) pad(1)
+    /// window(4) xOffset(2) yOffset(2), then `LISTofRECTANGLE`. No reply.
+    ///
+    /// **Applied, to child windows too** - this is what GTK3 relies on to
+    /// put a client-side popover above a NATIVE child window. Cheese's menu
+    /// is drawn into the top-level's own pixels, and its video is a native
+    /// child X window covering them; GDK makes the menu visible by giving
+    /// the video a bounding shape with the menu's area cut out
+    /// (`gdkwindow.c`, `apply_clip_as_shape`). Stored but never applied,
+    /// the video painted straight over the menu - "menus appear behind the
+    /// video" - and the same goes for every GTK3 app that embeds a native
+    /// child: players, GL views, terminals, maps.
+    ///
+    /// Ops: Set and Union are what clients send; Intersect and Subtract are
+    /// done exactly on the rectangle lists; Invert is taken as Set. `clip`
+    /// kind is accepted and ignored (it only restricts what the window's
+    /// own children may draw over, which a subview here cannot express).
     private func handleShapeRectangles(body: [UInt8]) {
         let r = X11ByteReader(body, littleEndian: littleEndian)
-        r.skip(1) // operation (Set/Union/...) - this server always just REPLACES with the new list, matching the common `Set` case every real client actually sends
-        r.skip(1) // destKind (bounding/clip/input) - only bounding is tracked, see WindowRecord.boundingShapeRects' doc comment
-        r.skip(2) // pad
+        let op = r.readU8()
+        let kind = r.readU8()
+        r.skip(2) // ordering + pad - order never affects the region
         let wid = r.readU32()
         let xOffset = Double(r.readI16())
         let yOffset = Double(r.readI16())
@@ -4134,7 +7560,37 @@ final class X11Connection: NSObject {
             let w = r.readU16(); let h = r.readU16()
             rects.append(CGRect(x: xOffset + Double(x), y: yOffset + Double(y), width: Double(w), height: Double(h)))
         }
-        record.boundingShapeRects = rects.isEmpty ? nil : rects
+        guard kind == ShapeKind.bounding || kind == ShapeKind.input else { return }
+        let full = CGRect(origin: .zero, size: record.frame.size)
+        let current = (kind == ShapeKind.bounding ? record.boundingShapeRects : record.inputShapeRects) ?? [full]
+        let result = X11ShapeRegion.combine(current: current, with: rects, op: op)
+        if kind == ShapeKind.bounding { record.boundingShapeRects = result } else { record.inputShapeRects = result }
+        if X11Trace.enabled {
+            MSLLog.line("x11", "shapeRects wid=\(wid) kind=\(kind) op=\(op) in=\(rects.count) out=\(result.count) topLevel=\(record.isTopLevel) frame=\(record.frame) rects=\(result.prefix(4))")
+        }
+        applyShape(record, boundingChanged: kind == ShapeKind.bounding)
+    }
+
+    /// Pushes a window's current bounding and input shapes onto its view.
+    private func applyShape(_ record: X11State.WindowRecord, boundingChanged: Bool = true) {
+        let bounding = record.boundingShapeRects
+        let input = record.inputShapeRects
+        let topLevel = record.isTopLevel
+        DispatchQueue.main.async {
+            guard let view = record.view else { return }
+            view.inputShapeRects = input
+            view.shapeRects = bounding
+            // A shaped top-level shows the desktop outside its shape, so
+            // its window has to stop being opaque (same as xeyes' mask).
+            // Only when the BOUNDING shape changed: GTK re-sends a top-level's
+            // input shape on every allocation (Cheese: 8 times as a menu
+            // opens), and that must never touch how the window is painted.
+            if boundingChanged, topLevel, let window = record.nsWindow, view.shapeMask == nil || bounding != nil {
+                window.isOpaque = bounding == nil
+                window.backgroundColor = bounding == nil ? .windowBackgroundColor : .clear
+                window.invalidateShadow()
+            }
+        }
     }
 
     /// `ShapeMask` (minor 2) - a bitmap-pixmap-defined shape (1 = inside,
@@ -4161,7 +7617,17 @@ final class X11Connection: NSObject {
         let xOff = Int(r.readI16())
         let yOff = Int(r.readI16())
         let src = r.readU32()
+        // `src = None` removes the shape, on any window: that is how GDK
+        // takes a child's cut-out away again once the popover over it
+        // closes (`XShapeCombineMask(..., None, ...)`).
+        if op == 0, src == 0, let record = state.window(wid), !record.isTopLevel || destKind != ShapeKind.bounding {
+            if destKind == ShapeKind.bounding { record.boundingShapeRects = nil }
+            if destKind == ShapeKind.input { record.inputShapeRects = nil }
+            applyShape(record)
+            return
+        }
         guard op == 0, destKind == 0, let record = state.window(wid), record.isTopLevel else { return }
+        record.boundingShapeRects = nil
         let pixmap = src == 0 ? nil : state.pixmap(src)
         guard src == 0 || pixmap != nil else { return }
         // Async on main, like the drawing requests that filled the mask
@@ -4170,6 +7636,7 @@ final class X11Connection: NSObject {
         DispatchQueue.main.async {
             guard let view = record.view, let window = record.nsWindow else { return }
             guard let pixmap else {
+                view.shapeRects = nil
                 view.shapeMask = nil
                 window.isOpaque = true
                 window.invalidateShadow()
@@ -4250,6 +7717,10 @@ final class X11Connection: NSObject {
         w.writeI16(Int16(bounds.origin.y)) // yClipShape
         w.writeU16(UInt16(max(0, bounds.width))) // widthClipShape
         w.writeU16(UInt16(max(0, bounds.height))) // heightClipShape
+        // 4 + 16 = 20 bytes of fields; the reply is 32. Without this pad the
+        // layout guard in sendReply tripped and took the app host down on
+        // the first XShapeQueryExtents (found by xhell's ext suite).
+        w.writePadding(4)
         sendReply(fixed24: w, detail: rects != nil ? 1 : 0) // detail: boundingShaped
     }
 
@@ -4295,10 +7766,88 @@ final class X11Connection: NSObject {
     private static let renderFormatARGB32: UInt32 = 3
     private static let renderFormatA1: UInt32 = 4
 
+    /// The depth of a PictFormat this server advertises, or nil for an id
+    /// it never handed out. The single source of truth for "is this a real
+    /// format?" - `QueryPictFormats` writes exactly these four.
+    static func renderFormatDepth(_ format: UInt32) -> UInt8? {
+        switch format {
+        case renderFormatA1: return 1
+        case renderFormatA8: return 8
+        case renderFormatRGB24: return 24
+        case renderFormatARGB32: return 32
+        default: return nil
+        }
+    }
+
+    /// The body size each RENDER minor requires, as `(fixed, repeatUnit)`:
+    /// the body must be exactly `fixed` bytes, or `fixed + k*repeatUnit` for
+    /// the list-carrying ones. From `<X11/extensions/renderproto.h>`.
+    ///
+    /// None of this was checked, so every truncated RENDER request was
+    /// handled against whatever the short read produced - a zero drawable, a
+    /// zero format, a zero picture id - and answered "Ok" or an error about
+    /// the wrong thing (xdiff `render.body_lengths`, fifteen cases).
+    private static let renderBodyLengths: [UInt8: (fixed: Int, repeatUnit: Int)] = [
+        0: (8, 0),    // QueryVersion: client major + minor
+        1: (0, 0),    // QueryPictFormats
+        2: (4, 0),    // QueryPictIndexValues: format
+        4: (16, 4),   // CreatePicture: pid, drawable, format, mask + values
+        5: (8, 4),    // ChangePicture: picture, mask + values
+        6: (8, 8),    // SetPictureClipRectangles: picture, origin + rectangles
+        7: (4, 0),    // FreePicture
+        8: (32, 0),   // Composite
+        17: (8, 0),   // CreateGlyphSet: gsid + format
+        18: (8, 0),   // ReferenceGlyphSet: gsid + existing
+        19: (4, 0),   // FreeGlyphSet: glyphset
+        26: (16, 8),  // FillRectangles: op, dst, colour + rectangles
+        28: (40, 0),  // SetPictureTransform: picture + 3x3 matrix
+        29: (4, 0),   // QueryFilters: drawable
+        30: (8, 0),   // SetPictureFilter: picture, name length (+ name)
+        36: (12, 0),  // CreateSolidFill: pid + 8-byte colour
+        // Deliberately ABSENT: Trapezoids(10), Triangles and the gradient
+        // minors. Their bodies carry variable-size geometry this server does
+        // not implement, and a length rule guessed rather than verified
+        // REJECTS valid requests - which is strictly worse than the
+        // leniency it replaces. CreateGlyphSet was briefly in here at the
+        // wrong size and refused every glyph set a client made, which is
+        // all text.
+    ]
+
     private func handleRenderRequest(minor: UInt8, body: [UInt8]) {
+        // Length first: a short body makes every field below it garbage.
+        if let shape = Self.renderBodyLengths[minor] {
+            let ok: Bool
+            if shape.repeatUnit == 0 {
+                // SetPictureFilter carries a padded name after its fixed
+                // part, so it only has a minimum.
+                ok = minor == 30 ? body.count >= shape.fixed : body.count == shape.fixed
+            } else {
+                ok = body.count >= shape.fixed
+                    && (body.count - shape.fixed) % shape.repeatUnit == 0
+            }
+            guard ok else {
+                sendError(code: X11ErrorCode.length, badValue: UInt32(body.count),
+                          minorOpcode: UInt16(minor), majorOpcode: X11Opcode.renderExtension)
+                return
+            }
+        }
         switch minor {
         case X11RenderOpcode.queryVersion: handleRenderQueryVersion()
         case X11RenderOpcode.queryPictFormats: handleRenderQueryPictFormats()
+        case X11RenderOpcode.queryPictIndexValues:
+            // This server has no indexed (colormap) formats at all, so every
+            // call is an error - but it must be the RIGHT error. It used to
+            // be BadImplementation, which Xlib's default handler turns into
+            // an exit: a client politely asking about a format it will not
+            // use was killed for asking. An unknown format id is
+            // BadPictFormat; a known DIRECT one is BadMatch.
+            let askedFormat = X11ByteReader(body, littleEndian: littleEndian).readU32()
+            let known = [Self.renderFormatRGB24, Self.renderFormatARGB32,
+                         Self.renderFormatA8, Self.renderFormatA1]
+            sendError(code: known.contains(askedFormat) ? X11ErrorCode.match : X11RenderError.pictFormat,
+                      badValue: askedFormat,
+                      minorOpcode: UInt16(X11RenderOpcode.queryPictIndexValues),
+                      majorOpcode: X11Opcode.renderExtension)
         case X11RenderOpcode.createPicture: handleRenderCreatePicture(body: body)
         case X11RenderOpcode.changePicture: handleRenderChangePicture(body: body)
         case X11RenderOpcode.setPictureClipRectangles: handleRenderSetPictureClipRectangles(body: body)
@@ -4306,6 +7855,7 @@ final class X11Connection: NSObject {
         case X11RenderOpcode.composite: handleRenderComposite(body: body)
         case X11RenderOpcode.trapezoids: handleRenderTrapezoids(body: body)
         case X11RenderOpcode.createGlyphSet: handleRenderCreateGlyphSet(body: body)
+        case X11RenderOpcode.referenceGlyphSet: handleRenderReferenceGlyphSet(body: body)
         case X11RenderOpcode.freeGlyphSet: handleRenderFreeGlyphSet(body: body)
         case X11RenderOpcode.addGlyphs: handleRenderAddGlyphs(body: body)
         case X11RenderOpcode.compositeGlyphs8: handleRenderCompositeGlyphs(body: body, idSize: 1)
@@ -4314,12 +7864,47 @@ final class X11Connection: NSObject {
         case X11RenderOpcode.fillRectangles: handleRenderFillRectangles(body: body)
         case X11RenderOpcode.createSolidFill: handleRenderCreateSolidFill(body: body)
         case X11RenderOpcode.createLinearGradient: handleRenderCreateLinearGradient(body: body)
+        case X11RenderOpcode.createRadialGradient: handleRenderCreateRadialGradient(body: body)
+        case X11RenderOpcode.createConicalGradient: handleRenderCreateConicalGradient(body: body)
+        case X11RenderOpcode.freeGlyphs: handleRenderFreeGlyphs(body: body)
         case X11RenderOpcode.setPictureTransform: handleRenderSetPictureTransform(body: body)
         case X11RenderOpcode.setPictureFilter: handleRenderSetPictureFilter(body: body)
+        // Every Xcursor theme cursor (Qt, GTK) is made here, and freed with
+        // core FreeCursor - which answered BadCursor for it until the id
+        // was tracked like core cursors are. Found by replaying Featherpad.
+        case X11RenderOpcode.createCursor, X11RenderOpcode.createAnimCursor:
+            state.addFlatResource(FlatKind.cursor, X11ByteReader(body, littleEndian: littleEndian).readU32())
+        case X11RenderOpcode.queryFilters: handleRenderQueryFilters(body: body)
         default:
-            // ChangePicture, radial/conical gradients, SetPictureTransform, ... - not implemented
+            // Radial/conical gradients, Triangles/TriStrip/TriFan,
+            // AddTraps, FreeGlyphs, QueryPictIndexValues, QueryFilters -
+            // not implemented.
+            //
+            // An error for the two that carry REPLIES, silence for the
+            // rest. This is deliberately narrower than "answer everything
+            // with an error like XInput and XKB do", because the two cases
+            // fail in opposite directions:
+            //
+            // - `QueryPictIndexValues` (2) and `QueryFilters` (29) have
+            //   replies, so silence hangs the client in `_XReply` forever.
+            //   Any answer, even an error, is better than none.
+            // - The rest have no reply, so silence costs only the drawing
+            //   they asked for - while an error reaches the client's error
+            //   handler, and Xlib's default handler EXITS the process.
+            //   This project has already watched that catch-all kill
+            //   galculator and abiword outright; sending more errors than
+            //   necessary would buy a hang back as a crash.
             if X11Trace.enabled {
-                FileHandle.standardError.write("[x11] renderUnhandled minor=\(minor)\n".data(using: .utf8)!)
+                MSLLog.line("x11", "renderUnhandled minor=\(minor)")
+            }
+            // Beyond anything RENDER has ever defined (0.11 ends at 36): no
+            // client can mean anything by it, so it is BadRequest - the
+            // silence above is for real requests not implemented yet.
+            if minor > 36 {
+                sendError(code: X11ErrorCode.request, badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.renderExtension)
+            } else if Self.renderMinorsWithReplies.contains(minor) {
+                sendError(code: X11ErrorCode.implementation, badValue: 0,
+                          minorOpcode: UInt16(minor), majorOpcode: X11Opcode.renderExtension)
             }
         }
     }
@@ -4332,11 +7917,12 @@ final class X11Connection: NSObject {
     private func handleRenderSetPictureTransform(body: [UInt8]) {
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let pictureID = r.readU32()
+        guard renderPictureIsValid(pictureID, minor: X11RenderOpcode.setPictureTransform) else { return }
         guard r.remaining >= 36, let picture = state.picture(pictureID) else { return }
         let fixed = (0..<9).map { _ in Int32(bitPattern: r.readU32()) }
         picture.transform = renderPictureTransform(fixed)
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] setPictureTransform picture=\(pictureID) matrix=\(fixed.map { Double($0) / 65536 }) -> \(String(describing: picture.transform))\n".data(using: .utf8)!)
+            MSLLog.line("x11", "setPictureTransform picture=\(pictureID) matrix=\(fixed.map { Double($0) / 65536 }) -> \(String(describing: picture.transform))")
         }
     }
 
@@ -4347,9 +7933,70 @@ final class X11Connection: NSObject {
         let pictureID = r.readU32()
         let nameLength = Int(r.readU16())
         r.skip(2)
-        guard r.remaining >= nameLength, let picture = state.picture(pictureID) else { return }
+        guard let picture = state.picture(pictureID) else {
+            sendError(code: X11RenderError.picture, badValue: pictureID,
+                      minorOpcode: UInt16(X11RenderOpcode.setPictureFilter),
+                      majorOpcode: X11Opcode.renderExtension)
+            return
+        }
+        guard r.remaining >= nameLength else {
+            sendError(code: X11ErrorCode.length, badValue: UInt32(nameLength),
+                      minorOpcode: UInt16(X11RenderOpcode.setPictureFilter),
+                      majorOpcode: X11Opcode.renderExtension)
+            return
+        }
         let name = r.readString8(nameLength).lowercased()
+        // A name this server does not implement is `BadName`, as Xorg
+        // answers - including the empty one. Accepting it silently left the
+        // client believing a filter it asked for was in effect.
+        // These are the names `QueryFilters` advertises, and the two lists
+        // must not drift apart.
+        guard ["nearest", "bilinear", "convolution", "fast", "good", "best"].contains(name) else {
+            sendError(code: X11ErrorCode.name, badValue: 0,
+                      minorOpcode: UInt16(X11RenderOpcode.setPictureFilter),
+                      majorOpcode: X11Opcode.renderExtension)
+            return
+        }
         picture.filterNearest = name == "nearest" || name == "fast"
+    }
+
+    /// `QueryFilters` (RENDER 29): the filters `SetPictureFilter` accepts,
+    /// with Xorg's aliases (fast = nearest, good/best = bilinear). Was
+    /// BadImplementation, which Xlib's default handler turns into an exit.
+    private func handleRenderQueryFilters(body: [UInt8]) {
+        // The request names a drawable, and an unknown one is BadDrawable -
+        // this used to answer the filter list regardless.
+        let drawable = X11ByteReader(body, littleEndian: littleEndian).readU32()
+        // The ROOT window is a legitimate argument here and is the one a
+        // real client actually passes, but it has no backing drawable in
+        // `state`, so checking the table alone rejected it. Validating
+        // against an incomplete resource table is how a strictness fix
+        // turns into a refusal of correct requests.
+        guard drawable == rootWindowID || state.drawable(drawable) != nil else {
+            sendError(code: X11ErrorCode.drawable, badValue: drawable,
+                      minorOpcode: UInt16(X11RenderOpcode.queryFilters),
+                      majorOpcode: X11Opcode.renderExtension)
+            return
+        }
+        sendRenderFilterList()
+    }
+
+    private func sendRenderFilterList() {
+        let names = ["nearest", "bilinear", "convolution", "fast", "good", "best"]
+        let aliases: [UInt16] = [0xFFFF, 0xFFFF, 0xFFFF, 0, 1, 1]
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writeU32(UInt32(aliases.count))
+        fw.writeU32(UInt32(names.count))
+        fw.writePadding(16)
+        let extra = X11ByteWriter(littleEndian: littleEndian)
+        for a in aliases { extra.writeU16(a) }
+        extra.writePadding((4 - extra.bytes.count % 4) % 4)
+        for name in names {
+            extra.writeU8(UInt8(name.utf8.count))
+            extra.writeBytes(Array(name.utf8))
+        }
+        extra.writePadding((4 - extra.bytes.count % 4) % 4)
+        sendReply(fixed24: fw, extra: extra.bytes)
     }
 
     private func handleRenderQueryVersion() {
@@ -4367,11 +8014,34 @@ final class X11Connection: NSObject {
     /// GTK/cairo usage (offscreen glyph/icon compositing) goes through
     /// pixmaps almost exclusively anyway.
     private func handleRenderQueryPictFormats() {
+        // The visual lists have to be built BEFORE the header, because
+        // `num-visuals` is their total and `2` was hardcoded here.
+        //
+        // **That one number disabled RENDER for every Xlib client.** It was
+        // right until each GLX config got its own X visual
+        // (`X11GLXConfig.extraVisuals`), which took the real total to 24
+        // while this still said 2. libXrender's `XRenderQueryFormats` checks
+        // `depth->nvisuals > rep.numVisuals` and, when it trips, frees
+        // everything and returns 0 WITHOUT caching the failure - so
+        // `XRenderFindFormat`, `XRenderFindVisualFormat`,
+        // `XRenderFindStandardFormat` and `XRenderQuerySubpixelOrder` each
+        // re-issue QueryVersion + QueryPictFormats and fail again, forever.
+        //
+        // Two things follow, and both were measured. cairo-xlib finds no
+        // usable PictFormat and falls back to core image transfer, which is
+        // why PutImage/GetImage/CopyArea dominate every death and why a
+        // dying GIMP had written 672 MB against 27 MB read. And the failing
+        // QueryVersion+QueryPictFormats pair becomes the hottest blocking
+        // round-trip in the process - which is exactly where clients were
+        // found dying, inside `XRenderQueryFormats`.
+        let visuals24 = [visualID] + X11GLXConfig.extraVisuals(visualID: visualID, argbVisualID: argbVisualID, depth: 24)
+        let visuals32 = [argbVisualID] + X11GLXConfig.extraVisuals(visualID: visualID, argbVisualID: argbVisualID, depth: 32)
+
         let fixed = X11ByteWriter(littleEndian: littleEndian)
         fixed.writeU32(4) // num-formats
         fixed.writeU32(1) // num-screens
         fixed.writeU32(2) // num-depths
-        fixed.writeU32(2) // num-visuals
+        fixed.writeU32(UInt32(visuals24.count + visuals32.count)) // num-visuals
         fixed.writeU32(0) // num-subpixel
         fixed.writeU32(0) // pad
 
@@ -4396,12 +8066,16 @@ final class X11Connection: NSObject {
 
         extra.writeU32(2) // this screen's nDepth
         extra.writeU32(Self.renderFormatRGB24) // fallback format
+        // Every visual of each depth, GLX's extras included: a visual with no
+        // PictFormat makes cairo/Qt give up on RENDER for windows made with it.
         extra.writeU8(24) // depth
         extra.writeU8(0) // pad
-        extra.writeU16(1) // nVisuals
+        extra.writeU16(UInt16(visuals24.count)) // nVisuals
         extra.writePadding(4)
-        extra.writeU32(visualID)
-        extra.writeU32(Self.renderFormatRGB24)
+        for visual in visuals24 {
+            extra.writeU32(visual)
+            extra.writeU32(Self.renderFormatRGB24)
+        }
         // Depth 32 entry - see `argbVisualID`'s doc comment. Real Xorg
         // maps each visual to exactly one format; giving the ARGB visual
         // ARGB32 (not XRGB32) here is what actually lets clients get
@@ -4409,10 +8083,12 @@ final class X11Connection: NSObject {
         // from a window using this visual (not just from a pixmap).
         extra.writeU8(32) // depth
         extra.writeU8(0) // pad
-        extra.writeU16(1) // nVisuals
+        extra.writeU16(UInt16(visuals32.count)) // nVisuals
         extra.writePadding(4)
-        extra.writeU32(argbVisualID)
-        extra.writeU32(Self.renderFormatARGB32)
+        for visual in visuals32 {
+            extra.writeU32(visual)
+            extra.writeU32(Self.renderFormatARGB32)
+        }
 
         sendReply(fixed24: fixed, extra: extra.bytes)
     }
@@ -4426,17 +8102,71 @@ final class X11Connection: NSObject {
     /// `ChangePicture` (`handleRenderChangePicture`) rather than here, but
     /// nothing stops a client from passing it at creation time too (the
     /// protocol explicitly allows both), so both parse it identically.
+    /// RENDER's own refusals. Every one of these used to be accepted in
+    /// silence, because the extension advertised error base `0` and so had
+    /// no way to name them (xdiff `render.*`, 2026-09-29). A Picture is
+    /// every cairo surface and every glyph cache, so an id that names
+    /// nothing is a client bug worth reporting at the request that made it.
+    ///
+    /// Another client's ids are left alone, the same policy
+    /// `invalidResourceError` documents.
+    private func renderPictureIsValid(_ id: UInt32, minor: UInt8) -> Bool {
+        if state.picture(id) != nil { return true }
+        guard isOwnID(id) else { return true }
+        sendError(code: X11RenderError.picture, badValue: id,
+                  minorOpcode: UInt16(minor), majorOpcode: X11Opcode.renderExtension)
+        return false
+    }
+
+    /// PictOp: 0...13 are the Porter-Duff set, 0x10...0x1C the disjoint
+    /// ops and 0x20...0x2C the conjoint ones. Anything else is `BadValue`.
+    private func renderOpIsValid(_ op: UInt8, minor: UInt8) -> Bool {
+        // Porter-Duff 0x00...0x0D, disjoint 0x10...0x1B, conjoint
+        // 0x20...0x2B, and the RENDER 0.11 blend ops 0x30...0x3E
+        // (Multiply ... HSLLuminosity). The blend range is not optional
+        // here: this server REPORTS 0.11, and cairo-xlib emits those ops
+        // for MULTIPLY/SCREEN/OVERLAY once a server says it has them.
+        let known = op <= 0x0D || (0x10...0x1B).contains(op)
+            || (0x20...0x2B).contains(op) || (0x30...0x3E).contains(op)
+        guard !known else { return true }
+        sendError(code: X11ErrorCode.value, badValue: UInt32(op),
+                  minorOpcode: UInt16(minor), majorOpcode: X11Opcode.renderExtension)
+        return false
+    }
+
     private func handleRenderCreatePicture(body: [UInt8]) {
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let pictureID = r.readU32()
         let drawableID = r.readU32()
         let format = r.readU32()
         let valueMask = r.readU32()
+        // The drawable must exist, the format must be one this server
+        // advertised, and the two must agree on depth.
+        // Root counts as a drawable even though it has no record.
+        let drawable = state.drawable(drawableID)
+        if drawable == nil, drawableID != rootWindowID, isOwnID(drawableID) {
+            return sendError(code: X11ErrorCode.drawable, badValue: drawableID,
+                             minorOpcode: UInt16(X11RenderOpcode.createPicture),
+                             majorOpcode: X11Opcode.renderExtension)
+        }
+        guard let formatDepth = Self.renderFormatDepth(format) else {
+            return sendError(code: X11RenderError.pictFormat, badValue: format,
+                             minorOpcode: UInt16(X11RenderOpcode.createPicture),
+                             majorOpcode: X11Opcode.renderExtension)
+        }
+        // Only where the depth is known exactly - a pixmap. A window's
+        // depth comes from its visual and is not tracked with the same
+        // confidence, and a wrong BadMatch would refuse a real request.
+        if let pixmap = state.pixmap(drawableID), pixmap.depth != formatDepth {
+            return sendError(code: X11ErrorCode.match, badValue: 0,
+                             minorOpcode: UInt16(X11RenderOpcode.createPicture),
+                             majorOpcode: X11Opcode.renderExtension)
+        }
         let picture = state.makePicture(id: pictureID)
         picture.drawableID = drawableID
         applyPictureValues(valueMask: valueMask, from: r, to: picture)
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] createPicture picture=\(pictureID) drawable=\(drawableID) format=\(format) valueMask=0x\(String(valueMask, radix: 16)) repeatNormal=\(picture.repeatNormal)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "createPicture picture=\(pictureID) drawable=\(drawableID) format=\(format) valueMask=0x\(String(valueMask, radix: 16)) repeatNormal=\(picture.repeatNormal)")
         }
     }
 
@@ -4474,6 +8204,31 @@ final class X11Connection: NSObject {
     /// the closer approximation either way (the rectangles it replaces are
     /// definitively no longer in force), and matches what `applyGCValues`
     /// already does for the same attribute.
+    /// Checks the value list a `ChangePicture`/`CreatePicture` carries, and
+    /// returns the error to send if one is wrong. Reads a fresh reader over
+    /// the same body so the caller's reader is untouched.
+    private func validatePictureValues(valueMask: UInt32, body: [UInt8]) -> (code: UInt8, value: UInt32)? {
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        _ = r.readU32()  // picture
+        _ = r.readU32()  // value-mask
+        // Values arrive low bit first, one 4-byte slot each.
+        for bit in 0..<13 {
+            guard valueMask & (UInt32(1) << UInt32(bit)) != 0 else { continue }
+            let value = r.readU32()
+            switch bit {
+            case 0: // CPRepeat: Normal, Pad, Reflect
+                if value > 3 { return (X11ErrorCode.value, value) }
+            case 6: // CPClipMask: a pixmap, or None
+                if value != 0, state.pixmap(value) == nil {
+                    return (X11ErrorCode.pixmap, value)
+                }
+            default:
+                break
+            }
+        }
+        return nil
+    }
+
     private func applyPictureValues(valueMask: UInt32, from r: X11ByteReader, to picture: X11State.PictureRecord) {
         var remainingMask = valueMask
         while remainingMask != 0, r.remaining >= 4 {
@@ -4482,6 +8237,18 @@ final class X11Connection: NSObject {
             let value = r.readU32()
             switch bit {
             case 0x1: picture.repeatNormal = value != 0
+            // CPClipXOrigin / CPClipYOrigin - signed, in a CARD32 slot.
+            // Same class as the core GC's clip origin (doc 10 F4).
+            case 0x10: picture.clipOrigin.x = Double(Int32(bitPattern: value))
+            case 0x20: picture.clipOrigin.y = Double(Int32(bitPattern: value))
+            case 0x1000:
+                // CPComponentAlpha - subpixel-antialiased text. Recorded
+                // so the compositing path can stop treating a per-channel
+                // coverage mask as a single alpha; see `PictureRecord`.
+                picture.componentAlpha = value != 0
+                if X11Trace.enabled {
+                    MSLLog.line("x11", "CPComponentAlpha=\(value != 0) picture=\(picture.id)")
+                }
             case 0x40:
                 // `CPClipMask` with `None` (0) genuinely means "drop the
                 // clip". A NON-zero value is a real mask Pixmap and
@@ -4489,12 +8256,12 @@ final class X11Connection: NSObject {
                 // traced here because that is exactly how a rounded
                 // corner would come out square.
                 if X11Trace.enabled, value != 0 {
-                    FileHandle.standardError.write("[x11] CPClipMask NON-NONE value=\(value) picture=\(picture.id)\n".data(using: .utf8)!)
+                    MSLLog.line("x11", "CPClipMask NON-NONE value=\(value) picture=\(picture.id)")
                 }
-                picture.clipRectangles = nil
+                picture.clipRectanglesRaw = nil
             default:
                 if X11Trace.enabled {
-                    FileHandle.standardError.write("[x11] pictureValue unhandled bit=0x\(String(bit, radix: 16)) value=\(value) picture=\(picture.id)\n".data(using: .utf8)!)
+                    MSLLog.line("x11", "pictureValue unhandled bit=0x\(String(bit, radix: 16)) value=\(value) picture=\(picture.id)")
                 }
             }
         }
@@ -4522,10 +8289,39 @@ final class X11Connection: NSObject {
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let pictureID = r.readU32()
         let valueMask = r.readU32()
-        guard let picture = state.picture(pictureID) else { return }
+        // RENDER can finally name its own errors (`renderFirstError`), so a
+        // bad Picture is reported instead of ignored (xdiff
+        // `render.changepicture_edges` had all eight cases answering "Ok").
+        guard let picture = state.picture(pictureID) else {
+            sendError(code: X11RenderError.picture, badValue: pictureID,
+                      minorOpcode: UInt16(X11RenderOpcode.changePicture),
+                      majorOpcode: X11Opcode.renderExtension)
+            return
+        }
+        // Every bit above the defined set is BadValue - CPRepeat(1),
+        // CPAlphaMap(2), CPAlphaXOrigin(4), CPAlphaYOrigin(8),
+        // CPClipXOrigin(16), CPClipYOrigin(32), CPClipMask(64),
+        // CPGraphicsExposure(128), CPSubwindowMode(256), CPPolyEdge(512),
+        // CPPolyMode(1024), CPDither(2048), CPComponentAlpha(4096).
+        guard valueMask & ~UInt32(0x1FFF) == 0 else {
+            sendError(code: X11ErrorCode.value, badValue: valueMask,
+                      minorOpcode: UInt16(X11RenderOpcode.changePicture),
+                      majorOpcode: X11Opcode.renderExtension)
+            return
+        }
+        // CPClipMask naming something that is not a pixmap is BadPixmap,
+        // and CPRepeat outside Normal/Pad/Reflect is BadValue. Both are
+        // checked against a COPY of the reader so the real apply below
+        // still sees the whole value list.
+        if let bad = validatePictureValues(valueMask: valueMask, body: body) {
+            sendError(code: bad.code, badValue: bad.value,
+                      minorOpcode: UInt16(X11RenderOpcode.changePicture),
+                      majorOpcode: X11Opcode.renderExtension)
+            return
+        }
         applyPictureValues(valueMask: valueMask, from: r, to: picture)
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] changePicture picture=\(pictureID) valueMask=0x\(String(valueMask, radix: 16)) repeatNormal=\(picture.repeatNormal) clip=\(String(describing: picture.clipRectangles))\n".data(using: .utf8)!)
+            MSLLog.line("x11", "changePicture picture=\(pictureID) valueMask=0x\(String(valueMask, radix: 16)) repeatNormal=\(picture.repeatNormal) clip=\(String(describing: picture.clipRectangles))")
         }
     }
 
@@ -4554,21 +8350,31 @@ final class X11Connection: NSObject {
         let pictureID = r.readU32()
         let originX = Double(r.readI16())
         let originY = Double(r.readI16())
-        guard let picture = state.picture(pictureID) else { return }
+        guard let picture = state.picture(pictureID) else {
+            sendError(code: X11RenderError.picture, badValue: pictureID,
+                      minorOpcode: UInt16(X11RenderOpcode.setPictureClipRectangles),
+                      majorOpcode: X11Opcode.renderExtension)
+            return
+        }
         var rects: [CGRect] = []
         while r.remaining >= 8 {
             let x = r.readI16(); let y = r.readI16()
             let w = r.readU16(); let h = r.readU16()
-            rects.append(CGRect(x: originX + Double(x), y: originY + Double(y), width: Double(w), height: Double(h)))
+            rects.append(CGRect(x: Double(x), y: Double(y), width: Double(w), height: Double(h)))
         }
-        picture.clipRectangles = rects.isEmpty ? nil : rects
+        // Unshifted, with the origin beside them, so a later
+        // `ChangePicture(clip-x-origin)` can move them.
+        picture.clipRectanglesRaw = rects.isEmpty ? nil : rects
+        picture.clipOrigin = CGPoint(x: originX, y: originY)
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] setPictureClipRectangles picture=\(pictureID) origin=(\(originX),\(originY)) rects=\(rects)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "setPictureClipRectangles picture=\(pictureID) origin=(\(originX),\(originY)) rects=\(rects)")
         }
     }
 
     private func handleRenderFreePicture(body: [UInt8]) {
-        state.removePicture(X11ByteReader(body, littleEndian: littleEndian).readU32())
+        let id = X11ByteReader(body, littleEndian: littleEndian).readU32()
+        guard renderPictureIsValid(id, minor: X11RenderOpcode.freePicture) else { return }
+        state.removePicture(id)
     }
 
     private func handleRenderCreateSolidFill(body: [UInt8]) {
@@ -4613,6 +8419,76 @@ final class X11Connection: NSObject {
         state.makePicture(id: pictureID).linearGradient = (p1: p1, p2: p2, stops: stops, colors: colors)
     }
 
+    /// The gradient stops shared by all three gradient requests: an
+    /// `nStops` count, then that many 16.16 positions, then that many
+    /// 16-bit-per-channel colours.
+    private func readGradientStops(_ r: X11ByteReader)
+        -> (stops: [CGFloat], colors: [(r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)])? {
+        let nStops = Int(r.readU32())
+        guard nStops > 0, nStops < 1000 else { return nil }
+        var stops: [CGFloat] = []
+        stops.reserveCapacity(nStops)
+        for _ in 0..<nStops { stops.append(CGFloat(r.readI32()) / 65536) }
+        var colors: [(r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat)] = []
+        colors.reserveCapacity(nStops)
+        for _ in 0..<nStops {
+            let red = r.readU16(); let green = r.readU16(); let blue = r.readU16(); let alpha = r.readU16()
+            colors.append((CGFloat(red) / 65535, CGFloat(green) / 65535, CGFloat(blue) / 65535, CGFloat(alpha) / 65535))
+        }
+        return (stops, colors)
+    }
+
+    /// `CreateRadialGradient` - two circles and the stops between them,
+    /// which is exactly `CGContext.drawRadialGradient`'s own model.
+    private func handleRenderCreateRadialGradient(body: [UInt8]) {
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        let pictureID = r.readU32()
+        func readFixed() -> CGFloat { CGFloat(r.readI32()) / 65536 }
+        let c1 = CGPoint(x: readFixed(), y: readFixed())
+        let r1 = readFixed()
+        let c2 = CGPoint(x: readFixed(), y: readFixed())
+        let r2 = readFixed()
+        guard let (stops, colors) = readGradientStops(r) else { return }
+        state.makePicture(id: pictureID).radialGradient = (c1: c1, r1: r1, c2: c2, r2: r2,
+                                                           stops: stops, colors: colors)
+    }
+
+    /// `CreateConicalGradient` - a sweep, which CoreGraphics has no
+    /// primitive for.
+    ///
+    /// Approximated as a radial gradient centred on the same point. That
+    /// is visibly wrong for a true sweep, and still much better than what
+    /// it replaces: with no picture created at all, the later `Composite`
+    /// found no source and drew **nothing**, leaving stale content behind.
+    /// A gradient of roughly the right colours in roughly the right place
+    /// fails in a way someone can see and report.
+    private func handleRenderCreateConicalGradient(body: [UInt8]) {
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        let pictureID = r.readU32()
+        func readFixed() -> CGFloat { CGFloat(r.readI32()) / 65536 }
+        let center = CGPoint(x: readFixed(), y: readFixed())
+        _ = readFixed() // angle - meaningless without a real sweep
+        guard let (stops, colors) = readGradientStops(r) else { return }
+        state.makePicture(id: pictureID).radialGradient = (c1: center, r1: 0, c2: center, r2: 1,
+                                                           stops: stops, colors: colors)
+    }
+
+    /// `FreeGlyphs` - without it, glyph sets grew without bound for the
+    /// life of the process. A long-running app that renders a lot of text
+    /// leaks steadily.
+    private func handleRenderFreeGlyphs(body: [UInt8]) {
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        let glyphsetID = r.readU32()
+        guard let glyphSet = state.glyphSet(glyphsetID) else { return }
+        var removed = 0
+        while r.remaining >= 4 {
+            if glyphSet.glyphs.removeValue(forKey: r.readU32()) != nil { removed += 1 }
+        }
+        if X11Trace.enabled {
+            MSLLog.line("x11", "freeGlyphs set=\(glyphsetID) removed=\(removed) remaining=\(glyphSet.glyphs.count)")
+        }
+    }
+
     /// X11 RENDER's `PictOp` values, mapped to the closest native
     /// `CGBlendMode` - covers every op a real client is likely to send;
     /// anything unmapped (`Dst`, `Saturate`, ...) falls back to plain
@@ -4640,6 +8516,8 @@ final class X11Connection: NSObject {
         r.skip(3)
         let dstID = r.readU32()
         let red = r.readU16(); let green = r.readU16(); let blue = r.readU16(); let alpha = r.readU16()
+        guard renderOpIsValid(op, minor: X11RenderOpcode.fillRectangles),
+              renderPictureIsValid(dstID, minor: X11RenderOpcode.fillRectangles) else { return }
         guard let dstPicture = state.picture(dstID), let drawableID = dstPicture.drawableID,
               let target = state.drawable(drawableID) else { return }
         var rects: [CGRect] = []
@@ -4684,6 +8562,10 @@ final class X11Connection: NSObject {
         let maskX = r.readI16(); let maskY = r.readI16()
         let dstX = r.readI16(); let dstY = r.readI16()
         let width = r.readU16(); let height = r.readU16()
+        guard renderOpIsValid(op, minor: X11RenderOpcode.composite),
+              renderPictureIsValid(srcID, minor: X11RenderOpcode.composite),
+              maskID == 0 || renderPictureIsValid(maskID, minor: X11RenderOpcode.composite),
+              renderPictureIsValid(dstID, minor: X11RenderOpcode.composite) else { return }
         guard width > 0, height > 0 else { return }
 
         guard let dstPicture = state.picture(dstID), let dstDrawableID = dstPicture.drawableID,
@@ -4740,7 +8622,7 @@ final class X11Connection: NSObject {
             if let maskPicture {
                 if let maskTarget {
                     if X11Trace.enabled {
-                        FileHandle.standardError.write("[x11] maskDebug maskID=\(maskID) maskDrawableID=\(String(describing: maskPicture.drawableID)) maskX=\(maskX) maskY=\(maskY) maskPixelH=\(maskTarget.pixelHeight) maskPixelW=\(maskTarget.pixelWidth) width=\(width) height=\(height)\n".data(using: .utf8)!)
+                        MSLLog.line("x11", "maskDebug maskID=\(maskID) maskDrawableID=\(String(describing: maskPicture.drawableID)) maskX=\(maskX) maskY=\(maskY) maskPixelH=\(maskTarget.pixelHeight) maskPixelW=\(maskTarget.pixelWidth) width=\(width) height=\(height)")
                     }
                     // Cropped in top-left space and clipped with the matching
                     // orientation - see `clipToMaskTopLeftOriented`. The old
@@ -4761,7 +8643,7 @@ final class X11Connection: NSObject {
                        let maskImage = maskTarget.bitmapContext.makeImage()?.cropping(to: rects.source) {
                         clipToMaskTopLeftOriented(maskImage, in: rects.destination, on: ctx)
                     } else if X11Trace.enabled {
-                        FileHandle.standardError.write("[x11] maskDebug CROP FAILED (nil) for maskID=\(maskID)\n".data(using: .utf8)!)
+                        MSLLog.line("x11", "maskDebug CROP FAILED (nil) for maskID=\(maskID)")
                     }
                 } else if let solid = maskPicture.solidColor {
                     constantAlpha = solid.a
@@ -4784,6 +8666,17 @@ final class X11Connection: NSObject {
                     ctx.saveGState()
                     ctx.clip(to: dstRect)
                     ctx.drawLinearGradient(cgGradient, start: gradient.p1, end: gradient.p2, options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
+                    ctx.restoreGState()
+                }
+            } else if let gradient = srcPicture.radialGradient, !gradient.colors.isEmpty {
+                let cgColors = gradient.colors.map { x11Color(red: $0.r, green: $0.g, blue: $0.b, alpha: $0.a) } as CFArray
+                if let cgGradient = CGGradient(colorsSpace: x11DeviceRGB, colors: cgColors, locations: gradient.stops) {
+                    ctx.saveGState()
+                    ctx.clip(to: dstRect)
+                    ctx.drawRadialGradient(cgGradient,
+                                           startCenter: gradient.c1, startRadius: gradient.r1,
+                                           endCenter: gradient.c2, endRadius: gradient.r2,
+                                           options: [.drawsBeforeStartLocation, .drawsAfterEndLocation])
                     ctx.restoreGState()
                 }
             } else if let srcTarget {
@@ -4882,14 +8775,14 @@ final class X11Connection: NSObject {
         // "which op put pixels at this rect, sampling what, tiled how?".
         // See `gui-bugs.md` #25 (galculator's inter-button smears).
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] imgSrc dest=(\(Int(destRect.minX)),\(Int(destRect.minY)),\(Int(destRect.width)),\(Int(destRect.height))) tile=\(tileW)x\(tileH) sample=(\(sampleOriginX),\(sampleOriginY)) repeat=\(repeatNormal)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "imgSrc dest=(\(Int(destRect.minX)),\(Int(destRect.minY)),\(Int(destRect.width)),\(Int(destRect.height))) tile=\(tileW)x\(tileH) sample=(\(sampleOriginX),\(sampleOriginY)) repeat=\(repeatNormal)")
         }
         // A transformed source (cairo scaling or rotating an image) is
         // sampled through the transform - see `drawTransformedImage`.
         // Untransformed pictures take exactly the paths below, unchanged.
         if let transform {
             if X11Trace.enabled {
-                FileHandle.standardError.write("[x11] imgSrc transformed \(transform) nearest=\(nearest)\n".data(using: .utf8)!)
+                MSLLog.line("x11", "imgSrc transformed \(transform) nearest=\(nearest)")
             }
             if let fullImage = srcTarget.bitmapContext.makeImage() {
                 drawTransformedImage(fullImage, sourceWidth: tileW, sourceHeight: tileH, transform: transform,
@@ -5069,7 +8962,7 @@ final class X11Connection: NSObject {
                 ctx.addPath(path)
                 ctx.clip()
                 if X11Trace.enabled {
-                    FileHandle.standardError.write("[x11] trapDraw srcID=\(srcID) srcX=\(srcX) srcY=\(srcY) firstLeftP1=\(String(describing: firstLeftP1)) origin=(\(Int(srcX) - Int(firstLeftP1?.x ?? 0) + Int(pathBounds.origin.x)),\(Int(srcY) - Int(firstLeftP1?.y ?? 0) + Int(pathBounds.origin.y))) oldOrigin=(\(Int(srcX) + Int(pathBounds.origin.x)),\(Int(srcY) + Int(pathBounds.origin.y))) dst=\(dstDrawableID) pathBounds=\(pathBounds) repeatNormal=\(srcPicture?.repeatNormal ?? false)\n".data(using: .utf8)!)
+                    MSLLog.line("x11", "trapDraw srcID=\(srcID) srcX=\(srcX) srcY=\(srcY) firstLeftP1=\(String(describing: firstLeftP1)) origin=(\(Int(srcX) - Int(firstLeftP1?.x ?? 0) + Int(pathBounds.origin.x)),\(Int(srcY) - Int(firstLeftP1?.y ?? 0) + Int(pathBounds.origin.y))) oldOrigin=(\(Int(srcX) + Int(pathBounds.origin.x)),\(Int(srcY) + Int(pathBounds.origin.y))) dst=\(dstDrawableID) pathBounds=\(pathBounds) repeatNormal=\(srcPicture?.repeatNormal ?? false)")
                 }
                 // Source alignment, confirmed against real xorg-server +
                 // pixman source rather than derived from the spec prose
@@ -5092,8 +8985,16 @@ final class X11Connection: NSObject {
                 // out of bounds in the first place - traced a stamp with
                 // `srcY=-7` whose own `left.p1.y` was `-7`, i.e. a correct
                 // offset of exactly 0.
-                let originX = Int(srcX) - Int(firstLeftP1?.x ?? 0) + Int(pathBounds.origin.x)
-                let originY = Int(srcY) - Int(firstLeftP1?.y ?? 0) + Int(pathBounds.origin.y)
+                // `.rounded(.down)`, because `Int(CGFloat)` truncates
+                // toward zero and pixman's bounding box floors. The two
+                // agree for non-negative values and differ by one when the
+                // origin is negative AND fractional - which is the norm
+                // for anything antialiased, since trapezoid coordinates
+                // are 16.16 fixed point. (`firstLeftP1` was already right:
+                // it uses `.rounded(.down)`, matching xorg's arithmetic
+                // shift.)
+                let originX = Int(srcX) - Int(firstLeftP1?.x ?? 0) + Int(pathBounds.origin.x.rounded(.down))
+                let originY = Int(srcY) - Int(firstLeftP1?.y ?? 0) + Int(pathBounds.origin.y.rounded(.down))
                 self.drawPictureImageSource(srcTarget, sampleOriginX: originX, sampleOriginY: originY, repeatNormal: srcPicture?.repeatNormal ?? false, destRect: pathBounds,
                                             transform: srcPicture?.transform, nearest: srcPicture?.filterNearest ?? true, on: ctx)
             }
@@ -5106,15 +9007,45 @@ final class X11Connection: NSObject {
     /// `X11State.GlyphSetRecord`'s doc comment); the interesting parts are
     /// `handleRenderAddGlyphs` (upload) and `handleRenderCompositeGlyphs8`
     /// (draw).
+    /// A glyph set's id must name one, or the request is `BadGlyphSet`.
+    /// Another client's ids are left alone - see `invalidResourceError`.
+    private func glyphSetIsValid(_ id: UInt32, minor: UInt8) -> Bool {
+        if state.glyphSet(id) != nil { return true }
+        guard isOwnID(id) else { return true }
+        sendError(code: X11RenderError.glyphSet, badValue: id,
+                  minorOpcode: UInt16(minor), majorOpcode: X11Opcode.renderExtension)
+        return false
+    }
+
     private func handleRenderCreateGlyphSet(body: [UInt8]) {
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let gsid = r.readU32()
         let format = r.readU32()
+        guard Self.renderFormatDepth(format) != nil else {
+            return sendError(code: X11RenderError.pictFormat, badValue: format,
+                             minorOpcode: UInt16(X11RenderOpcode.createGlyphSet),
+                             majorOpcode: X11Opcode.renderExtension)
+        }
         _ = state.makeGlyphSet(id: gsid, format: format)
     }
 
+    /// `ReferenceGlyphSet` - a second id for an existing glyph set, which
+    /// is how cairo shares one glyph cache between surfaces. Both ids name
+    /// the same set, so the record is simply registered twice; freeing one
+    /// leaves the other working, as it should.
+    private func handleRenderReferenceGlyphSet(body: [UInt8]) {
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        let newID = r.readU32()
+        let existingID = r.readU32()
+        guard glyphSetIsValid(existingID, minor: X11RenderOpcode.referenceGlyphSet),
+              let existing = state.glyphSet(existingID) else { return }
+        state.addGlyphSetAlias(newID, of: existing)
+    }
+
     private func handleRenderFreeGlyphSet(body: [UInt8]) {
-        state.removeGlyphSet(X11ByteReader(body, littleEndian: littleEndian).readU32())
+        let id = X11ByteReader(body, littleEndian: littleEndian).readU32()
+        guard glyphSetIsValid(id, minor: X11RenderOpcode.freeGlyphSet) else { return }
+        state.removeGlyphSet(id)
     }
 
     /// `AddGlyphs` - uploads one or more glyphs' bitmaps into a
@@ -5146,14 +9077,39 @@ final class X11Connection: NSObject {
             let yOff = Int(r.readI16())
             infos.append(Info(width: width, height: height, x: x, y: y, xOff: xOff, yOff: yOff))
         }
+        // A1 is one BIT per pixel, not one byte, and its rows pad to 32
+        // bits - `((w + 31) / 32) * 4`, not `((w + 3) / 4) * 4`. There was
+        // no A1 branch at all, so a depth-1 glyph set read `w * 4` bytes
+        // per row: an 8x8 glyph consumed 32 bytes a row where the client
+        // sent 4. That does not just corrupt one glyph. `AddGlyphs` parses
+        // every glyph sequentially out of one buffer, so the first A1
+        // glyph desynchronises the reader and **every remaining glyph in
+        // the request is garbage**.
+        //
+        // Reachable, not theoretical: `QueryPictFormats` advertises A1 as
+        // format 4, and cairo asks for it whenever antialiasing is off
+        // (`CAIRO_ANTIALIAS_NONE`, `Xft.antialias: false`,
+        // `QFont::NoAntialias`).
+        let isA1 = glyphSet.format == Self.renderFormatA1
         let bytesPerPixel = glyphSet.format == Self.renderFormatA8 ? 1 : 4
         for i in 0..<count {
             let info = infos[i]
-            let stride = ((info.width * bytesPerPixel + 3) / 4) * 4
+            let stride = isA1
+                ? ((info.width + 31) / 32) * 4
+                : ((info.width * bytesPerPixel + 3) / 4) * 4
             let data = r.readBytes(stride * info.height)
+            // Downstream, `CompositeGlyphs` reads `imageData` as A8
+            // coverage, so the bits are expanded here rather than teaching
+            // every consumer a second format. `expandBitmap` already does
+            // exactly this for `PutImage`'s Bitmap format.
+            let coverage = isA1
+                ? Self.expandBitmap(data, width: info.width, height: info.height,
+                                    leftPad: 0, lsbFirst: littleEndian,
+                                    rowBytes: info.width)
+                : data
             glyphSet.glyphs[ids[i]] = X11State.GlyphRecord(
                 width: info.width, height: info.height, x: info.x, y: info.y,
-                xOff: info.xOff, yOff: info.yOff, imageData: data
+                xOff: info.xOff, yOff: info.yOff, imageData: coverage
             )
         }
     }
@@ -5281,10 +9237,10 @@ final class X11Connection: NSObject {
             if pad > 0 { r.skip(pad) }
         }
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] compositeGlyphs idSize=\(idSize) dstID=\(dstID) dstDrawableID=\(dstDrawableID) glyphsetID=\(glyphsetID) solid=\(solid) clip=\(String(describing: dstPicture.clipRectangles)) placedCount=\(placed.count) penX=\(penX) penY=\(penY) sizes=\(placed.map { ($0.glyph.width, $0.glyph.height) }) origins=\(placed.map { ($0.originX, $0.originY) })\n".data(using: .utf8)!)
+            MSLLog.line("x11", "compositeGlyphs idSize=\(idSize) dstID=\(dstID) dstDrawableID=\(dstDrawableID) glyphsetID=\(glyphsetID) solid=\(solid) clip=\(String(describing: dstPicture.clipRectangles)) placedCount=\(placed.count) penX=\(penX) penY=\(penY) sizes=\(placed.map { ($0.glyph.width, $0.glyph.height) }) origins=\(placed.map { ($0.originX, $0.originY) })")
         }
         guard !placed.isEmpty else {
-            if X11Trace.enabled { FileHandle.standardError.write("[x11] compositeGlyphs idSize=\(idSize): placed EMPTY (glyph lookup failed for all)\n".data(using: .utf8)!) }
+            if X11Trace.enabled { MSLLog.line("x11", "compositeGlyphs idSize=\(idSize): placed EMPTY (glyph lookup failed for all)") }
             return
         }
         let clip = dstPicture.clipRectangles
@@ -5402,11 +9358,26 @@ final class X11Connection: NSObject {
     /// request header's `detail` byte and isn't modelled. `PointerRoot`
     /// (1) and `None` (0) are stored as-is - a client that asks for
     /// either gets it back verbatim from `GetInputFocus`.
-    private func handleSetInputFocus(body: [UInt8]) {
+    private func handleSetInputFocus(detail: UInt8, body: [UInt8]) {
+        // `revert-to` is None/PointerRoot/Parent. Same finding as
+        // QueryBestSize's class: a real server answers BadValue.
+        guard detail <= 2 else {
+            return sendError(code: X11ErrorCode.value, badValue: UInt32(detail),
+                             minorOpcode: 0, majorOpcode: X11Opcode.setInputFocus)
+        }
         let focus = X11ByteReader(body, littleEndian: littleEndian).readU32()
+        // None (0) and PointerRoot (1) are legal here and are NOT window
+        // ids, which is why this cannot go in the rules table - anything
+        // else must name a real window. mslgd accepted any id (xdiff
+        // `focus.roundtrip`, 2026-09-29), so focus could be set to nothing
+        // and every later keystroke had nowhere to go.
+        if focus > 1, focus != rootWindowID, state.window(focus) == nil, isOwnID(focus) {
+            return sendError(code: X11ErrorCode.window, badValue: focus,
+                             minorOpcode: 0, majorOpcode: X11Opcode.setInputFocus)
+        }
         state.setFocusWindow(focus)
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] setInputFocus focus=\(focus)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "setInputFocus focus=\(focus)")
         }
     }
 
@@ -5423,35 +9394,66 @@ final class X11Connection: NSObject {
     /// see it as "nothing held," always.
     private func handleQueryPointer(body: [UInt8]) {
         let wid = X11ByteReader(body, littleEndian: littleEndian).readU32()
-        // `windowOrigin`, not `frame.origin`: a child window's frame is
-        // parent-relative, so win_x/win_y came out offset for any child
-        // (xeyes queries its Eyes widget window, a child of the shell).
-        // Same fix `handleXIQueryPointer` already has.
-        let origin = windowOrigin(wid)
-        var rootX = 0, rootY = 0
-        // NSEvent.mouseLocation/NSScreen.main are AppKit - same main-thread
-        // requirement as everything else here (see GetKeyboardMapping's
-        // doc comment for the TIS crash this exact pattern was added to
-        // avoid elsewhere; AppKit calls off the main thread aren't all
-        // guaranteed safe even where they don't outright crash).
-        DispatchQueue.main.sync {
-            let screenHeight = NSScreen.main?.frame.height ?? 1080
-            let cocoa = NSEvent.mouseLocation // bottom-left origin, screen space
-            rootX = Int(cocoa.x)
-            rootY = Int(screenHeight - cocoa.y) // -> top-left origin, matching X11
-        }
-        let winX = rootX - Int(origin.x)
-        let winY = rootY - Int(origin.y)
+        let p = pointerQuery(for: wid)
         let fw = X11ByteWriter(littleEndian: littleEndian)
         fw.writeU32(rootWindowID)
-        fw.writeU32(0) // child: None
-        fw.writeI16(Int16(clamping: rootX))
-        fw.writeI16(Int16(clamping: rootY))
-        fw.writeI16(Int16(clamping: winX))
-        fw.writeI16(Int16(clamping: winY))
-        fw.writeU16(0) // mask: no buttons/modifiers tracked
+        fw.writeU32(p.child)
+        fw.writeI16(Int16(clamping: p.rootX))
+        fw.writeI16(Int16(clamping: p.rootY))
+        fw.writeI16(Int16(clamping: p.winX))
+        fw.writeI16(Int16(clamping: p.winY))
+        fw.writeU16(p.mask)
         fw.writePadding(6)
         sendReply(fixed24: fw, detail: 1) // detail: same-screen = True
+    }
+
+    /// Where the pointer is, as `QueryPointer`/`XIQueryPointer` report it
+    /// relative to `wid`: root and window coordinates in X pixels, the
+    /// **child of `wid` that contains the pointer**, and the button and
+    /// modifier state.
+    ///
+    /// `child` was always None, and that was the scrolling bug in Firefox
+    /// and every other core-event GTK client: when a click's implicit grab
+    /// ends, GDK asks the server which window the pointer is in by walking
+    /// down from the root with QueryPointer. None at the first step means
+    /// "not over any of your windows", so GDK synthesised a Leave (mode
+    /// Ungrab) after every click and from then on dropped wheel events as
+    /// arriving from nowhere. Found with Firefox's own widget log. None is
+    /// still the answer when the pointer is over another Mac app, or over
+    /// no child of `wid`.
+    ///
+    /// The deepest window comes from AppKit's own hit-testing, so SHAPE
+    /// regions and stacking are respected exactly as clicks see them.
+    private func pointerQuery(for wid: UInt32) -> (rootX: Int, rootY: Int, winX: Int, winY: Int, child: UInt32, mask: UInt16) {
+        let origin = windowOrigin(wid)
+        var rootX = 0, rootY = 0
+        var deepest: UInt32?
+        // AppKit, so main thread (see GetKeyboardMapping's doc comment).
+        let work = {
+            let cocoa = NSEvent.mouseLocation // bottom-left origin, screen points
+            // -> top-left origin, in X pixels (Native Scaling)
+            rootX = Int(cocoa.x / X11DisplayScale.factor)
+            rootY = Int((Self.primaryScreenMaxY - cocoa.y) / X11DisplayScale.factor)
+            let number = NSWindow.windowNumber(at: cocoa, belowWindowWithWindowNumber: 0)
+            guard let window = NSApplication.shared.window(withWindowNumber: number),
+                  let frameView = window.contentView?.superview else { return }
+            var view = frameView.hitTest(window.convertPoint(fromScreen: cocoa))
+            while let current = view, !(current is X11CanvasView) { view = current.superview }
+            deepest = (view as? X11CanvasView)?.windowID
+        }
+        if Thread.isMainThread { work() } else { DispatchQueue.main.sync(execute: work) }
+        var child: UInt32 = 0
+        var id = deepest
+        while let current = id, current != wid, let record = state.window(current) {
+            if record.isTopLevel {
+                if wid == rootWindowID { child = current }
+                break
+            }
+            if record.parent == wid { child = current; break }
+            id = record.parent
+        }
+        let mask = UInt16(X11KeyboardState.shared.current.effectiveMods) | Self.x11ButtonMask(pressedButtons)
+        return (rootX, rootY, rootX - Int(origin.x), rootY - Int(origin.y), child, mask)
     }
 
     /// Root-relative origin of any window ID this server knows about -
@@ -5498,7 +9500,7 @@ final class X11Connection: NSObject {
         let dstX = srcOrigin.x + Double(srcX) - dstOrigin.x
         let dstY = srcOrigin.y + Double(srcY) - dstOrigin.y
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] translateCoords src=\(srcWindow)@\(srcOrigin) in=(\(srcX),\(srcY)) dst=\(dstWindow)@\(dstOrigin) -> (\(Int(dstX)),\(Int(dstY)))\n".data(using: .utf8)!)
+            MSLLog.line("x11", "translateCoords src=\(srcWindow)@\(srcOrigin) in=(\(srcX),\(srcY)) dst=\(dstWindow)@\(dstOrigin) -> (\(Int(dstX)),\(Int(dstY)))")
         }
         let fw = X11ByteWriter(littleEndian: littleEndian)
         fw.writeU32(0) // child: None
@@ -5518,6 +9520,67 @@ final class X11Connection: NSObject {
     /// nothing else could ever hold a conflicting one - every connected
     /// client shares one flat, ungated resource space (see `X11State`'s
     /// doc comment), so there's no real contention to model.
+    /// A client grabbed the keyboard to `window`. If that window lives in an
+    /// override-redirect popup (a menu), the popup becomes key so AppKit
+    /// routes typing - arrow keys, type-ahead, Escape - to it. Popups are
+    /// otherwise shown without key (see `handleMapWindow`); a grab before
+    /// the map is remembered and honoured when the map comes.
+    private func keyboardGrabbed(window: UInt32) {
+        var id = window
+        var record = state.window(id)
+        while let current = record, !current.isTopLevel, current.parent != 0 {
+            id = current.parent
+            record = state.window(id)
+        }
+        guard let popup = record, popup.isTopLevel, popup.overrideRedirect else { return }
+        popup.wantsKeyboard = true
+        guard popup.mapped else { return }
+        DispatchQueue.main.async {
+            popup.nsWindow?.makeKeyAndOrderFront(nil)
+            popup.nsWindow?.makeFirstResponder(popup.view)
+        }
+    }
+
+    /// Sync (0) or Async (1) - the only two `event-mode` values the
+    /// protocol defines for a grab's pointer and keyboard modes. Anything
+    /// else is `BadValue`; mslgd used to answer `GrabSuccess` for it, which
+    /// tells a client a grab it never made is in force (xdiff
+    /// `grab.pointer`/`grab.keyboard`, 2026-09-29). Sends the error itself
+    /// and returns false when the caller must stop.
+    private func grabModesAreValid(body: [UInt8], offsets: (Int, Int), opcode: UInt8) -> Bool {
+        for offset in [offsets.0, offsets.1] {
+            guard offset < body.count else { continue } // length is the rules table's job
+            guard body[offset] > 1 else { continue }
+            sendError(code: X11ErrorCode.value, badValue: UInt32(body[offset]),
+                      minorOpcode: 0, majorOpcode: opcode)
+            return false
+        }
+        return true
+    }
+
+    /// `CreateCursor`'s source and mask: both must exist and both must be
+    /// depth 1. A cursor is a bitmap, and a depth-24 pixmap is `BadMatch`.
+    private func cursorPixmapsAreValid(body: [UInt8], opcode: UInt8) -> Bool {
+        guard body.count >= 12 else { return true } // length is the rules table's job
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        _ = r.readU32() // the new cursor id
+        for _ in 0..<2 {
+            let id = r.readU32()
+            guard let pixmap = state.pixmap(id) else {
+                // Someone else's id is not ours to refuse - the same policy
+                // `invalidResourceError` documents.
+                guard isOwnID(id) else { continue }
+                sendError(code: X11ErrorCode.pixmap, badValue: id, minorOpcode: 0, majorOpcode: opcode)
+                return false
+            }
+            guard pixmap.depth == 1 else {
+                sendError(code: X11ErrorCode.match, badValue: 0, minorOpcode: 0, majorOpcode: opcode)
+                return false
+            }
+        }
+        return true
+    }
+
     private func handleGrabReply() {
         let fw = X11ByteWriter(littleEndian: littleEndian)
         fw.writePadding(24)
@@ -5552,6 +9615,7 @@ final class X11Connection: NSObject {
         guard r.remaining >= nameLen else { return }
         let name = r.readString8(nameLen)
         state.setFont(fid, isSymbol: X11CoreText.isSymbolFontName(name))
+        state.addFlatResource(FlatKind.font, fid)
     }
 
     private static let fakeCharWidth = Int16(X11FakeFont.charWidth.rounded())
@@ -5564,18 +9628,44 @@ final class X11Connection: NSObject {
     /// responses do. `n_charinfos=0` is the protocol's documented shorthand
     /// for "every character uses `min_bounds`/`max_bounds`" - skips ever
     /// needing a real per-glyph table for this fake, uniform-width font.
-    private func handleQueryFont() {
+    /// A FONTABLE is either a font this client opened or one of its GCs
+    /// (the protocol lets a client name a GC and mean the font inside it).
+    /// Anything else is `BadFont`, and saying so is the whole point: both
+    /// of these requests used to answer a *fabricated* reply for an id that
+    /// named nothing, and a client divides its entire layout by those
+    /// metrics (xdiff `font.errors`, 2026-09-29).
+    ///
+    /// Only this client's own ids are judged - another client's resources
+    /// are not visible here, and refusing them would break the same
+    /// cross-client cases `invalidResourceError` already documents.
+    private func fontableIsValid(_ id: UInt32) -> Bool {
+        if state.hasFlatResource(FlatKind.font, id) { return true }
+        if state.gc(id) != nil { return true }
+        return !isOwnID(id)
+    }
+
+    private func handleQueryFont(body: [UInt8]) {
+        let fid = X11ByteReader(body, littleEndian: littleEndian).readU32()
+        guard fontableIsValid(fid) else {
+            return sendError(code: X11ErrorCode.font, badValue: fid,
+                             minorOpcode: 0, majorOpcode: X11Opcode.queryFont)
+        }
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(1) // Reply
         w.writeU8(0) // unused
-        w.writeU16(sequenceNumber)
+        w.writeU16(stampSequence)
         w.writeU32(7) // reply length: (60 total - 32) / 4
         writeCharInfo(into: w) // min_bounds
         w.writePadding(4)
         writeCharInfo(into: w) // max_bounds
         w.writePadding(4)
-        w.writeU16(32) // min_char_or_byte2 (space)
-        w.writeU16(126) // max_char_or_byte2 (~)
+        // The full Latin-1 range, because that is what this server draws:
+        // `X11ByteReader.readLatin1String8` decodes 0-255 and `ImageText8`
+        // renders it, which was the fix for xcalc's tofu boxes. Claiming
+        // 32-126 told clients not to send anything above `~` through the
+        // core text path at all.
+        w.writeU16(0) // min_char_or_byte2
+        w.writeU16(255) // max_char_or_byte2
         w.writeU16(32) // default_char
         w.writeU16(0) // n_font_props
         w.writeU8(0) // draw_direction: LeftToRight
@@ -5593,7 +9683,14 @@ final class X11Connection: NSObject {
         w.writeI16(Self.fakeCharWidth) // right_side_bearing
         w.writeI16(Self.fakeCharWidth) // character_width
         w.writeI16(Self.fakeFontAscent) // ascent
-        w.writeI16(-Self.fakeFontDescent) // descent (negative = below baseline, per spec)
+        // Positive, like the `font-descent` field this same reply writes a
+        // few lines down. CHARINFO's descent is the distance from the
+        // baseline DOWN to the bottom of the ink, and Xlib's own
+        // definition of interline spacing is `ascent + descent`. Negated,
+        // a client summing per-character metrics got `ascent - descent` -
+        // about 6 points short per line at Menlo 13, which reads as
+        // crowded or overlapping lines rather than as clipping.
+        w.writeI16(Self.fakeFontDescent) // descent: baseline to bottom of ink
         w.writeU16(0) // attributes
     }
 
@@ -5601,11 +9698,12 @@ final class X11Connection: NSObject {
     /// through `sendReply(fixed24:)` - `detail` doubles as the reply's
     /// draw-direction field, matching the request's own layout.
     private func handleQueryTextExtents(detail: UInt8, body: [UInt8]) {
-        // body: 4-byte fontable ID, then a CHAR2B[] string (2 bytes each;
-        // `detail`'s low bit means the string was an odd count of CHAR2Bs,
-        // i.e. the wire had one fewer padding byte - close enough for a
-        // fake-metrics reply that only cares about the count).
-        let char2BCount = max(0, body.count - 4) / 2
+        let fid = X11ByteReader(body, littleEndian: littleEndian).readU32()
+        guard fontableIsValid(fid) else {
+            return sendError(code: X11ErrorCode.font, badValue: fid,
+                             minorOpcode: 0, majorOpcode: X11Opcode.queryTextExtents)
+        }
+        let char2BCount = Self.textExtentsCharCount(bodyByteCount: body.count, oddLength: detail & 1 != 0)
         let width = Int32(char2BCount) * Int32(Self.fakeCharWidth)
         let fw = X11ByteWriter(littleEndian: littleEndian)
         fw.writeI16(Self.fakeFontAscent)
@@ -5616,7 +9714,43 @@ final class X11Connection: NSObject {
         fw.writeI32(0) // overall_left
         fw.writeI32(width) // overall_right
         fw.writePadding(4)
-        sendReply(fixed24: fw, detail: detail & 0x01)
+        // Byte 1 of the REPLY is draw-direction (0 = LeftToRight), which
+        // has nothing to do with byte 1 of the REQUEST (`odd length`).
+        // They merely share an offset; echoing the request's flag reported
+        // every odd-length string as right-to-left text.
+        sendReply(fixed24: fw, detail: 0)
+    }
+
+    /// The largest request this server accepts, in 4-byte units - the same
+    /// number `handleBigReqEnable` advertises as `max-request-size`.
+    static let maxRequestLengthUnits: UInt32 = 4_000_000
+
+    /// The largest pixmap or window this server will allocate, per side.
+    ///
+    /// Not a protocol limit - a memory one. Dimensions arrive as raw
+    /// CARD16s and went straight into a `CGContext(...)!`, which returns
+    /// nil when it cannot allocate, so the force-unwrap took the whole
+    /// host process down and every window of that app with it. The
+    /// realistic trigger is not a hostile client but an ordinary one: a
+    /// large-canvas document in a paint program asking for 20000x20000 is
+    /// 1.6 GB in a single allocation.
+    static let maxDrawableSide = 16384
+
+    /// RENDER minors that carry a reply, so a client blocks forever if the
+    /// server says nothing. `QueryVersion` (0) and `QueryPictFormats` (1)
+    /// are implemented; these two are not.
+    static let renderMinorsWithReplies: Set<UInt8> = [2]
+
+    /// How many CHAR2Bs a `QueryTextExtents` body holds.
+    ///
+    /// The request is `FONTABLE`(4) + `STRING16`(2n) + p bytes of padding,
+    /// and for odd n the wire carries `p = 2` - so the byte count alone
+    /// cannot tell n from n+1. That is exactly why the request has an
+    /// `odd length` flag, and ignoring it measured every odd-length string
+    /// one full character too wide.
+    static func textExtentsCharCount(bodyByteCount: Int, oddLength: Bool) -> Int {
+        let padded = max(0, bodyByteCount - 4) / 2
+        return oddLength ? max(0, padded - 1) : padded
     }
 
     // MARK: - Keyboard mapping requests
@@ -5626,15 +9760,16 @@ final class X11Connection: NSObject {
     /// error path and desyncs on one, which is why these were the first
     /// keyboard requests this server ever handled.
     private func handleGetKeyboardMapping(body: [UInt8]) {
+        noteKeymapRead()
         let r = X11ByteReader(body, littleEndian: littleEndian)
         let firstKeycode = r.readU8()
         let count = Int(r.readU8())
         writeFull(X11KeymapProvider.shared.keymap.keyboardMappingReply(
-            firstKeycode: firstKeycode, count: count, sequence: sequenceNumber, littleEndian: littleEndian))
+            firstKeycode: firstKeycode, count: count, sequence: stampSequence, littleEndian: littleEndian))
     }
 
     private func handleGetModifierMapping() {
-        writeFull(X11KeymapProvider.shared.keymap.modifierMappingReply(sequence: sequenceNumber, littleEndian: littleEndian))
+        writeFull(X11KeymapProvider.shared.keymap.modifierMappingReply(sequence: stampSequence, littleEndian: littleEndian))
     }
 
     // MARK: - Reply/error/event wire helpers
@@ -5650,23 +9785,71 @@ final class X11Connection: NSObject {
     /// any further variable-length data, already padded to a 4-byte
     /// boundary by the caller.
     private func sendReply(fixed24: X11ByteWriter, extra: [UInt8] = [], detail: UInt8 = 0) {
-        precondition(fixed24.bytes.count == 24, "X11 reply fixed portion must be exactly 24 bytes")
-        precondition(extra.count % 4 == 0, "X11 reply extra data must be padded to a 4-byte boundary")
+        // A reply with the wrong layout is a bug in one handler. It used to
+        // be a `precondition`, which made that one bug kill the whole app
+        // host - every window of the app, and the app itself in the guest.
+        // Now it is loud in debug builds and tests, and in a shipped build
+        // the client gets BadImplementation for that one request instead.
+        guard fixed24.bytes.count == 24, extra.count % 4 == 0 else {
+            assertionFailure("X11 reply layout: fixed \(fixed24.bytes.count) (want 24), extra \(extra.count) (want multiple of 4)")
+            MSLLog.line("x11", "BUG: malformed reply for opcode \(currentOpcode) (fixed \(fixed24.bytes.count), extra \(extra.count)) - sent BadImplementation instead")
+            sendError(code: X11ErrorCode.implementation, badValue: 0, minorOpcode: 0, majorOpcode: currentOpcode)
+            return
+        }
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(1) // Reply
         w.writeU8(detail)
-        w.writeU16(sequenceNumber)
+        noteSequenceDrift("reply to opcode \(currentOpcode)")
+        w.writeU16(currentRequestSequence)
         w.writeU32(UInt32(extra.count / 4))
         w.writeBytes(fixed24.bytes)
         w.writeBytes(extra)
         writeFull(w.bytes)
     }
 
+    /// Reports a reply built for one request but stamped while the counter
+    /// had moved on - the thing being tested for. Deliberately loud and
+    /// rate-limited rather than silent: it should be impossible.
+    /// The sequence to stamp on an outgoing event: the last request
+    /// processed, unless that is BEHIND what the client has already seen,
+    /// in which case the wire value stands.
+    ///
+    /// Wrapping-aware on purpose (RFC 1982): these are 16-bit numbers that
+    /// wrap every 65536 requests, roughly 45 times in a 12-minute GIMP
+    /// session, and a plain `max` is meaningless across a wrap - it pins
+    /// the stamp to a stale pre-wrap value and starts stamping events far
+    /// AHEAD of pending replies, which kills the client.
+    static func wireStamp(lastWire: UInt16, processed: UInt16) -> UInt16 {
+        let ahead = processed &- lastWire
+        return (ahead != 0 && ahead < 0x8000) ? processed : lastWire
+    }
+
+    private func noteSequenceDrift(_ what: String) {
+        // Deliberately empty. The check that replaced it lives in `writeFull`
+        // and watches the WIRE, which is the only place the defect shows:
+        // comparing the dispatcher's counter against the reader's fires on
+        // every correct reply once those two legitimately differ, and the
+        // packets that were actually mis-stamped never came through here.
+        _ = what
+    }
+
+    private var sequenceDriftReports = 0
+    private var unansweredReports = 0
+    private var lengthMismatchReports = 0
+    private var wireOrderReports = 0
+    /// The highest sequence yet written to this client, for the check above.
+    private var lastWireSequence: UInt16 = 0
+
+    /// Set once the setup response is out, so the wire-length invariant
+    /// only applies to packets that actually follow the reply/event shape.
+    private var handshakeComplete = false
+
     private func sendError(code: UInt8, badValue: UInt32, minorOpcode: UInt16, majorOpcode: UInt8) {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(0) // Error
         w.writeU8(code)
-        w.writeU16(sequenceNumber)
+        noteSequenceDrift("error \(code) for opcode \(majorOpcode)")
+        w.writeU16(currentRequestSequence)
         w.writeU32(badValue)
         w.writeU16(minorOpcode)
         w.writeU8(majorOpcode)
@@ -5695,7 +9878,7 @@ final class X11Connection: NSObject {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(code)
         w.writeU8(detail)
-        w.writeU16(sequenceNumber)
+        w.writeU16(stampSequence)
         w.writeU32(currentX11Timestamp)
         w.writeU32(rootWindowID)
         w.writeU32(windowID)
@@ -5734,7 +9917,7 @@ final class X11Connection: NSObject {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(21) // ReparentNotify
         w.writePadding(1)
-        w.writeU16(sequenceNumber)
+        w.writeU16(stampSequence)
         w.writeU32(event)
         w.writeU32(window)
         w.writeU32(parent)
@@ -5745,26 +9928,100 @@ final class X11Connection: NSObject {
         writeFull(w.bytes)
     }
 
-    private func sendMapNotify(windowID: UInt32) {
+    /// Delivers a structure event to the window itself and, separately, to
+    /// its parent.
+    ///
+    /// The parent half is `SubstructureNotify`, and it was missing from
+    /// every structure event except `ReparentNotify` - which does it
+    /// correctly, so this was an omission rather than a design choice. A
+    /// toolkit watching a container for its children appearing and
+    /// disappearing (which is what `SubstructureNotifyMask` is for) simply
+    /// never heard about any of it.
+    private func deliverStructureEvent(window wid: UInt32, parent: UInt32?,
+                                       build: (_ eventWindow: UInt32) -> [UInt8]) {
+        let structureNotify: UInt32 = 0x0002_0000, substructureNotify: UInt32 = 0x0008_0000
+        if let record = state.window(wid) {
+            deliverSelected(record, mask: structureNotify, build(wid))
+        }
+        if let parent, let parentRecord = state.window(parent) {
+            deliverSelected(parentRecord, mask: substructureNotify, build(parent))
+        }
+    }
+
+    /// The window is no longer visible.
+    ///
+    /// GDK's window-state machine sets `GDK_WINDOW_STATE_WITHDRAWN` from
+    /// this event, so without it `gdk_window_hide()` left GTK's idea of
+    /// what is on screen permanently out of step with what actually is -
+    /// popups and panels it still believed were mapped.
+    private func unmapNotifyBytes(eventWindow: UInt32, window: UInt32) -> [UInt8] {
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU8(18) // UnmapNotify
+        w.writePadding(1)
+        w.writeU16(stampSequence)
+        w.writeU32(eventWindow)
+        w.writeU32(window)
+        w.writeU8(0) // from-configure
+        w.writePadding(19)
+        return w.bytes
+    }
+
+    /// The window is gone. A client that asked to be told cannot find out
+    /// any other way.
+    /// `CreateNotify`, which is SubstructureNotify-only: it is news for the
+    /// parent, and the window itself cannot have selected anything yet.
+    /// mslgd sent none at all, so a client watching a container - every
+    /// window manager, and any toolkit tracking its own subwindows - never
+    /// learned a child existed (xdiff `events.substructure`, 2026-09-28).
+    private func createNotifyBytes(parent: UInt32, window: UInt32, frame: CGRect,
+                                   borderWidth: UInt16, overrideRedirect: Bool) -> [UInt8] {
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU8(16) // CreateNotify
+        w.writePadding(1)
+        w.writeU16(stampSequence)
+        w.writeU32(parent)
+        w.writeU32(window)
+        w.writeI16(Int16(clamping: Int(frame.origin.x)))
+        w.writeI16(Int16(clamping: Int(frame.origin.y)))
+        w.writeU16(UInt16(clamping: Int(frame.width)))
+        w.writeU16(UInt16(clamping: Int(frame.height)))
+        w.writeU16(borderWidth)
+        w.writeU8(overrideRedirect ? 1 : 0)
+        w.writePadding(9)
+        return w.bytes
+    }
+
+    private func destroyNotifyBytes(eventWindow: UInt32, window: UInt32) -> [UInt8] {
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU8(17) // DestroyNotify
+        w.writePadding(1)
+        w.writeU16(stampSequence)
+        w.writeU32(eventWindow)
+        w.writeU32(window)
+        w.writePadding(20)
+        return w.bytes
+    }
+
+    private func mapNotifyBytes(eventWindow: UInt32, window: UInt32) -> [UInt8] {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(19) // MapNotify
         w.writePadding(1)
-        w.writeU16(sequenceNumber)
-        w.writeU32(windowID) // event
-        w.writeU32(windowID) // window
-        w.writeU8((state.window(windowID)?.overrideRedirect ?? false) ? 1 : 0) // override-redirect
+        w.writeU16(stampSequence)
+        w.writeU32(eventWindow)
+        w.writeU32(window)
+        w.writeU8((state.window(window)?.overrideRedirect ?? false) ? 1 : 0) // override-redirect
         w.writePadding(19)
-        writeFull(w.bytes)
+        return w.bytes
     }
 
     private func sendExposeEvent(windowID: UInt32, x: UInt16 = 0, y: UInt16 = 0, width: UInt16, height: UInt16) {
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] sendExposeEvent wid=\(windowID) x=\(x) y=\(y) w=\(width) h=\(height)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "sendExposeEvent wid=\(windowID) x=\(x) y=\(y) w=\(width) h=\(height)")
         }
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(12) // Expose
         w.writePadding(1)
-        w.writeU16(sequenceNumber)
+        w.writeU16(stampSequence)
         w.writeU32(windowID)
         w.writeU16(x)
         w.writeU16(y)
@@ -5823,9 +10080,14 @@ final class X11Connection: NSObject {
         let sizeChanged = Int(real.width) != Int(record.frame.width) || Int(real.height) != Int(record.frame.height)
         guard originChanged || sizeChanged else { return }
         record.frame = real
+        // Deliberately preserving here: this is a correction pass that
+        // reconciles the record with what AppKit actually did, not a
+        // resize the client asked for, and it can run when nothing about
+        // the window's contents should change. Discarding on this path
+        // would blank windows for no reason a client could anticipate.
         if sizeChanged { view.resize(width: Int(real.width), height: Int(real.height)) }
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] syncFrame wid=\(record.id) -> \(real)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "syncFrame wid=\(record.id) -> \(real)")
         }
         if record.eventMask & 0x0002_0000 != 0 { // StructureNotifyMask
             sendConfigureNotify(record)
@@ -5836,11 +10098,15 @@ final class X11Connection: NSObject {
     }
 
     fileprivate func sendConfigureNotify(_ record: X11State.WindowRecord) {
+        writeFull(configureNotifyBytes(record, eventWindow: record.id))
+    }
+
+    fileprivate func configureNotifyBytes(_ record: X11State.WindowRecord, eventWindow: UInt32) -> [UInt8] {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(22) // ConfigureNotify
         w.writePadding(1)
-        w.writeU16(sequenceNumber)
-        w.writeU32(record.id) // event
+        w.writeU16(stampSequence)
+        w.writeU32(eventWindow) // event
         w.writeU32(record.id) // window
         w.writeU32(0) // above-sibling: None
         w.writeI16(Int16(clamping: Int(record.frame.origin.x)))
@@ -5863,7 +10129,7 @@ final class X11Connection: NSObject {
         // this side (`sendPointerEvent`/`sendExposeEvent` both happen to
         // already total exactly 32 - only this one was wrong).
         w.writePadding(5)
-        writeFull(w.bytes)
+        return w.bytes
     }
 
     /// `PropertyNotify` (code 28) - tells a client one of its own
@@ -5877,18 +10143,99 @@ final class X11Connection: NSObject {
     /// existing handlers exercise, but a real gap for any client using
     /// property change as a synchronization signal (ICCCM selection
     /// negotiation, `_NET_WM_STATE` watchers).
-    fileprivate func sendPropertyNotify(_ record: X11State.WindowRecord, atom: UInt32, state propertyState: UInt8) {
-        guard record.eventMask & 0x0040_0000 != 0 else { return } // PropertyChangeMask
+    /// Tells the selection owner that MSL has taken a chunk of an INCR
+    /// transfer and deleted the property, which is its cue to write the
+    /// next one.
+    ///
+    /// The owner is waiting on `PropertyNotify(Delete)` for the property
+    /// on the requestor window; without it an INCR transfer stops dead
+    /// after the first chunk and the paste silently produces nothing.
+    ///
+    /// Sent without consulting an event mask, which is the one place this
+    /// server does that deliberately. MSL's requestor window
+    /// (`X11Clipboard.requestorWindowID`) is synthetic - it has no
+    /// `WindowRecord`, so the owner's `XSelectInput(PropertyChangeMask)`
+    /// on it had nowhere to be recorded. The owner asked for this
+    /// conversation by answering `INCR`, and it is the only party the
+    /// event goes to.
+    private func acknowledgeIncrChunk(property: UInt32) {
+        guard let owner = state.clipboard.pendingOwner,
+              let connection = state.connection(forWindow: owner) else { return }
+        connection.deliverPropertyDeleted(window: X11Clipboard.requestorWindowID, atom: property)
+    }
+
+    /// `PropertyNotify(Delete)` for a window with no record - see
+    /// `acknowledgeIncrChunk`.
+    fileprivate func deliverPropertyDeleted(window: UInt32, atom: UInt32) {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(28) // PropertyNotify
         w.writePadding(1)
-        w.writeU16(sequenceNumber)
+        w.writeU16(stampSequence)
+        w.writeU32(window)
+        w.writeU32(atom)
+        w.writeU32(currentX11Timestamp)
+        w.writeU8(1) // state: Deleted
+        w.writePadding(15)
+        writeFull(w.bytes)
+    }
+
+    fileprivate func sendPropertyNotify(_ record: X11State.WindowRecord, atom: UInt32, state propertyState: UInt8) {
+        let propertyChange: UInt32 = 0x0040_0000
+        guard record.eventMask & propertyChange != 0 || !record.otherClientMasks.isEmpty else { return }
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU8(28) // PropertyNotify
+        w.writePadding(1)
+        w.writeU16(stampSequence)
         w.writeU32(record.id) // window
         w.writeU32(atom)
         w.writeU32(currentX11Timestamp)
         w.writeU8(propertyState)
         w.writePadding(15) // 1+1+2+4+4+4+1 = 17 so far; pad to the mandatory 32-byte event size
-        writeFull(w.bytes)
+        deliverSelected(record, mask: propertyChange, w.bytes)
+    }
+
+    /// Delivers a server-generated event to every client that selected
+    /// `mask` on `record`: the creator (`eventMask`, which may be another
+    /// connection when this request came from someone else) and each
+    /// other selecting client (`otherClientMasks`). `bytes` carries this
+    /// connection's sequence number; other recipients get their own.
+    ///
+    /// Before this, an event always went to whichever connection made the
+    /// request, gated on the CREATOR's mask - so a second client changing
+    /// a property on an app's window told itself, not the app.
+    fileprivate func deliverSelected(_ record: X11State.WindowRecord, mask: UInt32, _ bytes: [UInt8]) {
+        if record.eventMask & mask != 0 {
+            let owner = record.id >> 21
+            if owner == clientIndex || record.id == rootWindowID {
+                writeFull(bytes)
+            } else {
+                state.connection(forClientIndex: owner)?.deliverGeneratedEvent(bytes)
+            }
+        }
+        for (index, selected) in record.otherClientMasks where selected & mask != 0 {
+            if index == clientIndex {
+                writeFull(bytes)
+            } else {
+                state.connection(forClientIndex: index)?.deliverGeneratedEvent(bytes)
+            }
+        }
+    }
+
+    /// A server-generated event from another connection's request: same
+    /// bytes, this connection's sequence number, no SendEvent bit.
+    fileprivate func deliverGeneratedEvent(_ bytes: [UInt8]) {
+        var patched = bytes
+        guard patched.count >= 4 else { return }
+        if littleEndian {
+            let stamp = stampSequence
+            patched[2] = UInt8(stamp & 0xFF)
+            patched[3] = UInt8(stamp >> 8)
+        } else {
+            let stamp = stampSequence
+            patched[2] = UInt8(stamp >> 8)
+            patched[3] = UInt8(stamp & 0xFF)
+        }
+        writeFull(patched)
     }
 
     /// `ClientMessage` (code 33) - the mechanism used for the
@@ -5903,7 +10250,7 @@ final class X11Connection: NSObject {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(33) // ClientMessage
         w.writeU8(32) // format
-        w.writeU16(sequenceNumber)
+        w.writeU16(stampSequence)
         w.writeU32(windowID)
         w.writeU32(type)
         w.writeU32(data0)
@@ -5920,7 +10267,7 @@ final class X11Connection: NSObject {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(30) // SelectionRequest
         w.writePadding(1)
-        w.writeU16(sequenceNumber)
+        w.writeU16(stampSequence)
         w.writeU32(currentX11Timestamp)
         w.writeU32(owner)
         w.writeU32(requestor)
@@ -5943,7 +10290,7 @@ final class X11Connection: NSObject {
         let w = X11ByteWriter(littleEndian: littleEndian)
         w.writeU8(31) // SelectionNotify
         w.writePadding(1)
-        w.writeU16(sequenceNumber)
+        w.writeU16(stampSequence)
         w.writeU32(currentX11Timestamp)
         w.writeU32(requestor)
         w.writeU32(selection)
@@ -5981,24 +10328,154 @@ final class X11Connection: NSObject {
                     if poll(&pfd, 1, -1) < 0, errno != EINTR { return false }
                     continue
                 }
-                return false // EOF or a real error
+                // **Why, not just that.** A client losing its connection
+                // is invisible from the Linux side: Xlib calls
+                // `_XIOError`, GDK's handler calls `_exit(1)`, and the app
+                // vanishes with no crash report, no core, and nothing in
+                // its own log. Caught in gdb on 2026-10-05:
+                //
+                //   #0 __GI__exit (status=1)
+                //   #1 libgdk-3.so.0
+                //   #2 _XIOError
+                //
+                // So the only place the reason can ever be recorded is
+                // here, at the moment the socket gives up.
+                self.disconnectReason = n == 0
+                    ? "the client closed its end"
+                    : "read failed: \(String(cString: strerror(errno))) (errno \(errno))"
+                return false
             }
             return true
         }
         return ok ? buf : nil
     }
 
-    private func writeFull(_ bytes: [UInt8]) {
-        guard !bytes.isEmpty else { return }
+    private func writeFull(_ original: [UInt8]) {
+        guard !original.isEmpty else { return }
+        var bytes = original
+        // **An event's sequence must be stamped HERE, not where it was
+        // built.** Events are built on the AppKit main thread, which reads
+        // the processed counter and only then calls this; in between, the
+        // dispatcher can advance and send its own reply. The event then
+        // lands on the wire carrying a LOWER sequence than the reply before
+        // it, and xcb reads a backward step as a 16-bit wrap - it adds
+        // 0x10000 and every later wait is poisoned, so a reply the server
+        // provably sent never matches and the client dies in `_XReply`.
+        //
+        // Measured exactly that way: `seq 1824 reply | seq 1823 event type
+        // 35 | seq 1825 reply`, with the client blocked in
+        // `XTranslateCoordinates` whose reply (seq 1807) had already gone
+        // out. Taking the stamp under `writeLock`, together with the
+        // ordering it protects, is what makes the two atomic.
+        //
+        // Replies and errors keep their own request's sequence, which is
+        // correct by definition. KeymapNotify (type 11) has no sequence
+        // field. Everything else is an event.
+        var eventStampCandidate: UInt16?
+        if let kind = bytes.first, kind > 1, kind != 11, bytes.count >= 4 {
+            // Read BEFORE `writeLock`: `stampSequence` takes its own lock,
+            // and nesting them here would invert the dispatcher's order.
+            // The stamp is APPLIED under `writeLock` below, together with
+            // the ordering that lock protects - doing it in two separate
+            // lock holds let another thread's reply land in between, which
+            // is the off-by-one inversion ("event 6731 after 6732") this
+            // exists to prevent.
+            eventStampCandidate = stampSequence
+        }
         // Every event this server sends leaves through here, so this is the
         // one place that can answer "what did the client actually receive?"
         // - the question that matters when a toolkit reacts to something
-        // rather than to a request it made. Events are exactly 32 bytes
-        // with a code in 2...35 in byte 0; replies (code 0/1) and the
-        // variable-length reply tails are skipped.
-        if X11Trace.enabled, bytes.count == 32, bytes[0] >= 2, bytes[0] <= 35 {
-            let wid = UInt32(bytes[4]) | UInt32(bytes[5]) << 8 | UInt32(bytes[6]) << 16 | UInt32(bytes[7]) << 24
-            FileHandle.standardError.write("[x11] >>EVT code=\(bytes[0]) detail=\(bytes[1]) w4=\(wid)\n".data(using: .utf8)!)
+        // rather than to a request it made. `X11Trace.event` decodes both
+        // shapes; the version inlined here used to require exactly 32
+        // bytes and so never once logged an XI2 event.
+        X11Trace.event(bytes, littleEndian: littleEndian)
+        // One hold from here to the end of the function. The stamp, the
+        // ordering check that reads `lastWireSequence`, the ring and the
+        // enqueue all have to agree about this packet's place in the
+        // stream, and separate holds let another thread interleave between
+        // any two of them.
+        writeLock.lock()
+        defer { writeLock.unlock() }
+        if let candidate = eventStampCandidate {
+            let stamp = Self.wireStamp(lastWire: lastWireSequence, processed: candidate)
+            if littleEndian {
+                bytes[2] = UInt8(stamp & 0xFF); bytes[3] = UInt8(stamp >> 8)
+            } else {
+                bytes[2] = UInt8(stamp >> 8); bytes[3] = UInt8(stamp & 0xFF)
+            }
+        }
+        if let kind = bytes.first {
+            // 0 = error, 1 = reply, anything else is an event.
+            let seq = bytes.count >= 4
+                ? (littleEndian ? UInt16(bytes[2]) | UInt16(bytes[3]) << 8
+                                : UInt16(bytes[3]) | UInt16(bytes[2]) << 8)
+                : 0
+            let label = kind == 0 ? "error code \(bytes.count > 1 ? bytes[1] : 0)"
+                      : kind == 1 ? "reply" : "event type \(kind)"
+            // **The wire must be self-describing, exactly.** xcb finds the
+            // next packet by trusting these lengths: a reply or a
+            // GenericEvent (type 35) is 32 + 4*length bytes, everything
+            // else is exactly 32. One byte of disagreement and xcb starts
+            // reading the NEXT packet from the wrong offset - it then
+            // consumes a reply as event payload, the client blocks in
+            // `_XReply` for something it has already been handed, and
+            // `xcb_connection_has_error()` stays 0 because the socket is
+            // perfectly healthy. That is the exact signature recorded in
+            // all 31 deaths, and XI2 events are the only variable-length
+            // packets this server emits - which is why it happens while
+            // the mouse and keyboard are busy and not when idle.
+            // The connection-setup response also starts with 1 - for
+            // "success", not "reply" - and lays out its first 8 bytes
+            // completely differently (protocol major/minor, then a length
+            // in 4-byte units at bytes 6-7). Reading those as a reply's
+            // CARD32 length made this fire twice per client at connect and
+            // claim a 768-byte packet declared 12,451,840. The wire is
+            // only self-describing in the way checked here AFTER the
+            // handshake.
+            if !handshakeComplete {
+                // nothing to check: setup response has its own shape
+            } else if kind == 1 || kind == 35 {
+                let declared = bytes.count >= 8
+                    ? (littleEndian
+                        ? UInt32(bytes[4]) | UInt32(bytes[5]) << 8 | UInt32(bytes[6]) << 16 | UInt32(bytes[7]) << 24
+                        : UInt32(bytes[7]) | UInt32(bytes[6]) << 8 | UInt32(bytes[5]) << 16 | UInt32(bytes[4]) << 24)
+                    : 0
+                let expected = 32 + Int(declared) * 4
+                if expected != bytes.count, lengthMismatchReports < 20 {
+                    lengthMismatchReports += 1
+                    MSLLog.line("x11", "LENGTH MISMATCH: \(kind == 1 ? "reply" : "GenericEvent") "
+                                + "declares length \(declared) = \(expected) bytes "
+                                + "but is \(bytes.count) bytes - the client's stream "
+                                + "desyncs from here")
+                }
+            } else if handshakeComplete, bytes.count != 32, lengthMismatchReports < 20 {
+                lengthMismatchReports += 1
+                MSLLog.line("x11", "LENGTH MISMATCH: event type \(kind) is "
+                            + "\(bytes.count) bytes, must be exactly 32")
+            }
+            // **The sequence on the wire must never go backwards.** libxcb
+            // treats an arriving sequence as "the server has moved past
+            // everything below this" and frees those pending replies; a
+            // packet stamped ahead of a reply the client is still waiting
+            // for makes `xcb_wait_for_reply` return NULL with no error, and
+            // `_XReply` reads that as a dead connection. A later backward
+            // step is worse still: xcb's 16->64-bit widening reads it as a
+            // wrap and adds 0x10000, poisoning every subsequent wait.
+            // KeymapNotify (type 11) is exempt - it has no sequence field.
+            if handshakeComplete, kind != 11 {
+                let back = lastWireSequence &- seq
+                if back > 0, back < 0x8000, wireOrderReports < 20 {
+                    wireOrderReports += 1
+                    MSLLog.line("x11", "SEQUENCE WENT BACKWARDS: \(label) seq \(seq) "
+                                + "after seq \(lastWireSequence) - the client's pending "
+                                + "replies below \(lastWireSequence) have already been "
+                                + "discarded by xcb")
+                }
+                if back == 0 || back >= 0x8000 { lastWireSequence = seq }
+            }
+            packetsForThisRequest += 1
+            packetRing.append("seq \(seq) \(label) \(bytes.count)B")
+            if packetRing.count > Self.ringLimit { packetRing.removeFirst() }
         }
         // Never blocks. This is called on the main thread for every mouse
         // move, key and focus change, and a blocking `write` into a guest
@@ -6009,8 +10486,6 @@ final class X11Connection: NSObject {
         // background drain; replies and events after it queue behind it.
         // Pointer motion is dropped instead while there is a backlog - a
         // client wants the latest position, not every one it missed.
-        writeLock.lock()
-        defer { writeLock.unlock() }
         guard !writeClosed else { return }
         if !writeBacklog.isEmpty {
             if Self.isDroppableMotion(bytes, littleEndian: littleEndian) { return }
@@ -6042,7 +10517,16 @@ final class X11Connection: NSObject {
                 if n > 0 { sent += n; continue }
                 if n < 0, errno == EINTR { continue }
                 if n < 0, errno == EAGAIN || errno == EWOULDBLOCK { return }
+                // **This is where a client dies without a word.** Once
+                // `writeClosed` is set, every later reply is dropped by the
+                // guard at the top of `writeFull` - so a client blocked in
+                // `_XReply` waits for something that will never be sent,
+                // Xlib gives up with an I/O error, and GDK's handler calls
+                // `_exit(1)`. No crash, no core, nothing in the app's log.
+                // Recording the errno is the only way that is ever
+                // diagnosable after the fact.
                 writeClosed = true
+                writeFailure = "write failed: \(String(cString: strerror(errno))) (errno \(errno))"
                 return
             }
         }
@@ -6052,10 +10536,21 @@ final class X11Connection: NSObject {
     /// `writeLock` must be held.
     private func enforceWriteBacklogLimit() {
         guard writeBacklog.count > Self.writeBacklogLimit else { return }
+        // Discarding the backlog throws away whatever was queued, which may
+        // include a reply a client is blocked on. That is a deliberate last
+        // resort against unbounded memory, but it must never be silent: from
+        // the app's side it is indistinguishable from a crash.
+        writeFailure = "write backlog hit \(Self.writeBacklogLimit >> 20)MB - "
+            + "dropped \(writeBacklog.count) queued bytes and closed the connection"
         writeBacklog.removeAll()
         writeClosed = true
         shutdown(fd, SHUT_RDWR) // ends `run`'s read loop, which cleans up
     }
+
+    /// Why this connection's write side was closed, if it was. Reported by
+    /// `cleanupOnDisconnect`, because the read side's "the client closed its
+    /// end" is what you see either way and names the wrong party.
+    private var writeFailure: String?
 
     /// Waits for the socket to accept more and hands it the backlog, until
     /// the backlog is empty or the connection is gone.
@@ -6119,6 +10614,13 @@ final class X11Connection: NSObject {
     fileprivate func deliverEvent(_ bytes: [UInt8]) {
         var patched = bytes
         guard patched.count >= 4 else { return }
+        // The protocol asks the server to do two things to an event it
+        // forwards for `SendEvent`: correct the sequence number, and
+        // "force on the most significant bit of the event code" so the
+        // receiver can tell synthetic from real. This only ever did the
+        // first - and `handleClipboardAnswer` masks with `& 0x7F`,
+        // expecting a bit nothing was setting. XDND receivers check it.
+        patched[0] |= 0x80
         if littleEndian {
             patched[2] = UInt8(sequenceNumber & 0xFF)
             patched[3] = UInt8(sequenceNumber >> 8)
@@ -6142,13 +10644,98 @@ final class X11Connection: NSObject {
 /// size AND this server's drawing surface stuck at whatever they were
 /// when the window was created.
 extension X11Connection: NSWindowDelegate {
+    /// How often a live resize is actually applied. 12 a second is well
+    /// under what a drag generates and well above what reads as jerky.
+    private static let liveResizeInterval: TimeInterval = 1.0 / 12
+
+    /// Applies a resize the throttle skipped.
+    ///
+    /// Re-reads the view's CURRENT size rather than replaying a remembered
+    /// one: by the time this runs the drag may have moved further, and the
+    /// live size is always the right answer.
+    private func flushPendingResize(windowID: UInt32) {
+        guard pendingLiveResize.contains(windowID),
+              let record = state.window(windowID),
+              let window = record.nsWindow,
+              window.contentView is X11CanvasView
+        else {
+            pendingLiveResize.remove(windowID)
+            return
+        }
+        bypassLiveResizeThrottle = true
+        defer { bypassLiveResizeThrottle = false }
+        windowDidResize(Notification(name: NSWindow.didResizeNotification, object: window))
+    }
+
+    /// Also flush when the drag ends, for the common case where the
+    /// trailing timer has not fired yet. Harmless when it already has.
+    /// Keeps `_NET_WM_STATE` honest when the state changes on the **Mac's**
+    /// side - the Dock tile, the green button, Mission Control.
+    ///
+    /// `handleWindowManagerRequest` used to be the only writer of
+    /// `isMinimised`/`isFullScreen`, so a window minimised from its own
+    /// titlebar button and then restored from the Dock stayed "minimised" in
+    /// the server's record forever. That was harmless only while nothing ever
+    /// told the client: now that every state change sends a `PropertyNotify`,
+    /// the next maximise would hand GTK `_NET_WM_STATE_HIDDEN` for a window
+    /// plainly on screen. Minimise-then-restore-then-maximise is the first
+    /// thing anyone does after finding the buttons work, so the record has to
+    /// follow AppKit as well as drive it.
+    private func windowStateChanged(_ notification: Notification, apply: (X11State.WindowRecord) -> Bool) {
+        guard let window = notification.object as? NSWindow,
+              let view = window.contentView as? X11CanvasView,
+              let record = state.window(view.windowID)
+        else { return }
+        guard apply(record) else { return } // unchanged - no event
+        sendPropertyNotify(record, atom: atom("_NET_WM_STATE"), state: 0) // 0 = NewValue
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        windowStateChanged(notification) { record in
+            guard !record.isMinimised else { return false }
+            record.isMinimised = true
+            return true
+        }
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        windowStateChanged(notification) { record in
+            guard record.isMinimised else { return false }
+            record.isMinimised = false
+            return true
+        }
+    }
+
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        windowStateChanged(notification) { record in
+            guard !record.isFullScreen else { return false }
+            record.isFullScreen = true
+            return true
+        }
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        windowStateChanged(notification) { record in
+            guard record.isFullScreen else { return false }
+            record.isFullScreen = false
+            return true
+        }
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              let view = window.contentView as? X11CanvasView
+        else { return }
+        flushPendingResize(windowID: view.windowID)
+    }
+
     func windowDidResize(_ notification: Notification) {
         guard let window = notification.object as? NSWindow,
               let view = window.contentView as? X11CanvasView,
               let record = state.window(view.windowID)
         else { return }
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] windowDidResize wid=\(record.id) viewSize=\(view.frame.size) recordSize=\(record.frame.size)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "windowDidResize wid=\(record.id) viewSize=\(view.bounds.size) points=\(view.frame.size) recordSize=\(record.frame.size)")
         }
         // No echo counter - the size comparison below is the reliable
         // test, for exactly the reasons spelled out in `windowDidMove`.
@@ -6159,8 +10746,67 @@ extension X11Connection: NSWindowDelegate {
             record.programmaticOuterFrame = nil
             return
         }
-        let size = view.frame.size // AppKit already resized the content view to match
+        // The content view's BOUNDS are the X11 size: AppKit resized its
+        // frame (points), and with Native Scaling the two differ.
+        let size = view.bounds.size
         guard Int(size.width) != Int(record.frame.width) || Int(size.height) != Int(record.frame.height) else { return }
+
+        // During a drag, throttle. AppKit fires this continuously while
+        // the mouse moves, and every call reallocates the window's whole
+        // backing bitmap and sends the client a whole-window Expose - so a
+        // one-second drag of a large window is dozens of megabyte
+        // allocations and dozens of full repaints, none of which anyone
+        // sees because the next one arrives first.
+        //
+        // Throttled rather than deferred to the end of the drag: a client
+        // that hears nothing until the mouse is released shows stale or
+        // blank content for the whole gesture, which is worse than a
+        // slightly coarse live resize. `windowDidEndLiveResize` always
+        // delivers the final size, so the last word is exact whatever the
+        // throttle skipped.
+        if window.inLiveResize, !bypassLiveResizeThrottle {
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - lastLiveResizeAt < Self.liveResizeInterval {
+                // Trailing flush, not just `windowDidEndLiveResize`. That
+                // delegate call is not guaranteed - it did not fire at all
+                // for a synthetic drag during testing - and a throttle
+                // whose last update can be dropped leaves the client
+                // believing a size the window does not have. This is the
+                // same coalesce-with-a-trailing-flush shape
+                // `X11MotionThrottle` already uses.
+                if pendingLiveResize.insert(record.id).inserted {
+                    let id = record.id
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Self.liveResizeInterval) { [weak self] in
+                        self?.flushPendingResize(windowID: id)
+                    }
+                }
+                return
+            }
+            lastLiveResizeAt = now
+        }
+        pendingLiveResize.remove(record.id)
+        // What the ConfigureNotify below would report, as it stands now.
+        //
+        // **A ConfigureNotify is a report that something changed.** AppKit
+        // calls this delegate for things that are not resizes - closing a
+        // window that was over this one is enough - so "the delegate fired"
+        // is not "the window changed", and a real X server does not announce
+        // a move or resize that did not happen.
+        //
+        // It matters more than tidiness because GTK counts these: freezing
+        // and thawing toplevel updates is driven by the configure events a
+        // window receives, so an unasked-for one can thaw something that was
+        // never frozen. That is the `gdk_window_thaw_toplevel_updates:
+        // assertion 'window->update_and_descendants_freeze_count > 0' failed`
+        // every GTK app here logs.
+        //
+        // Honest note: this did **not** turn out to be the cause of the
+        // Firefox crash it was written for - that was the portal omitting
+        // `uris` from a cancel (see `GuestIntegration`'s `run_chooser`) - and
+        // the assertion still appears. It is kept because it is correct, not
+        // because it is known to fix anything.
+        let previousSize = record.frame.size
+        let previousOrigin = record.frame.origin
         record.frame.size = size
         // A resize MOVES the X11 origin as well. AppKit's window origin is
         // its BOTTOM-left corner, so a window resized with its top edge
@@ -6179,8 +10825,18 @@ extension X11Connection: NSWindowDelegate {
         // the window itself makes both callbacks agree no matter which
         // order they arrive in.
         record.frame.origin = Self.x11Frame(fromCocoaWindow: window).origin
-        view.resize(width: Int(size.width), height: Int(size.height))
-        if record.eventMask & 0x0002_0000 != 0 { // StructureNotifyMask
+        // Gravity, same as the client-driven path. Safe here because this
+        // method already sends a whole-window Expose unconditionally
+        // afterwards - which is the half that must never be skipped.
+        view.resize(width: Int(size.width), height: Int(size.height),
+                    preserveContent: record.bitGravity != 0,
+                    background: record.backgroundNone ? nil : record.backgroundPixel)
+        // Only when it really moved or resized - see `previousSize` above.
+        let geometryChanged = Int(record.frame.width) != Int(previousSize.width)
+            || Int(record.frame.height) != Int(previousSize.height)
+            || Int(record.frame.origin.x) != Int(previousOrigin.x)
+            || Int(record.frame.origin.y) != Int(previousOrigin.y)
+        if geometryChanged, record.eventMask & 0x0002_0000 != 0 { // StructureNotifyMask
             sendConfigureNotify(record)
         }
         // Confirmed live this was the "black border on resize" bug: a
@@ -6227,7 +10883,7 @@ extension X11Connection: NSWindowDelegate {
               let record = state.window(view.windowID)
         else { return }
         if X11Trace.enabled {
-            FileHandle.standardError.write("[x11] windowDidMove wid=\(record.id) winOrigin=\(window.frame.origin) recordOrigin=\(record.frame.origin)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "windowDidMove wid=\(record.id) winOrigin=\(window.frame.origin) recordOrigin=\(record.frame.origin)")
         }
         // NO echo counter here any more - see the guard below. This used
         // to early-return whenever a `pendingProgrammaticMoves` count was
@@ -6304,7 +10960,7 @@ extension X11Connection: NSWindowDelegate {
               let view = window.contentView as? X11CanvasView,
               let record = state.window(view.windowID)
         else {
-            if X11Trace.mouseEnabled { FileHandle.standardError.write("[x11] windowDidBecomeKey: no record/view\n".data(using: .utf8)!) }
+            if X11Trace.mouseEnabled { MSLLog.line("x11", "windowDidBecomeKey: no record/view") }
             return
         }
         // Core and XI2 focus delivery are independent, exactly like
@@ -6313,7 +10969,7 @@ extension X11Connection: NSWindowDelegate {
         // core mask (or vice versa) silently drops focus for one whole
         // class of client. See `sendXIFocusEvent`'s doc comment.
         let xiFocusBit = UInt32(1) << UInt32(XIEventType.focusIn)
-        if X11Trace.mouseEnabled { FileHandle.standardError.write("[x11] windowDidBecomeKey wid=\(record.id) eventMask=0x\(String(record.eventMask, radix: 16)) core=\(record.eventMask & 0x0020_0000 != 0) xi=\(record.xiEventMask & xiFocusBit != 0) overrideRedirect=\(record.overrideRedirect)\n".data(using: .utf8)!) }
+        if X11Trace.mouseEnabled { MSLLog.line("x11", "windowDidBecomeKey wid=\(record.id) eventMask=0x\(String(record.eventMask, radix: 16)) core=\(record.eventMask & 0x0020_0000 != 0) xi=\(record.xiEventMask & xiFocusBit != 0) overrideRedirect=\(record.overrideRedirect)") }
         // An override-redirect window (a menu/popup) is override-redirect
         // PRECISELY so that it bypasses the window manager and never takes
         // the input focus - see `windowDidResignKey` for the other half of
@@ -6336,7 +10992,7 @@ extension X11Connection: NSWindowDelegate {
             if previous.xiEventMask & xiFocusBit != 0 { sendXIFocusEvent(focusIn: false, windowID: previous.id) }
         }
         if focusNeverLeft {
-            if X11Trace.mouseEnabled { FileHandle.standardError.write("[x11] windowDidBecomeKey wid=\(record.id) focus never left; no FocusIn\n".data(using: .utf8)!) }
+            if X11Trace.mouseEnabled { MSLLog.line("x11", "windowDidBecomeKey wid=\(record.id) focus never left; no FocusIn") }
             return
         }
         // Retarget the single shared Dock tile at whichever Linux app the
@@ -6380,7 +11036,7 @@ extension X11Connection: NSWindowDelegate {
         // the popup in `windowDidBecomeKey`, no `FocusOut` for whoever it
         // stole AppKit key status from here) reproduces that.
         let menuOpen = state.hasMappedOverrideRedirectWindow
-        if X11Trace.mouseEnabled { FileHandle.standardError.write("[x11] windowDidResignKey wid=\(record.id) eventMask=0x\(String(record.eventMask, radix: 16)) suppressed=\(menuOpen)\n".data(using: .utf8)!) }
+        if X11Trace.mouseEnabled { MSLLog.line("x11", "windowDidResignKey wid=\(record.id) eventMask=0x\(String(record.eventMask, radix: 16)) suppressed=\(menuOpen)") }
         guard !menuOpen else {
             record.focusOutSuppressed = true
             return
@@ -6484,12 +11140,12 @@ extension X11Connection: X11EventSink {
     func mouseButton(_ event: NSEvent, in view: X11CanvasView, pressed: Bool, button: UInt8) {
         guard !inputIsFrozen else { return }
         guard let record = state.window(view.windowID) else {
-            if X11Trace.mouseEnabled { FileHandle.standardError.write("[x11] mouseButton: NO RECORD for wid=\(view.windowID)\n".data(using: .utf8)!) }
+            if X11Trace.mouseEnabled { MSLLog.line("x11", "mouseButton: NO RECORD for wid=\(view.windowID)") }
             return
         }
         let mask: UInt32 = pressed ? 0x0000_0004 : 0x0000_0008 // ButtonPressMask / ButtonReleaseMask
         if X11Trace.mouseEnabled {
-            FileHandle.standardError.write("[x11] mouseButton t=\(currentX11Timestamp) appkit=\(Int(event.timestamp * 1000)) eventNumber=\(event.eventNumber) wid=\(view.windowID) pressed=\(pressed) button=\(button) eventMask=0x\(String(record.eventMask, radix: 16)) needsMask=0x\(String(mask, radix: 16)) passes=\(record.eventMask & mask != 0) locInWindow=\(event.locationInWindow) viewBounds=\(view.bounds) viewFrame=\(view.frame) winFrame=\(view.window?.frame ?? .zero)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "mouseButton t=\(currentX11Timestamp) appkit=\(Int(event.timestamp * 1000)) eventNumber=\(event.type == .scrollWheel ? -1 : event.eventNumber) wid=\(view.windowID) pressed=\(pressed) button=\(button) eventMask=0x\(String(record.eventMask, radix: 16)) needsMask=0x\(String(mask, radix: 16)) passes=\(record.eventMask & mask != 0) locInWindow=\(event.locationInWindow) viewBounds=\(view.bounds) viewFrame=\(view.frame) winFrame=\(view.window?.frame ?? .zero)")
         }
         let point = view.convert(event.locationInWindow, from: nil)
         let x = Int16(clamping: Int(point.x)), y = Int16(clamping: Int(point.y))
@@ -6506,14 +11162,14 @@ extension X11Connection: X11EventSink {
         let xiEvtype = pressed ? XIEventType.buttonPress : XIEventType.buttonRelease
         let xiPasses = xi2TakesPrecedence(record, evtype: xiEvtype)
         if X11Trace.mouseEnabled {
-            FileHandle.standardError.write("[x11] mouseButton XI2 wid=\(view.windowID) xiEventMask=0x\(String(record.xiEventMask, radix: 16)) needsBit=\(xiEvtype) passes=\(xiPasses)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "mouseButton XI2 wid=\(view.windowID) xiEventMask=0x\(String(record.xiEventMask, radix: 16)) needsBit=\(xiEvtype) passes=\(xiPasses)")
         }
         if xiPasses {
             sendXIDeviceEvent(evtype: xiEvtype, detail: UInt32(button), deviceid: XIDeviceUse.corePointerID, windowID: view.windowID, x: x, y: y,
                               buttons: buttonsBefore)
         } else if record.eventMask & mask != 0 {
             if X11Trace.mouseEnabled {
-                FileHandle.standardError.write("[x11] mouseButton delivering core event at (\(point.x),\(point.y)) state=0x\(String(stateMask, radix: 16))\n".data(using: .utf8)!)
+                MSLLog.line("x11", "mouseButton delivering core event at (\(point.x),\(point.y)) state=0x\(String(stateMask, radix: 16))")
             }
             sendPointerEvent(code: pressed ? 4 : 5, detail: button, windowID: view.windowID, x: x, y: y, state: stateMask)
         }
@@ -6577,7 +11233,7 @@ extension X11Connection: X11EventSink {
         let corePasses = record.eventMask & 0x0000_0040 != 0 // PointerMotionMask
         let xiPasses = xi2TakesPrecedence(record, evtype: XIEventType.motion)
         if X11Trace.mouseEnabled {
-            FileHandle.standardError.write("[x11] mouseMoved t=\(currentX11Timestamp) appkit=\(Int(event.timestamp * 1000)) wid=\(view.windowID) x=\(x) y=\(y) corePasses=\(corePasses) xiPasses=\(xiPasses)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "mouseMoved t=\(currentX11Timestamp) appkit=\(Int(event.timestamp * 1000)) wid=\(view.windowID) x=\(x) y=\(y) corePasses=\(corePasses) xiPasses=\(xiPasses)")
         }
         if xiPasses {
             sendXIDeviceEvent(evtype: XIEventType.motion, detail: 0, deviceid: XIDeviceUse.corePointerID, windowID: view.windowID, x: x, y: y)
@@ -6628,7 +11284,7 @@ extension X11Connection: X11EventSink {
         // transition the protocol says is impossible.
         guard record.pointerInside != entered else {
             if X11Trace.mouseEnabled {
-                FileHandle.standardError.write("[x11] mouseCrossing wid=\(windowID) entered=\(entered) SUPPRESSED (already \(entered ? "inside" : "outside"))\n".data(using: .utf8)!)
+                MSLLog.line("x11", "mouseCrossing wid=\(windowID) entered=\(entered) SUPPRESSED (already \(entered ? "inside" : "outside"))")
             }
             return
         }
@@ -6638,7 +11294,7 @@ extension X11Connection: X11EventSink {
         let corePasses = record.eventMask & coreMask != 0
         let xiPasses = xi2TakesPrecedence(record, evtype: xiEvtype)
         if X11Trace.mouseEnabled {
-            FileHandle.standardError.write("[x11] mouseCrossing wid=\(windowID) entered=\(entered) x=\(x) y=\(y) corePasses=\(corePasses) xiPasses=\(xiPasses)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "mouseCrossing wid=\(windowID) entered=\(entered) x=\(x) y=\(y) corePasses=\(corePasses) xiPasses=\(xiPasses)")
         }
         if xiPasses {
             sendXICrossingEvent(evtype: xiEvtype, deviceid: XIDeviceUse.corePointerID, windowID: windowID, x: x, y: y)
@@ -6661,6 +11317,23 @@ extension X11Connection: X11EventSink {
         deliverCrossing(windowID: windowID, x: Int16(clamping: Int(viewLoc.x)), y: Int16(clamping: Int(viewLoc.y)), entered: true)
     }
 
+    /// The `WM_CLASS` of the top-level window `windowID` belongs to.
+    ///
+    /// Walks up to the top level because `WM_CLASS` is set there and key
+    /// events arrive addressed to whatever child has focus - a text area, a
+    /// terminal widget - which carries no class of its own. Used to tell a
+    /// terminal emulator from everything else (`X11TerminalApps`).
+    func appClass(forWindow windowID: UInt32) -> String? {
+        var record = state.window(windowID)
+        var hops = 0
+        while let current = record, hops < 32 {
+            if current.isTopLevel { return current.appName }
+            record = state.window(current.parent)
+            hops += 1
+        }
+        return nil
+    }
+
     /// A key from AppKit (or from `X11KeyboardRouter`, for Command combos).
     ///
     /// Modifiers are resynced first: if the event's flags disagree with
@@ -6671,7 +11344,7 @@ extension X11Connection: X11EventSink {
     func keyEvent(_ event: NSEvent, in view: X11CanvasView, pressed: Bool) {
         guard !inputIsFrozen else { return }
         guard let keycode = X11KeyCodes.keycode(forMac: event.keyCode) else {
-            if X11Trace.enabled { FileHandle.standardError.write("[x11] keyEvent: no keycode for macKeyCode=\(event.keyCode)\n".data(using: .utf8)!) }
+            if X11Trace.enabled { MSLLog.line("x11", "keyEvent: no keycode for macKeyCode=\(event.keyCode)") }
             return
         }
         let point = view.convert(event.locationInWindow, from: nil)
@@ -6688,10 +11361,12 @@ extension X11Connection: X11EventSink {
         // keyDown, so its keyUp is swallowed, whatever modifiers are held
         // by then.
         if !pressed, remappedMacKeys.remove(event.keyCode) != nil { return }
-        if pressed, let chords = remapper.remap(macKeyCode: event.keyCode, flags: event.modifierFlags) {
+        let focusedClass = appClass(forWindow: view.windowID)
+        if pressed, let chords = remapper.remap(macKeyCode: event.keyCode, flags: event.modifierFlags,
+                                                appClass: focusedClass) {
             remappedMacKeys.insert(event.keyCode)
             if X11Trace.enabled {
-                FileHandle.standardError.write("[x11] remap macKeyCode=\(event.keyCode) flags=0x\(String(event.modifierFlags.rawValue, radix: 16)) -> \(chords.map { "\($0.modifiers)+\($0.keycode)" })\n".data(using: .utf8)!)
+                MSLLog.line("x11", "remap macKeyCode=\(event.keyCode) flags=0x\(String(event.modifierFlags.rawValue, radix: 16)) class=\(focusedClass ?? "nil") terminal=\(X11TerminalApps.isTerminal(focusedClass)) -> \(chords.map { "\($0.modifiers)+\($0.keycode)" })")
             }
             for transition in keyboard.chordTransitions(chords) {
                 deliverKey(transition, windowID: view.windowID, x: x, y: y)
@@ -6707,9 +11382,78 @@ extension X11Connection: X11EventSink {
         let transition = keyboard.key(keycode, pressed: pressed)
         if X11Trace.enabled {
             let keysym = X11KeymapProvider.shared.keymap.keysym(keycode: keycode, mods: transition.before.effectiveMods)
-            FileHandle.standardError.write("[x11] keyEvent wid=\(view.windowID) pressed=\(pressed) macKeyCode=\(event.keyCode) keycode=\(keycode) keysym=0x\(String(keysym, radix: 16)) mods=0x\(String(transition.before.effectiveMods, radix: 16)) repeat=\(event.isARepeat) detectable=\(xkbClientFlags & 1) ts=\(currentX11Timestamp)\n".data(using: .utf8)!)
+            MSLLog.line("x11", "keyEvent wid=\(view.windowID) pressed=\(pressed) macKeyCode=\(event.keyCode) keycode=\(keycode) keysym=0x\(String(keysym, radix: 16)) mods=0x\(String(transition.before.effectiveMods, radix: 16)) repeat=\(event.isARepeat) detectable=\(xkbClientFlags & 1) ts=\(currentX11Timestamp)")
         }
         deliverKey(transition, windowID: view.windowID, x: x, y: y)
+    }
+
+    /// Text with no key behind it - the emoji picker, dictation, an input
+    /// method's committed text, a synthetic Unicode key event - typed into
+    /// the client.
+    ///
+    /// X11 delivers keycodes, never characters, so each code point is bound
+    /// to one of the reserved Unicode slot keycodes (`X11Keymap.unicodeSlots`),
+    /// the client is told the keymap changed, and the slot is pressed and
+    /// released. The client handles its MappingNotify/XkbMapNotify - and
+    /// re-reads the keymap - before the key press queued behind it, which is
+    /// what makes the press resolve to the new character.
+    ///
+    /// Up to 32 distinct characters go in one batch. Longer text is chunked,
+    /// and each chunk waits until the client has actually re-read the keymap
+    /// (or 250 ms): rebinding a slot the client hasn't caught up on yet would
+    /// type the wrong character.
+    func insertText(_ text: String, in view: X11CanvasView) {
+        guard !inputIsFrozen, !text.isEmpty else { return }
+        let point = view.convert(view.window?.mouseLocationOutsideOfEventStream ?? .zero, from: nil)
+        let x = Int16(clamping: Int(point.x)), y = Int16(clamping: Int(point.y))
+        var queue: [UInt32] = []
+        for scalar in text.unicodeScalars {
+            if scalar == "\n" || scalar == "\r" { queue.append(X11Keysym.returnKey); continue }
+            if scalar == "\t" { queue.append(X11Keysym.tab); continue }
+            if let keysym = X11Keysym.forText(String(scalar)) { queue.append(keysym) }
+        }
+        injectKeysyms(queue[...], windowID: view.windowID, x: x, y: y)
+    }
+
+    private func injectKeysyms(_ remaining: ArraySlice<UInt32>, windowID: UInt32, x: Int16, y: Int16) {
+        guard !remaining.isEmpty else { return }
+        var chunk: [UInt32] = []
+        var distinct = Set<UInt32>()
+        var rest = remaining
+        while let next = rest.first {
+            if !distinct.contains(next), distinct.count == X11Keymap.unicodeSlots.count { break }
+            distinct.insert(next)
+            chunk.append(next)
+            rest = rest.dropFirst()
+        }
+        // Return and Tab go out as their real keys, so an input method's
+        // committed newline behaves like one.
+        let keymap = X11KeymapProvider.shared
+        var special: [UInt32: UInt8] = [:]
+        if let returnKey = X11KeyCodes.keycode(forMac: 36) { special[X11Keysym.returnKey] = returnKey } // kVK_Return
+        if let tab = X11KeyCodes.keycode(forMac: 48) { special[X11Keysym.tab] = tab }                     // kVK_Tab
+        let (slots, changed) = keymap.unicodeSlots(for: chunk.filter { special[$0] == nil })
+        let readsBefore = keymapReads
+        if changed { keymapDidChange() }
+        let keyboard = X11KeyboardState.shared
+        for keysym in chunk {
+            guard let keycode = special[keysym] ?? slots[keysym] else { continue }
+            deliverKey(keyboard.key(keycode, pressed: true), windowID: windowID, x: x, y: y)
+            deliverKey(keyboard.key(keycode, pressed: false), windowID: windowID, x: x, y: y)
+        }
+        if X11Trace.enabled {
+            MSLLog.line("x11", "insertText \(chunk.count) keysyms, keymap changed=\(changed), \(rest.count) left")
+        }
+        guard !rest.isEmpty else { return }
+        let deadline = Date().addingTimeInterval(0.25)
+        func waitThenContinue() {
+            if !changed || keymapReads > readsBefore || Date() > deadline {
+                injectKeysyms(rest, windowID: windowID, x: x, y: y)
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { waitThenContinue() }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { waitThenContinue() }
     }
 
     /// A modifier key on its own - AppKit reports those only through
@@ -6721,7 +11465,7 @@ extension X11Connection: X11EventSink {
         let x = Int16(clamping: Int(point.x)), y = Int16(clamping: Int(point.y))
         for transition in X11KeyboardState.shared.flagsChanged(keycode: keycode, rawFlags: event.modifierFlags.rawValue) {
             if X11Trace.enabled {
-                FileHandle.standardError.write("[x11] modifier wid=\(view.windowID) keycode=\(transition.keycode) pressed=\(transition.pressed) mods=0x\(String(transition.before.effectiveMods, radix: 16))->0x\(String(transition.after.effectiveMods, radix: 16))\n".data(using: .utf8)!)
+                MSLLog.line("x11", "modifier wid=\(view.windowID) keycode=\(transition.keycode) pressed=\(transition.pressed) mods=0x\(String(transition.before.effectiveMods, radix: 16))->0x\(String(transition.after.effectiveMods, radix: 16))")
             }
             deliverKey(transition, windowID: view.windowID, x: x, y: y)
         }
@@ -6796,11 +11540,781 @@ extension X11Connection: X11EventSink {
     /// array is button N, as xorg's `SetBit(ptr, i)` writes it. It's a byte
     /// array, so it doesn't depend on the connection's byte order. Buttons
     /// above 31 don't fit and are left out.
+    /// FP3232: signed 32-bit integer part, then the fraction as a CARD32.
+    static func writeFP3232(_ value: Double, into w: X11ByteWriter) {
+        let integral = value.rounded(.down)
+        w.writeI32(Int32(clamping: Int(integral)))
+        w.writeU32(UInt32(clamping: Int((value - integral) * 4_294_967_296.0)))
+    }
+
     static func xi2ButtonMask(_ buttons: Set<UInt8>) -> [UInt8] {
         var mask = [UInt8](repeating: 0, count: 4)
         for button in buttons where button < 32 {
             mask[Int(button) / 8] |= UInt8(1) << (button % 8)
         }
         return mask
+    }
+}
+
+// MARK: - Scrolling and touchpad gestures
+
+extension X11Connection {
+    /// A wheel or trackpad scroll over `view` (see `X11ScrollTranslator`).
+    func scrollWheel(_ event: NSEvent, in view: X11CanvasView) {
+        guard !inputIsFrozen, let record = state.window(view.windowID) else { return }
+        let point = view.convert(event.locationInWindow, from: nil)
+        let x = Int16(clamping: Int(point.x)), y = Int16(clamping: Int(point.y))
+        let step = scrollTranslator.translate(
+            scrollingDeltaX: Double(event.scrollingDeltaX), scrollingDeltaY: Double(event.scrollingDeltaY),
+            precise: event.hasPreciseScrollingDeltas,
+            beginsGesture: event.phase.contains(.began) || event.phase.contains(.mayBegin),
+            scale: Double(X11DisplayScale.factor))
+        let smooth = deliverScroll(step, record: record, x: x, y: y)
+        if step.source == .touchpad { trackTouchpadScrollEnd(event, window: record.id, x: x, y: y, smooth: smooth) }
+    }
+
+    /// One scroll step to `record`'s window, per XI2proto "Smooth
+    /// scrolling": the valuator motion to XI 2.1+ clients that select
+    /// XI_Motion there, and the legacy clicks - as XI button events,
+    /// flagged `XIPointerEmulated` when the motion went too, or as core
+    /// button events for a core client. The device's valuators advance
+    /// whoever receives it: they are server state. Returns whether the
+    /// smooth motion was delivered.
+    @discardableResult
+    private func deliverScroll(_ step: X11ScrollTranslator.Step, record: X11State.WindowRecord,
+                               x: Int16, y: Int16, mods: X11KeyboardSnapshot? = nil) -> Bool {
+        let source = step.source == .wheel ? XIDeviceUse.mslMouseID : XIDeviceUse.mslTouchpadID
+        let before = state.scrollPosition(device: source)
+        let after = state.advanceScroll(device: source, dx: step.dx, dy: step.dy)
+        let modState = mods ?? X11KeyboardState.shared.current
+        // One timestamp for the smooth event and its emulated clicks, as
+        // Xorg does: Firefox drops a legacy scroll whose time equals the
+        // last smooth one's (its fix for GNOME bug 726878), which is the
+        // only thing stopping native-window widgets scrolling twice.
+        let time = currentX11Timestamp
+        var smooth = false
+        if xiAtLeast(2, 1), record.xiEventMask & (UInt32(1) << UInt32(XIEventType.motion)) != 0,
+           step.dx != 0 || step.dy != 0 {
+            primeScrollValuators(source: source, position: before, window: record.id, x: x, y: y, mods: modState)
+            var values: [(number: UInt16, value: Double)] = []
+            if step.dx != 0 { values.append((2, after.h)) }
+            if step.dy != 0 { values.append((3, after.v)) }
+            sendXIDeviceEvent(evtype: XIEventType.motion, detail: 0, deviceid: XIDeviceUse.corePointerID,
+                              windowID: record.id, x: x, y: y, mods: modState, sourceid: source, valuators: values,
+                              time: time)
+            smooth = true
+        }
+        let xiButtons = xi2TakesPrecedence(record, evtype: XIEventType.buttonPress)
+        for button in step.clicks {
+            if xiButtons {
+                let flags = smooth ? XIFlag.pointerEmulated : 0
+                sendXIDeviceEvent(evtype: XIEventType.buttonPress, detail: UInt32(button), deviceid: XIDeviceUse.corePointerID,
+                                  windowID: record.id, x: x, y: y, mods: modState, buttons: pressedButtons,
+                                  sourceid: source, flags: flags, time: time)
+                sendXIDeviceEvent(evtype: XIEventType.buttonRelease, detail: UInt32(button), deviceid: XIDeviceUse.corePointerID,
+                                  windowID: record.id, x: x, y: y, mods: modState, buttons: pressedButtons.union([button]),
+                                  sourceid: source, flags: flags, time: time)
+            } else if record.eventMask & 0x0000_0004 != 0 { // ButtonPressMask
+                let held = UInt16(modState.effectiveMods) | Self.x11ButtonMask(pressedButtons)
+                sendPointerEvent(code: 4, detail: button, windowID: record.id, x: x, y: y, state: held)
+                sendPointerEvent(code: 5, detail: button, windowID: record.id, x: x, y: y,
+                                 state: held | Self.x11ButtonMask([button]))
+            }
+        }
+        return smooth
+    }
+
+    /// GTK and Chromium take a scroll valuator's first value only as a
+    /// baseline and scroll on the difference from the next one, so the
+    /// first wheel click a client ever saw did nothing. Before a client's
+    /// first scroll from a device it gets that device's current position,
+    /// unchanged - a baseline, not a scroll (Qt, which reads the position
+    /// from XIQueryDevice instead, sees a zero delta and ignores it).
+    private func primeScrollValuators(source: UInt16, position: (h: Double, v: Double), window: UInt32,
+                                      x: Int16, y: Int16, mods: X11KeyboardSnapshot) {
+        guard !scrollPrimed.contains(source) else { return }
+        scrollPrimed.insert(source)
+        sendXIDeviceEvent(evtype: XIEventType.motion, detail: 0, deviceid: XIDeviceUse.corePointerID,
+                          windowID: window, x: x, y: y, mods: mods, sourceid: source,
+                          valuators: [(2, position.h), (3, position.v)])
+    }
+
+    /// A touchpad scroll ends with one zero-delta valuator event - GTK's
+    /// `is_stop`, which ends its scroll sequence. It goes out when macOS's
+    /// momentum finishes or, when no momentum follows the lift, just after
+    /// the fingers leave. Not at the lift itself: momentum is still to come,
+    /// and GTK would start its own inertia on top of macOS's.
+    private func trackTouchpadScrollEnd(_ event: NSEvent, window: UInt32, x: Int16, y: Int16, smooth: Bool) {
+        if smooth { touchpadScrollTarget = (window, x, y) }
+        if event.momentumPhase.contains(.began) { touchpadScrollSerial += 1 }
+        if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled) {
+            sendTouchpadScrollStop()
+        } else if event.phase.contains(.ended) || event.phase.contains(.cancelled) {
+            touchpadScrollSerial += 1
+            let serial = touchpadScrollSerial
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                guard let self, self.touchpadScrollSerial == serial else { return }
+                self.sendTouchpadScrollStop()
+            }
+        }
+    }
+
+    private func sendTouchpadScrollStop() {
+        guard let target = touchpadScrollTarget, state.window(target.window) != nil else { return }
+        touchpadScrollTarget = nil
+        let position = state.scrollPosition(device: XIDeviceUse.mslTouchpadID)
+        sendXIDeviceEvent(evtype: XIEventType.motion, detail: 0, deviceid: XIDeviceUse.corePointerID,
+                          windowID: target.window, x: target.x, y: target.y, sourceid: XIDeviceUse.mslTouchpadID,
+                          valuators: [(2, position.h), (3, position.v)])
+    }
+
+    /// Trackpad pinch. To a client that selected XI 2.4 pinch events on the
+    /// window (GTK3/4 widgets with touchpad-gesture masks, Qt 6, Chromium):
+    /// GesturePinchBegin/Update/End with the running scale. To everyone
+    /// else: Ctrl + scroll (`X11PinchZoomFallback`), which zooms in every
+    /// browser, image viewer and editor. Decided once per pinch.
+    func magnify(_ event: NSEvent, in view: X11CanvasView) {
+        guard !inputIsFrozen else { return }
+        let point = view.convert(event.locationInWindow, from: nil)
+        let x = Int16(clamping: Int(point.x)), y = Int16(clamping: Int(point.y))
+        if pinch == nil { beginPinch(window: view.windowID, x: x, y: y) }
+        guard let current = pinch else { return }
+        let magnification = Double(event.magnification)
+        if magnification != 0 {
+            let scale = current.scale * (1 + magnification)
+            pinch?.scale = scale
+            if current.native {
+                sendXIGesturePinch(evtype: XIEventType.gesturePinchUpdate, window: current.window, x: x, y: y,
+                                   scale: scale, angle: 0)
+            } else if let record = state.window(current.window) {
+                let zoom = pinchFallback.translate(magnification: magnification)
+                var ctrl = X11KeyboardState.shared.current
+                ctrl.baseMods |= 0x04 // ControlMask
+                deliverScroll(.init(source: .touchpad, dx: 0, dy: zoom.dy, clicks: zoom.clicks),
+                              record: record, x: x, y: y, mods: ctrl)
+            }
+        }
+        if event.phase.contains(.ended) || event.phase.contains(.cancelled) {
+            endPinch(x: x, y: y, cancelled: event.phase.contains(.cancelled))
+        }
+    }
+
+    /// Two-finger rotation: the pinch's `delta_angle` (degrees, clockwise
+    /// positive as libinput reports it; AppKit's is counter-clockwise).
+    /// Nothing for the fallback - there is no rotation convention to map to.
+    func rotate(_ event: NSEvent, in view: X11CanvasView) {
+        guard !inputIsFrozen else { return }
+        let point = view.convert(event.locationInWindow, from: nil)
+        let x = Int16(clamping: Int(point.x)), y = Int16(clamping: Int(point.y))
+        if pinch == nil { beginPinch(window: view.windowID, x: x, y: y) }
+        guard let current = pinch else { return }
+        if current.native, event.rotation != 0 {
+            sendXIGesturePinch(evtype: XIEventType.gesturePinchUpdate, window: current.window, x: x, y: y,
+                               scale: current.scale, angle: -Double(event.rotation))
+        }
+        if event.phase.contains(.ended) || event.phase.contains(.cancelled) {
+            endPinch(x: x, y: y, cancelled: event.phase.contains(.cancelled))
+        }
+    }
+
+    private func beginPinch(window: UInt32, x: Int16, y: Int16) {
+        guard let record = state.window(window) else { return }
+        let native = xiAtLeast(2, 4)
+            && record.xiEventMask & (UInt32(1) << UInt32(XIEventType.gesturePinchBegin)) != 0
+        pinch = (window, native, 1.0)
+        pinchFallback.reset()
+        if native {
+            sendXIGesturePinch(evtype: XIEventType.gesturePinchBegin, window: window, x: x, y: y, scale: 1, angle: 0)
+        }
+    }
+
+    private func endPinch(x: Int16, y: Int16, cancelled: Bool) {
+        guard let current = pinch else { return }
+        pinch = nil
+        if current.native, state.window(current.window) != nil {
+            sendXIGesturePinch(evtype: XIEventType.gesturePinchEnd, window: current.window, x: x, y: y,
+                               scale: current.scale, angle: 0, flags: cancelled ? XIFlag.gesturePinchCancelled : 0)
+        }
+    }
+
+    private func sendXIGesturePinch(evtype: UInt16, window: UInt32, x: Int16, y: Int16,
+                                    scale: Double, angle: Double, flags: UInt32 = 0) {
+        let origin = windowOrigin(window)
+        writeFull(Self.xiGesturePinchBytes(
+            evtype: evtype, sequence: stampSequence, time: currentX11Timestamp, root: rootWindowID, event: window,
+            rootX: origin.x + Double(x), rootY: origin.y + Double(y), eventX: Double(x), eventY: Double(y),
+            scale: scale, angle: angle, mods: X11KeyboardState.shared.current, flags: flags, littleEndian: littleEndian))
+    }
+
+    /// `xXIGesturePinchEvent` (XI2proto.h, XI 2.4): 100 bytes.
+    static func xiGesturePinchBytes(evtype: UInt16, sequence: UInt16, time: UInt32, root: UInt32, event: UInt32,
+                                    rootX: Double, rootY: Double, eventX: Double, eventY: Double,
+                                    scale: Double, angle: Double, mods: X11KeyboardSnapshot, flags: UInt32,
+                                    littleEndian: Bool) -> [UInt8] {
+        func fp1616(_ value: Double) -> Int32 { Int32(clamping: Int((value * 65536).rounded())) }
+        let w = X11ByteWriter(littleEndian: littleEndian)
+        w.writeU8(35) // GenericEvent
+        w.writeU8(X11Opcode.xinputExtension)
+        w.writeU16(sequence)
+        w.writeU32(17) // (100 - 32) / 4
+        w.writeU16(evtype)
+        w.writeU16(XIDeviceUse.corePointerID)
+        w.writeU32(time)
+        w.writeU32(2) // detail: touches in the gesture
+        w.writeU32(root)
+        w.writeU32(event)
+        w.writeU32(0) // child
+        w.writeI32(fp1616(rootX)); w.writeI32(fp1616(rootY))
+        w.writeI32(fp1616(eventX)); w.writeI32(fp1616(eventY))
+        w.writeI32(0); w.writeI32(0) // delta_x, delta_y: the fingers' centre doesn't travel in a macOS pinch
+        w.writeI32(0); w.writeI32(0) // delta_unaccel_x/y
+        w.writeI32(fp1616(scale)) // scale, relative to the gesture's start
+        w.writeI32(fp1616(angle)) // delta_angle, degrees since the last event
+        w.writeU16(XIDeviceUse.mslTouchpadID) // sourceid
+        w.writeU16(0) // pad0
+        w.writeU32(UInt32(mods.baseMods)); w.writeU32(0) // mods.base, latched
+        w.writeU32(UInt32(mods.lockedMods)); w.writeU32(UInt32(mods.effectiveMods)) // mods.locked, effective
+        w.writeU8(0); w.writeU8(0); w.writeU8(0); w.writeU8(0) // group
+        w.writeU32(flags)
+        return w.bytes
+    }
+}
+
+// MARK: - The rest of XInput
+
+extension X11Connection {
+    /// Every XInput request that has no richer handler above, XI1 and XI2,
+    /// answered the way a server with this device set would (XIproto.h,
+    /// XI2proto.h): a reply where one is owed, silence where none is, and
+    /// BadDevice for a device that doesn't exist. All of these used to be
+    /// BadImplementation, which Xlib's default handler turns into an exit
+    /// and which crashed Blender (XI1 SelectExtensionEvent at startup; its
+    /// handler segfaulted on the error).
+    ///
+    /// XI1 devices that can be opened are the two slave pointers the XI1
+    /// device list shows as extension devices; the core pair can't be
+    /// opened through XI1, as on Xorg.
+    fileprivate func handleXIOtherRequest(minor: UInt8, body: [UInt8]) {
+        let openable: Set<UInt8> = [UInt8(XIDeviceUse.mslMouseID), UInt8(XIDeviceUse.mslTouchpadID)]
+        func reply(_ fields: [UInt8] = [], extra: [UInt8] = []) {
+            let fw = X11ByteWriter(littleEndian: littleEndian)
+            fw.writeBytes(Array(fields.prefix(24)))
+            fw.writePadding(24 - min(24, fields.count))
+            sendReply(fixed24: fw, extra: extra, detail: minor) // detail = RepType, the request minor
+        }
+        func badDevice(_ id: UInt8) {
+            sendError(code: X11ExtensionBase.xinputFirstError, badValue: UInt32(id), minorOpcode: UInt16(minor),
+                      majorOpcode: X11Opcode.xinputExtension)
+        }
+        let device = body.first ?? 0
+        switch minor {
+        case 3: // OpenDevice -> num_classes, then (class, event_type_base) pairs
+            guard openable.contains(device) else { return badDevice(device) }
+            // One input class: buttons (ButtonClass = 1); events count from
+            // the extension's first event, as libXi computes them.
+            reply([1], extra: [1, X11ExtensionBase.xinputFirstEvent, 0, 0])
+        case 5: // SetDeviceMode -> status
+            guard openable.contains(device) else { return badDevice(device) }
+            reply([0]) // Success
+        case 7: // GetSelectedExtensionEvents -> this_client_count, all_clients_count
+            reply([0, 0, 0, 0])
+        case 9: // GetDeviceDontPropagateList -> count
+            reply([0, 0])
+        case 10: // GetDeviceMotionEvents -> nEvents(4), axes(1), mode(1): no history kept
+            reply([0, 0, 0, 0, 0, 0])
+        case 11, 12, 13: // ChangeKeyboardDevice, ChangePointerDevice, GrabDevice -> status
+            reply([0]) // Success
+        case 20: // GetDeviceFocus -> focus None, time, revertTo
+            reply([0, 0, 0, 0, 0, 0, 0, 0, 0])
+        case 22: // GetFeedbackControl -> num_feedbacks
+            reply([0, 0])
+        case 24: // GetDeviceKeyMapping -> keySymsPerKeyCode 0: the core map is the map
+            reply([0])
+        case 26: // GetDeviceModifierMapping -> numKeyPerModifier 0
+            reply([0])
+        case 27, 29, 33: // SetDeviceModifierMapping, SetDeviceButtonMapping, SetDeviceValuators -> status
+            reply([0]) // Success
+        case 28: // GetDeviceButtonMapping -> nElts, then the identity map
+            let n = Self.pointerButtonLabels.count
+            let map = (1...n).map { UInt8($0) }
+            reply([UInt8(n)], extra: map + [UInt8](repeating: 0, count: (4 - n % 4) % 4))
+        case 30: // QueryDeviceState -> num_classes 0
+            reply([0])
+        case 34, 35: // GetDeviceControl, ChangeDeviceControl: no controls here
+            sendError(code: X11ErrorCode.match, badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xinputExtension)
+        case 36: // ListDeviceProperties -> nAtoms 0
+            reply([0, 0])
+        case 39: // GetDeviceProperty -> type None, bytesAfter, nItems, format, deviceid
+            reply([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, device])
+        case 50: // XIGetFocus -> focus None
+            reply([0, 0, 0, 0])
+        case 54: // XIPassiveGrabDevice -> num_modifiers 0: every modifier combination took
+            reply([0, 0])
+        case 56: // XIListProperties -> num_properties 0
+            reply([0, 0])
+        // No reply: CloseDevice, SelectExtensionEvent,
+        // ChangeDeviceDontPropagateList, UngrabDevice, Grab/UngrabDeviceKey,
+        // Grab/UngrabDeviceButton, AllowDeviceEvents, SetDeviceFocus,
+        // ChangeFeedbackControl, ChangeDeviceKeyMapping, SendExtensionEvent,
+        // DeviceBell, Change/DeleteDeviceProperty, XIWarpPointer (never
+        // moves the Mac's cursor), XIChangeHierarchy, XISetClientPointer,
+        // XISetFocus, XIAllowEvents, XIPassiveUngrabDevice,
+        // XIChange/DeleteProperty, XIBarrierReleasePointer.
+        case 4, 6, 8, 14, 15, 16, 17, 18, 19, 21, 23, 25, 31, 32, 37, 38,
+             41, 43, 44, 49, 53, 55, 57, 58, 61:
+            break
+        default:
+            // Beyond XI 2.4's last request (61): nothing a client can mean.
+            sendError(code: X11ErrorCode.request, badValue: 0, minorOpcode: UInt16(minor), majorOpcode: X11Opcode.xinputExtension)
+        }
+    }
+}
+
+// MARK: - GLX
+
+extension X11Connection {
+    /// The framebuffer configurations this screen offers, built from the
+    /// two real visuals (see `X11GLXConfig.all`).
+    fileprivate var glxConfigs: [X11GLXConfig] {
+        X11GLXConfig.all(visualID: visualID, argbVisualID: argbVisualID)
+    }
+
+    /// GLX extensions mslgd claims - Xvfb's list (a Mesa-backed Xorg), so an
+    /// app sees the same GLX here as on any Linux desktop. Every one is
+    /// satisfied without server-side GL: the context-attribute ones are
+    /// accepted by `CreateContextAttribsARB`, texture-from-pixmap and
+    /// copy_sub_buffer are done client-side by Mesa's drisw through core
+    /// GetImage/PutImage, and the SGIX ones map onto the GLX 1.3 requests
+    /// (see `handleGLXVendorPrivate`). `GLX_EXT_libglvnd` matters most:
+    /// libglvnd asks it which vendor library to load (`mesa`).
+    fileprivate var glxExtensionString: String {
+        [
+            "GLX_ARB_context_flush_control",
+            "GLX_ARB_create_context",
+            "GLX_ARB_create_context_no_error",
+            "GLX_ARB_create_context_profile",
+            "GLX_ARB_create_context_robustness",
+            "GLX_ARB_fbconfig_float",
+            "GLX_ARB_framebuffer_sRGB",
+            "GLX_ARB_get_proc_address",
+            "GLX_ARB_multisample",
+            "GLX_EXT_create_context_es_profile",
+            "GLX_EXT_create_context_es2_profile",
+            "GLX_EXT_fbconfig_packed_float",
+            "GLX_EXT_framebuffer_sRGB",
+            "GLX_EXT_get_drawable_type",
+            "GLX_EXT_libglvnd",
+            "GLX_EXT_no_config_context",
+            "GLX_EXT_texture_from_pixmap",
+            "GLX_EXT_visual_info",
+            "GLX_EXT_visual_rating",
+            "GLX_MESA_copy_sub_buffer",
+            "GLX_OML_swap_method",
+            "GLX_SGI_make_current_read",
+            "GLX_SGIS_multisample",
+            "GLX_SGIX_fbconfig",
+            "GLX_SGIX_pbuffer",
+            "GLX_SGIX_visual_select_group",
+        ].joined(separator: " ")
+    }
+
+    fileprivate func sendGLXError(_ code: UInt8, badValue: UInt32, minor: UInt8) {
+        sendError(code: X11ExtensionBase.glxFirstError + code, badValue: badValue,
+                  minorOpcode: UInt16(minor), majorOpcode: X11Opcode.glxExtension)
+    }
+
+    /// The `pad, n, pad...` string reply shape `QueryServerString` and
+    /// `QueryExtensionsString` share. `n` counts the terminating NUL, and
+    /// the string is padded to a 4-byte boundary after it.
+    fileprivate func sendGLXString(_ value: String) {
+        let bytes = Array(value.utf8) + [0]
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writeU32(0)
+        fw.writeU32(UInt32(bytes.count))
+        fw.writePadding(16)
+        sendReply(fixed24: fw, extra: padded(bytes))
+    }
+
+    fileprivate func handleGLXRequest(minor: UInt8, body: [UInt8]) {
+        let r = X11ByteReader(body, littleEndian: littleEndian)
+        switch minor {
+        case GLXOpcode.queryVersion:
+            // Answer the lower of the client's version and ours, as Xorg
+            // does: a 1.2 client must not be handed 1.4 semantics.
+            let asked = (major: r.readU32(), minor: r.readU32())
+            let ours = (major: UInt32(1), minor: UInt32(4))
+            let agreed = (asked.major, asked.minor) < (ours.major, ours.minor) ? asked : ours
+            let fw = X11ByteWriter(littleEndian: littleEndian)
+            fw.writeU32(agreed.0)
+            fw.writeU32(agreed.1)
+            fw.writePadding(16)
+            sendReply(fixed24: fw)
+
+        case GLXOpcode.queryServerString:
+            r.skip(4) // screen
+            switch r.readU32() {
+            case 1: sendGLXString("MSL") // GLX_VENDOR
+            case 2: sendGLXString("1.4") // GLX_VERSION
+            case GLXToken.vendorNamesEXT: sendGLXString("mesa") // GLX_EXT_libglvnd
+            default: sendGLXString(glxExtensionString) // GLX_EXTENSIONS
+            }
+
+        case GLXOpcode.queryExtensionsString:
+            sendGLXString(glxExtensionString)
+
+        case GLXOpcode.getVisualConfigs:
+            // Exactly the 18 fixed properties and no tagged extras. In this
+            // older reply some tags are one word and some are two (see
+            // Mesa's `FETCH_OR_SET`), so appending any is a parsing hazard
+            // for no gain - `GetFBConfigs` carries the full description.
+            let configs = glxConfigs
+            let fw = X11ByteWriter(littleEndian: littleEndian)
+            fw.writeU32(UInt32(configs.count))
+            fw.writeU32(18)
+            fw.writePadding(16)
+            let extra = X11ByteWriter(littleEndian: littleEndian)
+            for config in configs {
+                for property in config.visualConfigProperties { extra.writeU32(property) }
+            }
+            sendReply(fixed24: fw, extra: extra.bytes)
+
+        case GLXOpcode.getFBConfigs:
+            sendGLXFBConfigs()
+
+        // Context creation. All three carry the client's `isDirect` flag,
+        // and `IsDirect` below must echo it back: Mesa asks right after
+        // creating a context and destroys it if the server disagrees
+        // (glxcmds.c) - so answering a blanket "direct" would break the
+        // rare indirect client, and a blanket "indirect" breaks everyone.
+        case GLXOpcode.createContext:
+            let context = r.readU32()
+            let visual = r.readU32()
+            let screen = r.readU32()
+            r.skip(4) // shareList
+            // GLX 1.2 names a visual, not a config; with one visual per
+            // config the config is exact.
+            let config = glxConfigs.first { $0.visualID == visual }?.fbconfigID ?? 0
+            glx.contexts[context] = .init(isDirect: r.readU8() != 0, fbconfigID: config, screen: screen)
+
+        case GLXOpcode.createNewContext:
+            let context = r.readU32()
+            let fbconfig = r.readU32()
+            let screen = r.readU32()
+            r.skip(4) // renderType
+            r.skip(4) // shareList
+            glx.contexts[context] = .init(isDirect: r.readU8() != 0, fbconfigID: fbconfig, screen: screen)
+
+        case GLXOpcode.createContextAttribsARB:
+            // The attribute list (profile, version, flags) is the guest's
+            // business: it creates the real context locally. This request
+            // is `_checked` on the client, so it must not error.
+            let context = r.readU32()
+            let fbconfig = r.readU32()
+            let screen = r.readU32()
+            r.skip(4) // shareList
+            glx.contexts[context] = .init(isDirect: r.readU8() != 0, fbconfigID: fbconfig, screen: screen)
+
+        case GLXOpcode.destroyContext:
+            let context = r.readU32()
+            if glx.contexts.removeValue(forKey: context) == nil, isOwnID(context) {
+                sendGLXError(0, badValue: context, minor: minor) // GLXBadContext
+            }
+
+        case GLXOpcode.isDirect:
+            let context = r.readU32()
+            let fw = X11ByteWriter(littleEndian: littleEndian)
+            fw.writeU8(glx.contexts[context]?.isDirect == true ? 1 : 0)
+            fw.writePadding(23)
+            sendReply(fixed24: fw)
+
+        // Both make-current forms answer with a context tag. A direct
+        // client never sends these (it binds the context itself); an
+        // indirect one would, and the tag only has to be non-zero and
+        // stable per context.
+        case GLXOpcode.makeCurrent:
+            r.skip(4) // drawable
+            let context = r.readU32()
+            sendGLXContextTag(for: context)
+
+        case GLXOpcode.makeContextCurrent:
+            r.skip(12) // oldContextTag, drawable, readdrawable
+            sendGLXContextTag(for: r.readU32())
+
+        case GLXOpcode.queryContext:
+            let context = r.readU32()
+            guard let record = glx.contexts[context] else {
+                return sendGLXError(0, badValue: context, minor: minor) // GLXBadContext
+            }
+            let attributes: [(UInt32, UInt32)] = [
+                (GLXToken.fbconfigID, record.fbconfigID),
+                (GLXToken.screen, record.screen),
+                (GLXToken.renderType, GLXToken.rgbaType),
+            ]
+            let fw = X11ByteWriter(littleEndian: littleEndian)
+            fw.writeU32(UInt32(attributes.count))
+            fw.writePadding(20)
+            let extra = X11ByteWriter(littleEndian: littleEndian)
+            for (attribute, value) in attributes {
+                extra.writeU32(attribute)
+                extra.writeU32(value)
+            }
+            sendReply(fixed24: fw, extra: extra.bytes)
+
+        // GLX drawables are a naming layer over an X drawable: the client
+        // renders into the X window or pixmap underneath, which this
+        // server already owns.
+        case GLXOpcode.createWindow, GLXOpcode.createPixmap:
+            r.skip(4) // screen
+            let fbconfig = r.readU32()
+            let drawable = r.readU32()
+            let glxDrawable = r.readU32()
+            let count = r.remaining >= 4 ? Int(r.readU32()) : 0
+            var attributes: [UInt32: UInt32] = [:]
+            for _ in 0..<count where r.remaining >= 8 {
+                let attribute = r.readU32()
+                attributes[attribute] = r.readU32()
+            }
+            glx.drawables[glxDrawable] = drawable
+            glx.drawableInfo[glxDrawable] = .init(
+                typeBit: minor == GLXOpcode.createWindow ? GLXToken.windowBit : GLXToken.pixmapBit,
+                fbconfigID: fbconfig, attributes: attributes)
+
+        case GLXOpcode.createGLXPixmap:
+            r.skip(4) // screen
+            let visual = r.readU32()
+            let pixmap = r.readU32()
+            let glxPixmap = r.readU32()
+            glx.drawables[glxPixmap] = pixmap
+            glx.drawableInfo[glxPixmap] = .init(
+                typeBit: GLXToken.pixmapBit,
+                fbconfigID: glxConfigs.first { $0.visualID == visual }?.fbconfigID ?? 0, attributes: [:])
+
+        case GLXOpcode.destroyWindow, GLXOpcode.destroyPixmap, GLXOpcode.destroyGLXPixmap:
+            let id = r.readU32()
+            glx.drawableInfo.removeValue(forKey: id)
+            if glx.drawables.removeValue(forKey: id) == nil, isOwnID(id) {
+                // GLXBadWindow for a window, GLXBadPixmap otherwise.
+                sendGLXError(minor == GLXOpcode.destroyWindow ? 12 : 3, badValue: id, minor: minor)
+            }
+
+        case GLXOpcode.getDrawableAttributes:
+            sendGLXDrawableAttributes(r.readU32())
+
+        // A GLX pbuffer is an offscreen drawable, and in X11 that is simply
+        // a pixmap the server owns - Mesa sends `GetGeometry` for the
+        // pbuffer id immediately after creating it, and gives up with
+        // "failed to create drawable" if it is not a real drawable. That is
+        // exactly how Blender starts: a 1x1 pbuffer to get a context before
+        // it has a window.
+        case GLXOpcode.createPbuffer:
+            r.skip(4) // screen
+            let fbconfig = r.readU32()
+            let pbuffer = r.readU32()
+            let attributeCount = Int(r.readU32())
+            var width = 1, height = 1
+            for _ in 0..<attributeCount where r.remaining >= 8 {
+                let attribute = r.readU32(), value = r.readU32()
+                if attribute == GLXToken.pbufferWidth { width = Int(value) }
+                if attribute == GLXToken.pbufferHeight { height = Int(value) }
+            }
+            createGLXPbuffer(pbuffer, fbconfig: fbconfig, width: width, height: height)
+
+        case GLXOpcode.destroyPbuffer:
+            destroyGLXPbuffer(r.readU32())
+
+        case GLXOpcode.vendorPrivate, GLXOpcode.vendorPrivateWithReply:
+            handleGLXVendorPrivate(minor: minor, r: r)
+
+        // No reply, and nothing to do. The frame reaches the screen through
+        // core X11 (`PutImage`/`CopyArea`) from Mesa's `drisw` path, so by
+        // the time SwapBuffers arrives the pixels are already here.
+        case GLXOpcode.swapBuffers, GLXOpcode.waitGL, GLXOpcode.waitX,
+             GLXOpcode.clientInfo, GLXOpcode.setClientInfoARB, GLXOpcode.setClientInfo2ARB,
+             GLXOpcode.changeDrawableAttributes, GLXOpcode.copyContext, GLXOpcode.useXFont:
+            break
+
+        case GLXOpcode.render, GLXOpcode.renderLarge:
+            // Indirect GLX: GL commands encoded into the X stream. Not
+            // implemented - every client here is local, so direct rendering
+            // always applies and Mesa never sends these unless something
+            // has gone wrong upstream. Silence would hang a client waiting
+            // on a later reply, so say so.
+            sendGLXError(6, badValue: 0, minor: minor) // GLXBadRenderRequest
+
+        default:
+            // Pbuffers, vendor-private requests and the rest: reply-less
+            // ones stay silent (an error reaches Xlib's default handler,
+            // which exits the process - the same reasoning as the RENDER
+            // and XInput dispatchers above).
+            if minor > GLXOpcode.setClientInfo2ARB {
+                // Past GLX 1.4's last request (35): nothing a client can
+                // mean by it, so BadRequest - the same rule the core
+                // dispatcher and the RENDER/SHAPE ones already follow.
+                sendError(code: X11ErrorCode.request, badValue: 0, minorOpcode: UInt16(minor),
+                          majorOpcode: X11Opcode.glxExtension)
+            } else if minor == GLXOpcode.vendorPrivateWithReply {
+                sendGLXError(8, badValue: 0, minor: minor) // GLXUnsupportedPrivateRequest
+            } else if X11Trace.enabled {
+                MSLLog.line("x11", "glx unhandled minor=\(minor)")
+            }
+        }
+    }
+
+    /// `numAttribs` counts PAIRS - Mesa reads `numAttribs * 2` words per
+    /// config (glxext.c). Off by a factor of two and every config decodes
+    /// as garbage. Shared by `GetFBConfigs` and `GetFBConfigsSGIX`.
+    private func sendGLXFBConfigs() {
+        let configs = glxConfigs
+        let pairs = configs.first?.taggedProperties.count ?? 0
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writeU32(UInt32(configs.count))
+        fw.writeU32(UInt32(pairs))
+        fw.writePadding(16)
+        let extra = X11ByteWriter(littleEndian: littleEndian)
+        for config in configs {
+            for (attribute, value) in config.taggedProperties {
+                extra.writeU32(attribute)
+                extra.writeU32(value)
+            }
+        }
+        sendReply(fixed24: fw, extra: extra.bytes)
+    }
+
+    /// `glXQueryDrawable`'s answer. Mesa sizes its back buffer from the
+    /// width and height (the live geometry, not the creation size), and
+    /// texture-from-pixmap reads back the target and format it asked for.
+    private func sendGLXDrawableAttributes(_ id: UInt32) {
+        let drawable = glx.drawables[id] ?? id
+        let size = state.drawable(drawable).map { ($0.pixelWidth, $0.pixelHeight) }
+            ?? state.window(drawable).map { (Int($0.frame.width), Int($0.frame.height)) }
+            ?? (0, 0)
+        let info = glx.drawableInfo[id]
+        // A bare X window used as a GLX 1.2 drawable has no info: a window.
+        let typeBit = info?.typeBit ?? (state.window(drawable) != nil ? GLXToken.windowBit : GLXToken.pixmapBit)
+        var attributes: [(UInt32, UInt32)] = [
+            (GLXToken.width, UInt32(size.0)),
+            (GLXToken.height, UInt32(size.1)),
+            (GLXToken.screen, 0),
+            (GLXToken.drawableType, typeBit), // GLX_EXT_get_drawable_type
+            (GLXToken.fbconfigID, info?.fbconfigID ?? glxConfigs.first?.fbconfigID ?? 0),
+            (GLXToken.eventMask, 0),
+            (GLXToken.yInverted, 0), // as Xorg: drisw frames are top-down
+        ]
+        if typeBit == GLXToken.pbufferBit {
+            attributes += [(GLXToken.preservedContents, 1), (GLXToken.largestPbuffer, 0)]
+        }
+        for key in [GLXToken.textureTarget, GLXToken.textureFormat] {
+            if let value = info?.attributes[key] { attributes.append((key, value)) }
+        }
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writeU32(UInt32(attributes.count))
+        fw.writePadding(20)
+        let extra = X11ByteWriter(littleEndian: littleEndian)
+        for (attribute, value) in attributes {
+            extra.writeU32(attribute)
+            extra.writeU32(value)
+        }
+        sendReply(fixed24: fw, extra: extra.bytes)
+    }
+
+    /// A GLX pbuffer is an offscreen drawable, and in X11 that is simply a
+    /// pixmap the server owns: Mesa sends `GetGeometry` for the pbuffer id
+    /// straight after creating it and gives up ("failed to create
+    /// drawable") if it is not a real drawable. Blender starts exactly that
+    /// way, with a 1x1 pbuffer to get a context before it has a window.
+    private func createGLXPbuffer(_ pbuffer: UInt32, fbconfig: UInt32, width: Int, height: Int) {
+        let depth = glxConfigs.first { $0.fbconfigID == fbconfig }?.xDepth ?? 24
+        _ = state.makePixmap(id: pbuffer, width: max(1, width), height: max(1, height), depth: UInt8(depth))
+        glx.drawables[pbuffer] = pbuffer
+        glx.drawableInfo[pbuffer] = .init(typeBit: GLXToken.pbufferBit, fbconfigID: fbconfig, attributes: [:])
+    }
+
+    private func destroyGLXPbuffer(_ pbuffer: UInt32) {
+        glx.drawables.removeValue(forKey: pbuffer)
+        glx.drawableInfo.removeValue(forKey: pbuffer)
+        state.removePixmap(pbuffer)
+    }
+
+    /// Vendor-private GLX: the SGIX fbconfig/pbuffer API (what older CAD
+    /// and scientific GL code still calls - Mesa's `glXCreateContextWithConfigSGIX`
+    /// and `glXCreateGLXPbufferSGIX` go out as these), plus the direct-
+    /// rendering hints (swap interval, copy-sub-buffer, texture binding)
+    /// that Mesa's drisw already did client-side. Every body starts with
+    /// the vendor code and a context tag.
+    private func handleGLXVendorPrivate(minor: UInt8, r: X11ByteReader) {
+        guard r.remaining >= 8 else { return }
+        let vendorCode = r.readU32()
+        r.skip(4) // context tag / pad
+        let withReply = minor == GLXOpcode.vendorPrivateWithReply
+        switch vendorCode {
+        case 65540 where withReply: // GetFBConfigsSGIX
+            sendGLXFBConfigs()
+        case 65546 where withReply: // GetDrawableAttributesSGIX
+            sendGLXDrawableAttributes(r.readU32())
+        case 1024 where withReply: // QueryContextInfoEXT
+            let context = r.readU32()
+            guard let record = glx.contexts[context] else {
+                return sendGLXError(0, badValue: context, minor: minor) // GLXBadContext
+            }
+            let attributes: [(UInt32, UInt32)] = [
+                (GLXToken.fbconfigID, record.fbconfigID),
+                (GLXToken.screen, record.screen),
+                (GLXToken.renderType, GLXToken.rgbaType),
+            ]
+            let fw = X11ByteWriter(littleEndian: littleEndian)
+            fw.writeU32(UInt32(attributes.count))
+            fw.writePadding(20)
+            let extra = X11ByteWriter(littleEndian: littleEndian)
+            for (attribute, value) in attributes {
+                extra.writeU32(attribute)
+                extra.writeU32(value)
+            }
+            sendReply(fixed24: fw, extra: extra.bytes)
+        case 65541 where !withReply: // CreateContextWithConfigSGIX
+            let context = r.readU32()
+            let fbconfig = r.readU32()
+            let screen = r.readU32()
+            r.skip(8) // renderType, shareList
+            glx.contexts[context] = .init(isDirect: r.readU8() != 0, fbconfigID: fbconfig, screen: screen)
+        case 65542 where !withReply: // CreateGLXPixmapWithConfigSGIX
+            r.skip(4) // screen
+            let fbconfig = r.readU32()
+            let pixmap = r.readU32()
+            let glxPixmap = r.readU32()
+            glx.drawables[glxPixmap] = pixmap
+            glx.drawableInfo[glxPixmap] = .init(typeBit: GLXToken.pixmapBit, fbconfigID: fbconfig, attributes: [:])
+        case 65543 where !withReply: // CreateGLXPbufferSGIX
+            r.skip(4) // screen
+            let fbconfig = r.readU32()
+            let pbuffer = r.readU32()
+            let width = Int(r.readU32())
+            let height = Int(r.readU32())
+            createGLXPbuffer(pbuffer, fbconfig: fbconfig, width: width, height: height)
+        case 65544 where !withReply: // DestroyGLXPbufferSGIX
+            destroyGLXPbuffer(r.readU32())
+        default:
+            // Swap intervals (SGI/EXT/MESA), ChangeDrawableAttributesSGIX,
+            // Bind/ReleaseTexImageEXT, CopySubBufferMESA: hints a direct
+            // client already acted on itself. Silent if reply-less; a
+            // reply-bearing one we don't know gets the GLX error, never
+            // silence (which would hang the client).
+            if withReply { sendGLXError(8, badValue: vendorCode, minor: minor) } // GLXUnsupportedPrivateRequest
+        }
+    }
+
+    private func sendGLXContextTag(for context: UInt32) {
+        let tag: UInt32
+        if context == 0 {
+            tag = 0 // releasing the current context
+        } else if glx.contexts[context] != nil {
+            glx.nextContextTag += 1
+            tag = glx.nextContextTag
+        } else {
+            return sendGLXError(0, badValue: context, minor: GLXOpcode.makeContextCurrent)
+        }
+        let fw = X11ByteWriter(littleEndian: littleEndian)
+        fw.writeU32(tag)
+        fw.writePadding(20)
+        sendReply(fixed24: fw)
     }
 }

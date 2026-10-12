@@ -49,6 +49,27 @@ static uint32_t path_request(unsigned char *buf, uint8_t op, const char *path) {
     return (uint32_t)(3 + plen);
 }
 
+/* Writes `src` in `parent` (so it exists and has the parent's owner), then
+ * RENAMEs it over `dst` in the same directory. */
+static void rename_over(unsigned char *req, const char *parent, const char *src, const char *dst,
+                        uint32_t *len, unsigned char **resp) {
+    char sp[8608], dp[8608];
+    snprintf(sp, sizeof(sp), "%s/%s", parent, src);
+    snprintf(dp, sizeof(dp), "%s/%s", parent, dst);
+
+    uint32_t n = path_request(req, OP_WRITE, sp);
+    write_u64le(req + n, 0);
+    write_u32le(req + n + 8, 2);
+    memcpy(req + n + 12, "hi", 2);
+    free(roundtrip(req, n + 14, len));
+
+    n = path_request(req, OP_RENAME, sp);
+    size_t dlen = strlen(dp);
+    write_u16le(req + n, (uint16_t)dlen);
+    memcpy(req + n + 2, dp, dlen);
+    *resp = roundtrip(req, n + (uint32_t)(2 + dlen), len);
+}
+
 static int response_errno(const unsigned char *resp, uint32_t len) {
     return (len == 5 && resp[0] == 0x01) ? (int)read_u32le(resp + 1) : -1;
 }
@@ -91,6 +112,10 @@ int main(void) {
     char p[4096];
 
     #define AT(name) (snprintf(p, sizeof(p), "%s/%s", dir, name), p)
+    /* Its own buffer, so a path built here can be held across a call that
+     * builds another one. */
+    char q[8608]; /* holds a 4200-byte parent plus a name, without truncation */
+    #define PATH_IN(parent, name) (snprintf(q, sizeof(q), "%s/%s", parent, name), q)
     touch_with_age(AT("plain.txt"), "hello", 0);
     touch_with_age(AT("tab\tname"), "x", 0);
     touch_with_age(AT("new\nline"), "x", 0);
@@ -164,6 +189,60 @@ int main(void) {
     resp = roundtrip(req, n + 2, &len); /* mode field truncated */
     check(resp && response_errno(resp, len) == EINVAL, "truncated mode field answers EINVAL");
     free(resp);
+
+    /* Ownership. The daemon runs as root in a real guest, so everything it
+     * created used to belong to root - including files it put in someone's
+     * home directory, which they could then neither edit nor delete. The
+     * chowns are best effort, so unprivileged the only thing to assert is
+     * that nothing breaks; run this as root to check the rule itself. */
+    printf("ownership\n");
+    {
+        int privileged = geteuid() == 0;
+        char owned[4200];
+        snprintf(owned, sizeof(owned), "%s/owned", dir);
+        check(mkdir(owned, 0755) == 0, "a parent directory to inherit from");
+        if (privileged) check(chown(owned, 1001, 1001) == 0, "parent given a non-root owner");
+
+        n = path_request(req, OP_WRITE, PATH_IN(owned, "new.txt"));
+        write_u64le(req + n, 0);
+        write_u32le(req + n + 8, 3);
+        memcpy(req + n + 12, "abc", 3);
+        resp = roundtrip(req, n + 15, &len);
+        check(resp && len == 1 && resp[0] == 0x00, "WRITE creates a file");
+        free(resp);
+        check(stat(PATH_IN(owned, "new.txt"), &st) == 0 && st.st_size == 3, "with its contents");
+        if (privileged) check(st.st_uid == 1001 && st.st_gid == 1001, "a new file takes its parent's owner");
+
+        resp = roundtrip(req, path_request(req, OP_MKDIR, PATH_IN(owned, "sub2")), &len);
+        check(resp && len == 1 && resp[0] == 0x00, "MKDIR succeeds");
+        check(stat(PATH_IN(owned, "sub2"), &st) == 0, "directory created");
+        if (privileged) check(st.st_uid == 1001 && st.st_gid == 1001, "a new directory takes its parent's owner");
+        free(resp);
+
+        /* An overwrite arrives as a temp file plus a rename, and the rename
+         * replaces the inode - so without care the file would silently
+         * change hands on every save. */
+        if (privileged) {
+            check(chown(PATH_IN(owned, "new.txt"), 1002, 1002) == 0, "existing file given a different owner");
+            /* An upload temp: the host's own overwrite, which must leave the
+             * saved file belonging to whoever owned it before. */
+            rename_over(req, owned, PUT_TEMP_PREFIX "abc" PUT_TEMP_SUFFIX, "new.txt", &len, &resp);
+            check(resp && len == 1 && resp[0] == 0x00, "RENAME over an existing file succeeds");
+            free(resp);
+            check(stat(PATH_IN(owned, "new.txt"), &st) == 0 && st.st_uid == 1002 && st.st_gid == 1002,
+                  "an upload overwrite keeps the original file's owner");
+
+            /* A rename the person asked for is a real `mv`, and `mv` keeps
+             * the MOVED file's owner, not the replaced one's. */
+            rename_over(req, owned, "moved.txt", "new.txt", &len, &resp);
+            check(resp && len == 1 && resp[0] == 0x00, "a plain RENAME succeeds");
+            free(resp);
+            check(stat(PATH_IN(owned, "new.txt"), &st) == 0 && st.st_uid == 1001 && st.st_gid == 1001,
+                  "a plain move keeps the moved file's owner, not the replaced one's");
+        } else {
+            printf("  (skipped the root-only ownership checks)\n");
+        }
+    }
 
     printf("capability probing\n");
     req[0] = 0x7F;

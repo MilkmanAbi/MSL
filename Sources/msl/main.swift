@@ -1,5 +1,7 @@
 import Foundation
+import CryptoKit
 import MSLCore
+import PublicMSL
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -52,6 +54,23 @@ func connectToDaemon() -> Int32 {
 /// ("OK ..." / "ERROR ..."), exiting with a matching status code. Used by
 /// every subcommand except the interactive shell session, which has its
 /// own response handling (a status byte + fd handoff, not a text line).
+/// Like `runControl`, for a request that legitimately takes minutes.
+///
+/// The default control timeout is nowhere near enough to copy a
+/// multi-gigabyte disk into a container, and a client that gave up
+/// half way would report a failure while the daemon carried on - the worst
+/// of both, since the operation is the one that moves somebody's only copy
+/// of their machine.
+func runControlWithTimeout(_ request: DaemonProtocol.ControlRequest,
+                           timeout: TimeInterval) -> Never {
+    guard let reply = sendControlRequestMultiline(request, timeout: timeout) else {
+        FileHandle.standardError.write("msl: no response from mslhd\n".data(using: .utf8)!)
+        exit(1)
+    }
+    print(reply.replacingOccurrences(of: "ERROR ", with: "msl: "))
+    exit(reply.hasPrefix("OK") ? 0 : 1)
+}
+
 func runControl(_ request: DaemonProtocol.ControlRequest) -> Never {
     let fd = connectToDaemon()
     defer { close(fd) }
@@ -102,6 +121,36 @@ func sendControlRequest(_ request: DaemonProtocol.ControlRequest) -> String? {
     defer { close(fd) }
     _ = request.encode().withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
     return DaemonProtocol.readLine(fd: fd)
+}
+
+/// The same, but for a reply that has more than one line in it.
+///
+/// `readLine` stops at the first newline, which quietly truncated every
+/// multi-line answer: `msl public keys` showed one key however many were
+/// authorized, and the notify list showed nobody at all. It looked like the
+/// data was missing rather than like the reply was cut in half, which is
+/// why it went unnoticed with a single entry.
+///
+/// Safe to read to the end because mslhd closes the connection once it has
+/// answered these - checked against the running daemon rather than assumed,
+/// since reading to EOF on a connection it held open would hang.
+func sendControlRequestMultiline(_ request: DaemonProtocol.ControlRequest,
+                                 timeout: TimeInterval = 60) -> String? {
+    guard let fd = bestEffortConnectToDaemon() else { return nil }
+    defer { close(fd) }
+    var tv = timeval(tv_sec: Int(timeout), tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+    _ = request.encode().withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+    var response = Data()
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let count = read(fd, &buffer, buffer.count)
+        if count <= 0 { break }
+        response.append(contentsOf: buffer[0..<count])
+    }
+    guard !response.isEmpty else { return nil }
+    let text = String(decoding: response, as: UTF8.self)
+    return text.hasSuffix("\n") ? String(text.dropLast()) : text
 }
 
 /// Fire-and-forget notification that this session's relay loop has ended -
@@ -189,6 +238,15 @@ func readShellFrame(fd: Int32) -> (type: ShellProtocol.FrameType, payload: [UInt
 /// pointer, which can't capture context.
 var needsResize: Int32 = 0
 
+/// The live shell connection, shared with the writer thread.
+///
+/// A reattach replaces the connection underneath a session that is already
+/// running, so the writer cannot capture the fd once - it reads this each
+/// time round. `-1` means "detached, nothing to write to": input typed
+/// while an instance is hibernated is dropped rather than sent into a dead
+/// socket, which is what the user sees anyway.
+nonisolated(unsafe) var sessionDataFD: Int32 = -1
+
 /// Runs a shell session against `instance`: interactive (a real login
 /// shell, full job control via a genuine pty on the guest side - see
 /// `Guest/init/shellinit.c`) when `command` is empty, or a single one-shot
@@ -244,7 +302,8 @@ func runShellSession(instance: String, distro: GuestDistro, command: String, use
     // bare command. A failure never stops the shell - it only means GUI
     // apps won't open from it, which is said once, dimmed.
     var guestCommand = command
-    if ProcessInfo.processInfo.environment["MSL_NO_DISPLAY"] == nil, !command.hasPrefix("DISPLAY=") {
+    if ProcessInfo.processInfo.environment["MSL_NO_DISPLAY"] == nil,
+       !command.hasPrefix("DISPLAY="), !command.hasPrefix("export DISPLAY=") {
         close(connectToDaemon()) // installs the tools and starts mslhd if this is the first run
         do {
             try LinuxAppLauncher.prepareDisplay(instance: instance, distro: distro)
@@ -254,6 +313,13 @@ func runShellSession(instance: String, distro: GuestDistro, command: String, use
             }
         }
         if !command.isEmpty { guestCommand = GuestIntegration.oneShotDisplayPrefix() + command }
+    }
+
+    // Tell the guest what this Mac terminal can display (see
+    // `TerminalProfile`): without it every guest shell ran with no TERM.
+    if let profile = TerminalProfile.detect(environment: ProcessInfo.processInfo.environment,
+                                            interactive: isatty(STDIN_FILENO) == 1 && isatty(STDOUT_FILENO) == 1) {
+        guestCommand = command.isEmpty ? profile.interactiveCommand : profile.exports + "\n" + guestCommand
     }
 
     let controlFD = connectToDaemon()
@@ -272,7 +338,7 @@ func runShellSession(instance: String, distro: GuestDistro, command: String, use
         exit(1)
     }
 
-    let dataFD: Int32
+    var dataFD: Int32
     do {
         dataFD = try FileDescriptorPassing.receive(from: controlFD)
     } catch {
@@ -299,13 +365,24 @@ func runShellSession(instance: String, distro: GuestDistro, command: String, use
     // completely unmodified - this is a banner in front of a native shell,
     // not a fake prompt standing in for one.
     if command.isEmpty {
-        print("\u{1B}[2J\u{1B}[H", terminator: "")
+        // Scrollback and all - see `TerminalClear`. Erasing the screen on
+        // its own looked right and was not: Terminal.app pushes what was on
+        // screen into the scrollback, so scrolling up after starting a
+        // session showed the shell's own "last login", the command line,
+        // and a screenful of blank rows above the banner.
+        print(TerminalClear.full, terminator: "")
         print("\u{1B}[1;32mmsl\u{1B}[0m@\u{1B}[1;36m\(distro.rawValue)\u{1B}[0m")
         // Dimmed, and never the same twice running - see `Greeter`. Below
         // the banner rather than above it so the line that actually tells
-        // you which machine you are on stays first.
-        if let greeting = Greeter.nextGreeting() {
-            print("\u{1B}[2m\(greeting.text)\u{1B}[0m")
+        // you which machine you are on stays first. Whether that is a line,
+        // the cat, the cat saying the line, or nothing at all is
+        // `PersonalityBanner`'s decision, shared with the app so the
+        // preview there is the same thing that prints here.
+        let personality = PersonalitySettingsStore.load()
+        if let banner = PersonalityBanner.render(settings: personality,
+                                                 greeting: Greeter.nextGreeting()?.text,
+                                                 columns: Int(currentWindowSize().cols)) {
+            print("\u{1B}[2m\(banner)\u{1B}[0m")
         }
         print("")
         // `print()` goes through stdio's own buffering (block-buffered
@@ -355,7 +432,12 @@ func runShellSession(instance: String, distro: GuestDistro, command: String, use
     // EXEC must be the very first frame shellinit sees on this connection -
     // send it before starting the relay so there's no chance a stdin byte
     // races ahead of it.
-    writeFull(fd: dataFD, bytes: ShellProtocol.encodeExec(command: guestCommand, rows: rows, cols: cols, user: user))
+    // Only an interactive shell is worth reattaching to. A one-shot command
+    // has a result the caller is waiting on, and silently waiting out a
+    // hibernate instead of returning would hang somebody's script.
+    let sessionID = command.isEmpty ? ShellProtocol.newSessionID() : ""
+    writeFull(fd: dataFD, bytes: ShellProtocol.encodeExec(command: guestCommand, rows: rows, cols: cols, user: user,
+                                            sessionID: sessionID))
 
     // stdin -> guest, framed as DATA, with RESIZE frames spliced in on
     // SIGWINCH.
@@ -369,7 +451,9 @@ func runShellSession(instance: String, distro: GuestDistro, command: String, use
             if needsResize == 1 {
                 needsResize = 0
                 let (r, c) = currentWindowSize()
-                writeFull(fd: dataFD, bytes: ShellProtocol.encodeResize(rows: r, cols: c))
+                if sessionDataFD >= 0 {
+                    writeFull(fd: sessionDataFD, bytes: ShellProtocol.encodeResize(rows: r, cols: c))
+                }
             }
 
             guard ready > 0, pfd.revents & Int16(POLLIN) != 0 else { continue }
@@ -386,12 +470,15 @@ func runShellSession(instance: String, distro: GuestDistro, command: String, use
                 // real terminal/ssh session behaves when input is
                 // exhausted - important for anything that pipes a command
                 // in and expects the session to actually end, not hang.
-                shutdown(dataFD, Int32(SHUT_WR))
+                if sessionDataFD >= 0 { shutdown(sessionDataFD, Int32(SHUT_WR)) }
                 break
             }
-            writeFull(fd: dataFD, bytes: ShellProtocol.encodeData(buf[0..<n]))
+            if sessionDataFD >= 0 {
+                writeFull(fd: sessionDataFD, bytes: ShellProtocol.encodeData(buf[0..<n]))
+            }
         }
     }
+    sessionDataFD = dataFD
     writer.start()
 
     // guest -> stdout, until EXIT (normal end of session) or the
@@ -400,19 +487,58 @@ func runShellSession(instance: String, distro: GuestDistro, command: String, use
     var exitCode: Int32 = 1
     var sawExit = false
     var sawOutput = false
-    while true {
-        guard let frame = readShellFrame(fd: dataFD) else { break }
-        switch frame.type {
-        case .data:
-            sawOutput = true
-            writeFull(fd: STDOUT_FILENO, bytes: frame.payload)
-        case .exit:
-            exitCode = Int32(frame.payload.first ?? 1)
+    /// Set when the guest answers EXEC with a `session` frame, which only a
+    /// `shellinit` that understands detachable sessions does. Its absence
+    /// is the whole backward-compatibility story: an older guest simply
+    /// never sets this and the loop below ends at the first EOF, exactly as
+    /// it always did.
+    var liveSession: (id: String, port: UInt32)?
+
+    relay: while true {
+        while true {
+            guard let frame = readShellFrame(fd: dataFD) else { break }
+            switch frame.type {
+            case .data:
+                sawOutput = true
+                writeFull(fd: STDOUT_FILENO, bytes: frame.payload)
+            case .exit:
+                exitCode = Int32(frame.payload.first ?? 1)
+                sawExit = true
+            case .session:
+                liveSession = ShellProtocol.parseSession(frame.payload)
+            case .exec, .resize, .attach, .detach:
+                break // host->guest-only frame types - shellinit never sends these
+            }
+        }
+
+        // The shell itself ended, so there is nothing to come back to.
+        if sawExit { break relay }
+
+        // The connection went, but the shell did not. A hibernate saves the
+        // guest's whole RAM: the shell, its pty and its children are all
+        // still there on the other side, and only the vsock died. So wait,
+        // and pick the same session back up rather than silently abandoning
+        // it - which is what used to happen, leaving a live shell stranded
+        // in the guest forever.
+        guard let session = liveSession else { break relay }
+        switch awaitReattach(instance: instance, session: session, restoring: originalTermios) {
+        case .reattached(let next):
+            close(dataFD)
+            dataFD = next
+            sessionDataFD = next
+            continue relay
+        case .ended:
+            // A deliberate end - `poweroff`, or the person pressing q. Not
+            // the "connection closed unexpectedly" case, and saying so would
+            // turn a normal shutdown into something that looks broken.
             sawExit = true
-        case .exec, .resize:
-            break // host->guest-only frame types - shellinit never sends these
+            exitCode = 0
+            break relay
+        case .abandoned:
+            break relay
         }
     }
+
     // A dropped connection with no EXIT frame ever seen used to exit(1)
     // completely silently - genuinely indistinguishable from a real command
     // that just happened to exit 1. Surfacing it (using the ShellProtocolError
@@ -449,9 +575,9 @@ func explainIfUserMissing(instance: String, distro: GuestDistro, user: String) {
 
     var message = "msl: there's no Linux user '\(user)' in \(instance)."
     let registry = DefaultUserRegistry(path: defaultUsersRegistryURL)
-    if requestedUser.isEmpty, registry.defaultUser(for: distro) == user {
-        try? registry.forgetDefaultUser(for: distro)
-        message += " MSL remembered it from an earlier \(distro.rawValue) install and has now forgotten it -"
+    if requestedUser.isEmpty, registry.defaultUser(forInstance: instance) == user {
+        try? registry.forgetDefaultUser(forInstance: instance)
+        message += " MSL remembered it from an earlier \(instance) session and has now forgotten it -"
         message += " start the session again to create your account."
     } else {
         message += " Pick an existing account, or use root: msl \(instance) -u root"
@@ -517,7 +643,8 @@ func runOneShotCommand(instance: String, distro: GuestDistro, command: String, u
             // already printing everything, never returning to a prompt.
             exitCode = Int32(frame.payload.first ?? 1)
             break loop
-        case .exec, .resize:
+        // A one-shot sends no session id, so `.session` never arrives here.
+        case .exec, .resize, .session, .attach, .detach:
             break
         }
     }
@@ -587,9 +714,10 @@ let mslMascot = #"""
 """#
 
 func runFirstUserSetupIfNeeded(instance: String, distro: GuestDistro) -> String? {
+    let personality = PersonalitySettingsStore.load()
     print("""
 
-    \(mslMascot)
+    \(personality.kitty ? mslMascot : "")
 
     Welcome to MSL - \(distro.rawValue)!
     Please create a default UNIX user account. The username does not need
@@ -618,7 +746,7 @@ func runFirstUserSetupIfNeeded(instance: String, distro: GuestDistro) -> String?
         )
         switch LinuxUserSetup.outcome(exitCode: exitCode, output: output, username: username) {
         case .created(let warning):
-            try? LinuxUserSetup.registry().setDefaultUser(username, for: distro)
+            try? LinuxUserSetup.registry().setDefaultUser(username, forInstance: instance)
             print("User '\(username)' created - your login for \(distro.rawValue), and an administrator: sudo asks for this password.")
             if let warning { print("Note: \(warning)") }
             print("")
@@ -707,12 +835,46 @@ func ensureXQuartzRunning() {
 ///
 /// The test-only entries are deliberately included: `cage-input-test` is
 /// exactly the kind of long name that gets mistyped.
-let mslCommands = [
-    "apps", "cage-bridge-test", "cage-input-test", "cage-view", "gui",
-    "gui-native", "help", "hibernate", "images", "install", "install-tools",
-    "doctor", "instances", "keyboard", "list", "ls", "new", "power-test", "remove", "remove-distro", "resume", "files",
-    "snapshot", "ssh", "status", "storage", "suspend", "uninstall", "resources", "config",
-]
+
+/// Finds the one app a name means, or explains why it is ambiguous.
+///
+/// Matching on `name` alone stopped working the moment an instance had the
+/// same application from two packaging systems: with a Flatpak Calculator
+/// and a Snap Calculator installed, `msl apps install Milk Calculator`
+/// silently picked whichever came first, and there was no way to ask for
+/// the other one at all. `qualifiedName` ("Calculator (Snap)") is how the
+/// app itself distinguishes them, so the CLI accepts that too - and when a
+/// name really is ambiguous it says so instead of guessing.
+func resolveApp(named wanted: String, in apps: [LinuxApp], instance: String) -> LinuxApp {
+    let needle = wanted.lowercased()
+    func fail(_ message: String) -> Never {
+        FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
+        exit(1)
+    }
+    if let exact = apps.first(where: { $0.qualifiedName.lowercased() == needle }) { return exact }
+
+    let byName = apps.filter { $0.name.lowercased() == needle }
+    let candidates = byName.isEmpty
+        ? apps.filter { $0.name.lowercased().contains(needle) || $0.qualifiedName.lowercased().contains(needle) }
+        : byName
+    switch candidates.count {
+    case 0:
+        fail("msl: no application matching '\(wanted)' in \(instance)")
+    case 1:
+        return candidates[0]
+    default:
+        let list = candidates.map { "       msl apps ... \($0.qualifiedName)" }.joined(separator: "\n")
+        fail("""
+        msl: '\(wanted)' matches \(candidates.count) applications in \(instance) - name one exactly:
+        \(list)
+        """)
+    }
+}
+
+/// Every command, from `CLICommands` - shared with `ArgumentSplitter` (which
+/// needs to know which ones have a guest command after them) and with
+/// instance creation (which refuses to name an instance after one).
+let mslCommands = CLICommands.sorted
 
 // This CLI forwards a command line into the guest, so it must stop looking
 // for its own options where the guest's command starts - see
@@ -721,7 +883,7 @@ let mslCommands = [
 // die with "unknown distro '/tmp'" and quietly ate the `-u 1000` out of
 // `msl work docker run -u 1000 img`.
 let splitArguments = ArgumentSplitter.split(
-    Array(CommandLine.arguments.dropFirst()), knownCommands: Set(mslCommands))
+    Array(CommandLine.arguments.dropFirst()), knownCommands: CLICommands.all)
 
 // `explicitDistro` (vs. a plain default) matters for the WSL-like
 // ergonomic below: `msl fedora` should just work, no `--distro fedora`
@@ -746,7 +908,12 @@ let manifestURLOverride: String? = splitArguments.manifest
 let requestedUser = splitArguments.user ?? ""
 
 var rawArgs = splitArguments.remainder
-let args = rawArgs
+// `let` until the alias pass below, which is the only thing that rewrites it.
+var args = rawArgs
+// A terminal does not need a picture, but the note it leaves behind is what
+// the screen reads if the app is what shows it next.
+CrashScreen.install(for: .cli, viewer: "/Applications/MSL.app/Contents/MacOS/MSLApp")
+
 let defaultInstance = InstanceRegistry.defaultInstanceName
 
 /// `msl fedora` and `msl fedora --distro fedora` are equivalent - an
@@ -766,6 +933,21 @@ func resolvedDistro(forInstance name: String) -> GuestDistro {
 /// through this - all registration/mutation stays server-side in
 /// `DaemonServer`.
 let registryForLookup = InstanceRegistry(path: URL(fileURLWithPath: DaemonProtocol.defaultInstanceRegistryPath()))
+
+// A guessed command (`msl start Milk`) is translated into MSL's own word
+// rather than becoming an instance called "start" - see `CommandAliases`.
+// Placed here because the registry is what decides it: an instance really
+// named `run` outranks the alias, always.
+do {
+    let resolved = CommandAliases.resolve(args, isTaken: { registryForLookup.distro(for: $0) != nil })
+    if resolved.arguments != args {
+        args = resolved.arguments
+        rawArgs = resolved.arguments
+        if let note = resolved.note {
+            FileHandle.standardError.write((note + "\n").data(using: .utf8)!)
+        }
+    }
+}
 
 /// Plain `msl` (no instance named): picks up the most recently used
 /// instance, once more than one is installed, instead of always landing on
@@ -788,34 +970,229 @@ func startupInstance() -> String {
     return existing.first?.key ?? defaultInstance
 }
 
-/// `msl` on a Mac with nothing installed: every distro that can be
-/// downloaded, with its release and download size, from the live manifest.
-func printAvailableDistros() {
-    var out = "msl: no installed distros and no created instances.\n\n"
-    let manifestURL = DistroInstaller.resolveManifestURLString(override: manifestURLOverride)
-    if let manifest = DistroCatalog.fetch(from: manifestURL) {
-        let entries = DistroCatalog.entries(from: manifest)
-        let nameWidth = entries.map { $0.distro.count }.max() ?? 8
-        let titleWidth = entries.map { "\($0.name) \($0.release)".count }.max() ?? 20
-        out += "Available distros:\n"
-        for entry in entries {
-            let title = "\(entry.name) \(entry.release)"
-            out += "  " + entry.distro.padding(toLength: nameWidth + 3, withPad: " ", startingAt: 0)
-                + title.padding(toLength: titleWidth + 3, withPad: " ", startingAt: 0)
-                + DiskStorage.format(entry.downloadBytes) + " download\n"
-        }
-    } else {
-        let names = GuestDistro.allCases.filter { !$0.isCustom }.map(\.rawValue).joined(separator: ", ")
-        out += "Available distros: \(names)\n(couldn't reach the image catalog for versions - are you online?)\n"
+/// What `msl update` was asked to do - see the `update` case.
+enum UpdateAction { case check, download }
+
+/// `msl update`. The CLI face of the same core the app's update prompt uses.
+func runUpdate(_ action: UpdateAction) -> Never {
+    let current = UpdateCheck.Version(MSLVersion.marketing)!
+    print("\(MSLVersion.display) - checking for updates")
+
+    // A deliberately unthrottled, unsilenced check: somebody who typed the
+    // command is asking, and "I checked yesterday" is not an answer to a
+    // question asked now. That is the same rule the app's
+    // "Check for Updates..." menu item follows.
+    let decision = runBlocking { await UpdateCheck.run(current: current, state: UpdateCheck.State()).0 }
+
+    guard let decision else {
+        FileHandle.standardError.write("msl: couldn't check just now - try again in a moment\n".data(using: .utf8)!)
+        exit(1)
     }
-    out += "\nInstall one with msl install <distro>, for example:\n\n    msl install debian\n"
-    FileHandle.standardError.write(out.data(using: .utf8)!)
+    switch decision.kind {
+    case .unknown:
+        FileHandle.standardError.write("msl: couldn't reach GitHub - are you online?\n".data(using: .utf8)!)
+        exit(1)
+    case .upToDate:
+        print("You have the newest MSL.")
+        for other in decision.alsoAvailable {
+            print("  (\(other.tag) exists but needs MSL \(other.minimum?.description ?? "newer") or later)")
+        }
+        exit(0)
+    case .advisory:
+        // Nothing installable: this copy is below the release's minimum.
+        if let release = decision.release {
+            print("MSL \(release.version) is out, but it needs MSL \(release.minimum?.description ?? "newer") or later.")
+            print("See \(release.page.absoluteString)")
+        }
+        exit(0)
+    case .suppressed, .update:
+        break
+    }
+    guard let release = decision.release else { exit(0) }
+
+    print("MSL \(release.version) is available\(decision.urgent ? " - unsafe-behaviour patch" : "").")
+    if let info = runBlocking({ await UpdateCheck.fetchInfo(for: release.tag) }), !info.isEmpty {
+        print("")
+        for line in info.split(separator: "\n") { print("  \(line)") }
+        print("")
+    }
+
+    guard action != .check else {
+        print("  msl update --download   put the installer in your Downloads")
+        exit(0)
+    }
+
+    // The download, always first and always complete before anything is
+    // removed - OIS's "a failure anywhere leaves the current install
+    // untouched". `msl update --install` that cannot download is a no-op,
+    // not a broken Mac.
+    let fetched: UpdateDownload.Fetched
+    do {
+        var lastLine = ""
+        fetched = try UpdateDownload.fetch(release, transfer: { progress in
+            // One line, rewritten - a progress bar in a pipe is noise.
+            guard isatty(STDOUT_FILENO) != 0 else { return }
+            let line = "  \(progress.description)"
+            guard line != lastLine else { return }
+            lastLine = line
+            print("\r\(line)", terminator: "")
+            fflush(stdout)
+        }, log: { line in
+            if isatty(STDOUT_FILENO) != 0 { print("\r\u{1B}[K", terminator: "") }
+            print("  \(line)")
+        })
+    } catch {
+        FileHandle.standardError.write("msl: \(error.localizedDescription)\n".data(using: .utf8)!)
+        FileHandle.standardError.write("     Nothing was changed. \(UpdateCheck.releasesPage.absoluteString)\n".data(using: .utf8)!)
+        exit(1)
+    }
+    if isatty(STDOUT_FILENO) != 0 { print("\r\u{1B}[K", terminator: "") }
+    let how = fetched.verification == .checksum
+        ? "checksum verified"
+        : "verified as MSL \(release.version)"
+    print("  \(fetched.url.path)  (\(how))")
+
+    print("\nOpen that package to install it - it closes your instances and replaces MSL in place.")
+    exit(0)
+}
+
+/// Instances that are actually live right now, for the warning before an
+/// update. Empty when the daemon is not running - every VM lives inside it.
+func runningInstanceNames() -> [String] {
+    guard DaemonClient.isRunning() else { return [] }
+    return registryForLookup.entries().map(\.key).sorted().filter { name in
+        let status = DaemonClient.send(.status(instance: name), timeout: 10)
+        return status == "OK running" || status == "OK paused"
+    }
+}
+
+/// Runs an async call from this synchronous CLI.
+func runBlocking<T>(_ work: @escaping () async -> T) -> T {
+    let semaphore = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var result: T?
+    Task { result = await work(); semaphore.signal() }
+    semaphore.wait()
+    return result!
+}
+
+/// How many instances exist of each distro, by distro name - the right-hand
+/// column of the distro table.
+func instanceCountsByDistro() -> [String: Int] {
+    var counts: [String: Int] = [:]
+    for (_, distro) in registryForLookup.entries() {
+        counts[distro.rawValue, default: 0] += 1
+    }
+    return counts
+}
+
+/// `msl distros` and `msl list online`: every distro MSL can install, with a
+/// tick against the ones already here.
+///
+/// Fetches the catalog with a short timeout and only one source, not the
+/// install path's two-hosts-twice: this is a listing, and someone who typed
+/// it is watching the terminal. The names and what this Mac has are known
+/// offline, so a failed fetch costs the releases and sizes, not the table.
+func printDistroTable(header: Bool = true) {
+    // `fetch` tries the sources in order with this timeout each, so the
+    // worst case is both hosts down at 5s apiece - fine for a listing
+    // somebody is watching, unlike the install path's two-tries-per-host.
+    // Listing is a read, and a refused override must not take the table
+    // down with it - MSL's own sources are what `msl distros` is for.
+    let listingSources = (try? DistroInstaller.resolveSources(override: manifestURLOverride))
+        ?? DistroInstaller.defaultSources
+    let catalog = DistroCatalog.fetch(from: listingSources, timeout: 5)
+    let rows = DistroListing.rows(catalog: catalog,
+                                  instanceCounts: instanceCountsByDistro(),
+                                  isInstalled: { DistroInstallation.isInstalled($0) })
+    if header { print("Distros MSL can install:") }
+    print(DistroListing.table(rows), terminator: "")
+    if catalog == nil {
+        print("(couldn't reach the image catalog, so no releases or sizes - are you online?)")
+    }
+    print("\nInstall one with msl install <distro>, for example:\n\n    msl install debian")
+}
+
+/// What plain `msl` prints - see `CLIOverview`. Registry only: no daemon
+/// connection and no network, so typing `msl` never starts anything.
+func printOverview() {
+    let entries = registryForLookup.entries()
+    // `startupInstance()`, not `lastUsed()`: that is the one `msl run` with
+    // no name actually opens, and the two differ whenever the last-used
+    // instance has since been removed. Marking the wrong row is worse than
+    // marking none - but only mark it when it is a row that exists, since on
+    // a first-ever run this is the built-in default and nothing is listed.
+    let opens = startupInstance()
+    let lines = entries
+        .sorted { $0.key < $1.key }
+        .map { CLIOverview.InstanceLine(name: $0.key, distro: $0.value.rawValue,
+                                        isLastUsed: $0.key == opens) }
+    print(CLIOverview.render(instances: lines,
+                             styled: isatty(STDOUT_FILENO) != 0,
+                             emptyHint: "See them all with msl distros.\n"),
+          terminator: "")
+}
+
+/// Whether `name` can be opened as an instance, and why not if it can't.
+///
+/// Guards the two places that open a session by name - `msl run <name>` and
+/// the bare-name fallthrough - so neither can register junk. MSL creates an
+/// instance by being asked to use one, which is the ergonomic that makes
+/// `msl fedora` work on a fresh install; the cost was that **any** word MSL
+/// didn't recognise became a real instance with a real disk. `msl about`
+/// downloaded Alpine and bootstrapped it (2026-10-01).
+///
+/// The rule: a name that already exists is always openable, and a name that
+/// doesn't is created only when the distro was said out loud - either
+/// because the name *is* a distro (`msl fedora`) or because `--distro` was
+/// passed (`msl work --distro debian`). Both are documented forms and both
+/// keep working. Everything else is a typo until `msl new` says otherwise.
+func openableRefusal(_ name: String) -> String? {
+    if registryForLookup.distro(for: name) != nil { return nil }
+    if let refusal = CLICommands.nameRefusal(name) {
+        return refusal
+    }
+    if GuestDistro(rawValue: name) != nil || explicitDistro != nil { return nil }
+    var message = "there's no instance called '\(name)'."
+    if let suggestion = CommandSuggestion.nearest(name, in: mslCommands) {
+        message += " Did you mean `msl \(suggestion)`?"
+    }
+    message += """
+
+         Make it:        msl new \(name)
+         What you have:  msl list
+    """
+    return message
+}
+
+/// A Mac with nothing installed: what can be downloaded.
+///
+/// The same table `msl distros` prints - one renderer, since the version that
+/// greets an empty Mac and the version someone asks for are the same facts.
+func printAvailableDistros() {
+    print("Nothing installed yet.\n")
+    printDistroTable(header: false)
 }
 
 /// Stops before a session on a distro whose image isn't on this Mac, with the
 /// command that fixes it - rather than asking for a Linux account on a disk
 /// that doesn't exist.
 func requireInstalled(instance: String, distro: GuestDistro) {
+    // **An instance that already has its own disk is installed**, whatever
+    // the distro's base says. Those are two different questions now
+    // (`InstanceDisk`): the base is what a *new* instance would be cloned
+    // from, and deleting it - which the migration to per-instance disks does
+    // - must not strand the instances that were already running.
+    // An instance with its own disk has its *filesystem*, which is not the
+    // same as being bootable: the kernel and initramfs are shared by every
+    // distro and arrive with the first one downloaded. A shipment brings the
+    // filesystem and nothing else, so this short-circuit let an installed
+    // shipment reach Virtualization and fail with a raw boot-loader error.
+    if InstanceDisk.exists(instance: instance) {
+        guard let reason = distro.bootFiles(instance: instance).missingDescription(distro: distro)
+        else { return }
+        FileHandle.standardError.write("msl: \(instance) can't start - \(reason)\n".data(using: .utf8)!)
+        exit(1)
+    }
     guard !distro.isCustom, !DistroInstallation.isInstalled(distro) else { return }
     // A brand-new Mac: nothing to open, so show what can be installed rather
     // than naming one distro (plain `msl` used to say "alpine isn't installed
@@ -827,10 +1204,12 @@ func requireInstalled(instance: String, distro: GuestDistro) {
     }
     var message = "msl: \(distro.rawValue) isn't installed yet. Install it with:\n\n    msl install \(distro.rawValue)\n"
     let ready = registryForLookup.entries()
-        .filter { $0.key != instance && ($0.value.isCustom || DistroInstallation.isInstalled($0.value)) }
+        .filter { $0.key != instance
+                  && (InstanceDisk.exists(instance: $0.key)
+                      || $0.value.isCustom || DistroInstallation.isInstalled($0.value)) }
         .map(\.key).sorted()
     if !ready.isEmpty {
-        message += "\nor open one you already have: " + ready.map { "msl \($0)" }.joined(separator: ", ") + "\n"
+        message += "\nor open one you already have: " + ready.map { "msl run \($0)" }.joined(separator: ", ") + "\n"
     }
     FileHandle.standardError.write(message.data(using: .utf8)!)
     exit(1)
@@ -860,7 +1239,7 @@ func resolveUser(instance: String, distro: GuestDistro, command: String) -> Stri
     requireInstalled(instance: instance, distro: distro)
     if !requestedUser.isEmpty { return requestedUser }
     let userRegistry = DefaultUserRegistry(path: defaultUsersRegistryURL)
-    if let remembered = userRegistry.defaultUser(for: distro) { return remembered }
+    if let remembered = userRegistry.defaultUser(forInstance: instance) { return remembered }
     guard command.isEmpty, isatty(STDIN_FILENO) != 0, isatty(STDOUT_FILENO) != 0 else { return "" }
     return runFirstUserSetupIfNeeded(instance: instance, distro: distro) ?? ""
 }
@@ -912,10 +1291,737 @@ func performShutdown(instances: [String]) {
     }
 }
 
+/// Prints to stderr and stops. The existing `fail` is nested inside another
+/// command's body, so it is not in scope out here.
+func usbFail(_ message: String) -> Never {
+    FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
+    exit(1)
+}
+
+/// `msl usb list`, aligned into columns here rather than in the daemon -
+/// the daemon has no idea how wide this terminal is.
+func runUSBList() {
+    guard let reply = sendControlRequest(.usbList) else {
+        usbFail("msl: couldn't reach mslhd")
+    }
+    guard reply.hasPrefix("OK") else {
+        print(reply)
+        return
+    }
+    let body = String(reply.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+    let rows = body.split(separator: "\n").map { $0.split(separator: "\t", omittingEmptySubsequences: false).map(String.init) }
+    let headers = ["LOCATION", "ID", "macOS DRIVER", "ATTACHED TO", "DEVICE"]
+    let table = [headers] + rows.filter { $0.count == 5 }
+    // Last column unpadded: it is the free-text name and nothing follows it.
+    var widths = [Int](repeating: 0, count: 5)
+    for row in table {
+        for (index, cell) in row.enumerated() where index < 4 {
+            widths[index] = max(widths[index], cell.count)
+        }
+    }
+    for (number, row) in table.enumerated() {
+        var line = ""
+        for (index, cell) in row.enumerated() {
+            line += index < 4 ? cell.padding(toLength: widths[index] + 2, withPad: " ", startingAt: 0) : cell
+        }
+        print(number == 0 && isatty(STDOUT_FILENO) != 0 ? "\u{1B}[1m\(line)\u{1B}[0m" : line)
+    }
+    print("")
+    print("A device with no macOS driver is passed through directly.")
+    print("One macOS has a driver for is taken from it, which needs your password.")
+}
+
+/// `msl usb attach`.
+///
+/// The whole point of this function is that the person never types `sudo`.
+/// It asks the daemon which tier the device needs first: a device macOS has
+/// never heard of is attached with no privileges at all and this returns
+/// immediately, and only a device macOS owns escalates - with an
+/// explanation of why, before the password prompt rather than after it.
+func runUSBAttach(device: String, instance: String, forceRelay: Bool = false) {
+    // `sudo msl` does not work and must not look as though it half does:
+    // every MSL path resolves through NSHomeDirectory(), which under sudo is
+    // /var/root - so it would install a second set of tools there, fail to
+    // find the daemon, and find no instances. MSL escalates the one small
+    // program that needs it, itself.
+    if ProcessInfo.processInfo.environment["SUDO_UID"] != nil {
+        usbFail("""
+        msl: don't run msl with sudo - it would look for your instances in /var/root and find none.
+
+          Run `msl usb attach \(device)` as yourself. If the device needs taking from macOS,
+          MSL asks for your password at that point and only the small USB helper runs as root.
+        """)
+    }
+
+    guard let reply = sendControlRequest(.usbPlan(device: device)) else {
+        usbFail("msl: couldn't reach mslhd")
+    }
+    guard reply.hasPrefix("OK") else {
+        usbFail(reply.replacingOccurrences(of: "ERROR ", with: "msl: "))
+    }
+    let fields = String(reply.dropFirst(3)).split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+    guard fields.count == 6, let speed = UInt32(fields[2]) else {
+        usbFail("msl: mslhd sent a plan this version doesn't understand")
+    }
+    let (tier, token, driver, holder, name) = (fields[0], fields[1], fields[3], fields[4], fields[5])
+    _ = speed
+
+    if holder != "-" {
+        usbFail("msl: \(name) is already attached to \(holder) - detach it there first:\n  msl usb detach \(token) \(holder)")
+    }
+
+    if tier == "NATIVE", !forceRelay {
+        // Nothing on the Mac wants this device, so mslhd can open it itself.
+        runControl(.usbAttach(instance: instance, device: token, capture: false))
+        return
+    }
+
+    if forceRelay {
+        print("Driving the privileged path deliberately (--relay), with \(name).")
+        print("This is the only way to check the root helper, its handshake socket and the")
+        print("relay without real hardware attached.")
+    } else {
+        // macOS owns it. Say so, name the driver, and say that it goes back.
+        print("\(name) is being used by macOS (\(driver)).")
+        print("MSL can take it for \(instance), and macOS gets it back when you detach.")
+        print("That needs your password - only MSL's small USB helper runs as root, not msl itself.")
+        // Taking a disk from macOS's storage driver is a forced unmount, so
+        // say that *before* the password rather than after the volume has
+        // gone. "Disk not ejected properly" is the single most alarming
+        // thing MSL could do without warning.
+        if driver.contains("MassStorage") {
+            print("")
+            print("This is a disk. Taking it unmounts it the hard way - eject it in Finder first,")
+            print("or anything still writing to it loses what it had not flushed.")
+        }
+    }
+    print("")
+
+    let relay = sendControlRequest(.usbRelay(instance: instance, device: token))
+    guard let relay, relay.hasPrefix("OK ") else {
+        usbFail((relay ?? "msl: couldn't reach mslhd")
+            .replacingOccurrences(of: "ERROR ", with: "msl: "))
+    }
+    let socketPath = String(relay.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+
+    // Never the copy in Application Support: guests get the Mac's home at
+    // /mnt/mac read-write, so a Linux process can replace that binary - and
+    // this one runs as root. See `USBHelperLocator`.
+    let helper: String
+    switch USBHelperLocator.trustedHelper() {
+    case .success(let found): helper = found
+    case .failure(let refusal): usbFail(refusal.description)
+    }
+
+    // exec, not spawn - the same reasoning as `msl ssh` above, and here it
+    // is not a nicety: Foundation's `Process` puts the child in a new
+    // process group, so `sudo` takes SIGTTIN the instant it reads the
+    // terminal and stops dead. Measured: `stat T`, with the process group
+    // not the terminal's foreground group, and a password prompt that never
+    // accepted anything. `msl` has nothing to do afterwards anyway - the
+    // attachment lasts exactly as long as the helper, so ^C is the detach -
+    // and exec makes the signals, the terminal and the exit status all
+    // behave with no extra code.
+    //
+    // A foreground process rather than a privileged daemon, on purpose:
+    // nothing of MSL's runs as root between attaches.
+    var arguments = [
+        "sudo",
+        // A prompt that says what the password is for. `sudo`'s bare
+        // "Password:" in the middle of a USB command reads like something
+        // has gone wrong, and a prompt nobody understands is one people
+        // type into without reading.
+        "-p", "Password for MSL to take \(name) from macOS: ",
+        helper, "serve-relay", token, "--connect", socketPath,
+    ]
+    // The synthetic self-test has no hardware to take from anybody, and
+    // asking for capture would make the helper refuse for no reason.
+    if token == "synthetic" { arguments.append("--no-capture") }
+    var execArgs: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) }
+    execArgs.append(nil)
+    execv("/usr/bin/sudo", &execArgs)
+    usbFail("msl: couldn't run /usr/bin/sudo: \(String(cString: strerror(errno)))")
+}
+
+/// Prints an endpoint the way somebody would use it.
+func printEndpoint(_ fields: [String]) {
+    guard fields.count >= 6, let port = UInt16(fields[1]) else {
+        print("msl: mslhd sent an endpoint this version doesn't understand")
+        return
+    }
+    let (host, user, key, expiry) = (fields[0], fields[2], fields[3], fields[4])
+    print("")
+    print("  \(user)@\(host):\(port)")
+    print("")
+    print("  ssh -i \"\(key)\" -o IdentitiesOnly=yes -p \(port) \(user)@\(host)")
+    print("")
+    // What to send somebody else. The line above names a file that exists
+    // on this Mac and nowhere else, so pasting it to a colleague reads as
+    // an instruction they cannot follow.
+    print("  To send to someone else:")
+    print("  ssh -i path/to/key -o IdentitiesOnly=yes -p \(port) \(user)@\(host)")
+    print("")
+    if let seconds = Int(expiry), seconds > 0 {
+        let minutes = seconds / 60
+        print("  This address lasts about \(minutes) minute\(minutes == 1 ? "" : "s") - the free relay ends")
+        print("  the session and MSL opens a new one, with a new address. For an address that")
+        print("  does not move, publish through a server you control.")
+    } else {
+        print("  No expiry.")
+    }
+}
+
+/// Asks before putting a machine on the internet.
+///
+/// Publishing is not like the rest of `msl`: everything else here changes
+/// something on this Mac, and this one makes a machine reachable by
+/// strangers. It deserves a deliberate yes, once, with the consequence
+/// stated plainly rather than buried in a man page.
+///
+/// Skipped when there is no terminal to ask - a script that calls this has
+/// already decided - and skipped with `--yes`, which is what somebody
+/// automating it will reach for.
+func confirmPublish(instance: String, force: Bool) {
+    if force || isatty(STDIN_FILENO) == 0 { return }
+    print("")
+    print("  Publishing \(instance) makes its SSH port reachable from the internet.")
+    print("  Anyone who gets the address can try to log in. MSL turns password")
+    print("  logins off first, so only the keys you authorize will work.")
+    print("")
+    print("  Worth knowing: your Mac's home folder is inside every instance at")
+    print("  /mnt/mac, and they can write to it. Anyone you let in has that too -")
+    print("  so this shares those files, not just the Linux machine.")
+    print("")
+    print("  Keys that can log in afterwards:")
+    print("    - one MSL makes for this Mac")
+    print("    - any you added with: msl public authorize \(instance) <key.pub>")
+    print("")
+    print("  Stop it any time with: msl public revoke \(instance)")
+    print("")
+    FileHandle.standardOutput.write("  Publish \(instance)? [y/N] ".data(using: .utf8)!)
+    let answer = readLine()?.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
+    guard answer == "y" || answer == "yes" else {
+        print("  Left alone.")
+        exit(0)
+    }
+    print("")
+}
+
+/// Turns `user@host:2222` into the token the daemon stores.
+///
+/// The port is required and deliberately not defaulted: it is the one
+/// number somebody else has to know to connect, and guessing it for them
+/// would mean publishing on a port they never chose.
+func selfHostedToken(_ value: String) -> String {
+    let parts = value.split(separator: ":").map(String.init)
+    guard parts.count >= 2, let port = UInt16(parts[1]), port > 0 else {
+        print("msl: --via needs a server and a port, like --via=root@my.vps:2222")
+        print("     The port is the one people will connect to there.")
+        print("     Ports below 1024 need root on that server, so pick a higher one.")
+        exit(1)
+    }
+    let sshPort = parts.count >= 3 ? (UInt16(parts[2]) ?? 22) : 22
+    return "self-hosted:\(parts[0]):\(port):\(sshPort):"
+}
+
+/// `msl public key [instance] [--reveal]`
+func runPublicKeyLocation(instance: String, reveal: Bool) {
+    guard let reply = sendControlRequest(.publicStatus(instance: instance)),
+          reply.hasPrefix("OK ") else {
+        print("\(instance) isn't published, so there's no key for it yet.")
+        print("Publish it with: msl public expose \(instance)")
+        exit(1)
+    }
+    let fields = String(reply.dropFirst(3)).components(separatedBy: "\t")
+    guard fields.count >= 4 else {
+        usbFail("msl: mslhd sent an endpoint this version doesn't understand")
+    }
+    let path = fields[3]
+    guard FileManager.default.fileExists(atPath: path) else {
+        print("The key for \(instance) isn't on disk.")
+        print("Publish it again to make a new one: msl public expose \(instance)")
+        exit(1)
+    }
+    print(path)
+    if reveal {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-R", path]
+        try? process.run()
+    }
+}
+
+/// `msl public tips <instance> [platform]` - the steps for whoever is
+/// connecting, in the words that actually work.
+func runPublicTips(instance: String, platform: String) {
+    let chosen: ConnectionTips.Platform
+    switch platform.lowercased() {
+    case "windows", "win":      chosen = .windows
+    case "linux":               chosen = .linux
+    case "freebsd", "bsd":      chosen = .freeBSD
+    case "mac", "macos", "osx": chosen = .macOS
+    default:
+        // Default to the machine asking, which is right far more often
+        // than any fixed choice.
+        chosen = .macOS
+    }
+    guard let reply = sendControlRequest(.publicStatus(instance: instance)),
+          reply.hasPrefix("OK ") else {
+        print("\(instance) isn't published yet, so there is no address to connect to.")
+        print("Publish it with: msl public expose \(instance)")
+        exit(1)
+    }
+    let fields = String(reply.dropFirst(3)).components(separatedBy: "\t")
+    guard fields.count >= 4, let port = UInt16(fields[1]) else {
+        usbFail("msl: mslhd sent an endpoint this version doesn't understand")
+    }
+    let endpoint = PublicEndpoint(host: fields[0], port: port, user: fields[2],
+                                  identityFile: fields[3], expires: nil,
+                                  backend: fields.count > 5 ? fields[5] : "")
+    print("")
+    print("Connecting to \(instance) from \(chosen.title):")
+    print("")
+    print(ConnectionTips.instructions(for: chosen, instance: instance, endpoint: endpoint))
+    print("")
+    print(ConnectionTips.identitiesOnlyNote)
+}
+
+/// `msl public invite <instance> <name>` - makes somebody a key and prints
+/// everything they need, ready to paste into a message.
+///
+/// For when email is not set up, which is most of the time: emailing needs
+/// a domain, and putting it in a chat window does not.
+func runPublicInvite(instance: String, label: String) {
+    guard let reply = sendControlRequestMultiline(
+        .publicMakeKey(instance: instance, label: label)) else {
+        usbFail("msl: couldn't reach mslhd")
+    }
+    guard reply.hasPrefix("OK ") else {
+        usbFail(reply.replacingOccurrences(of: "ERROR ", with: "msl: "))
+    }
+    let privateKey = String(reply.dropFirst(3))
+
+    guard let status = sendControlRequest(.publicStatus(instance: instance)),
+          status.hasPrefix("OK ") else {
+        print("Key made for \(label), but \(instance) isn't published yet.")
+        print("Publish it first: msl public expose \(instance)")
+        return
+    }
+    let fields = String(status.dropFirst(3)).components(separatedBy: "\t")
+    guard fields.count >= 3, let port = UInt16(fields[1]) else {
+        usbFail("msl: mslhd sent an endpoint this version doesn't understand")
+    }
+    let file = "msl-\(instance.lowercased())-key"
+
+    print("")
+    print("Send \(label) everything between the lines.")
+    print(String(repeating: "-", count: 68))
+    print("Save this as ~/Downloads/\(file), then run:")
+    print("")
+    print("  chmod 600 ~/Downloads/\(file)")
+    print("  ssh -i ~/Downloads/\(file) -o IdentitiesOnly=yes -p \(port) \(fields[2])@\(fields[0])")
+    print("")
+    print(privateKey.trimmingCharacters(in: .whitespacesAndNewlines))
+    print(String(repeating: "-", count: 68))
+    print("")
+    print("The address changes from time to time - their key does not, so they")
+    print("only need this once. Send them the new command when it moves, or set")
+    print("up email with: msl public notify setup")
+    print("")
+    print("Revoke them any time with: msl public deauthorize \(instance) \(label)")
+}
+
+/// `msl public notify ...` - who gets emailed the address.
+func runPublicNotify(_ args: [String], defaultInstance: String) {
+    let verb = args.count > 2 ? args[2] : "list"
+    switch verb {
+    case "setup":
+        runNotifySetup(args)
+    case "test":
+        let to = args.count > 3 ? args[3] : ""
+        guard !to.isEmpty else {
+            print("msl public notify test <your-email>")
+            exit(1)
+        }
+        runControl(.publicNotifyTest(to: to))
+    case "add":
+        guard args.count >= 5 else {
+            print("msl public notify add <instance> <email> [name]")
+            print("")
+            print("They get an email with their own key and the address, and another")
+            print("short one whenever the address changes.")
+            exit(1)
+        }
+        runControl(.publicNotifyAdd(instance: args[3], email: args[4],
+                                    label: args.count > 5 ? args[5...].joined(separator: " ") : args[4]))
+    case "remove":
+        guard args.count >= 5 else {
+            print("msl public notify remove <instance> <email>")
+            exit(1)
+        }
+        runControl(.publicNotifyRemove(instance: args[3], email: args[4]))
+    case "forget":
+        runControl(.publicNotifyForget)
+    case "list":
+        runNotifyList(instance: args.count > 3 ? args[3] : defaultInstance)
+    default:
+        print("msl public notify setup | add | remove | list | test | forget")
+        exit(1)
+    }
+}
+
+/// Walks somebody through Resend, because the two things that go wrong are
+/// both invisible until a send fails.
+func runNotifySetup(_ args: [String]) {
+    print("")
+    print("  MSL can email the address to whoever needs it, so nobody has to ask you")
+    print("  for it again. It sends through Resend - free, and a minute to set up.")
+    print("")
+    print("  1. Make an account at resend.com")
+    print("  2. Verify a domain you own at resend.com/domains")
+    print("  3. Make an API key at resend.com/api-keys")
+    print("")
+    print("  A domain is the awkward part, and it is Resend's rule, not MSL's: their")
+    print("  free sender can only email YOUR OWN address. With a domain verified you")
+    print("  can email anyone. Without one, you can still set this up to email")
+    print("  yourself - useful on its own, since you are the one who gets asked.")
+    print("")
+
+    // Flags first, so this can be scripted. **Prompting is only ever done
+    // at a terminal**: `readLine()` on a pipe that never closes blocks
+    // forever, so without the `isatty` check a setup run from a script -
+    // or from anything driving `msl` programmatically - hangs with no
+    // output and no way to tell why.
+    func flag(_ name: String) -> String? {
+        for argument in args where argument.hasPrefix("--\(name)=") {
+            return String(argument.dropFirst(name.count + 3))
+        }
+        return nil
+    }
+    let interactive = isatty(STDIN_FILENO) == 1
+
+    func ask(_ name: String, _ prompt: String, secret: Bool = false) -> String {
+        if let given = flag(name) { return given.trimmingCharacters(in: .whitespaces) }
+        guard interactive else { return "" }
+        FileHandle.standardOutput.write("  \(prompt)".data(using: .utf8)!)
+        guard let line = secret ? String(cString: getpass("")) : readLine() else { return "" }
+        return line.trimmingCharacters(in: .whitespaces)
+    }
+
+    // Not echoed, and never passed as a command-line argument anywhere:
+    // `ps` shows those to every process on this Mac.
+    var apiKey = flag("key") ?? ""
+    if apiKey.isEmpty, args.count > 3, args[3].hasPrefix("re_") { apiKey = args[3] }
+    if apiKey.isEmpty { apiKey = ask("key", "Resend API key (not shown): ", secret: true) }
+    guard apiKey.hasPrefix("re_") else {
+        print("")
+        if interactive {
+            print("  msl: a Resend API key starts with re_. Make one at resend.com/api-keys")
+        } else {
+            print("  msl: no terminal to ask on. Pass them as flags instead:")
+            print("       msl public notify setup --key=re_... --from=msl@your-domain.com")
+        }
+        exit(1)
+    }
+    var from = ask("from", "Send from (e.g. msl@your-domain.com): ")
+    if from.isEmpty {
+        from = "onboarding@resend.dev"
+        print("  Using Resend's test sender - it can only email your own Resend address.")
+    }
+    let replyTo = ask("reply-to", "Reply-To, so people can answer you (optional): ")
+
+    guard let reply = sendControlRequest(
+        .publicNotifySetup(apiKey: apiKey, replyTo: replyTo, from: from)) else {
+        usbFail("msl: couldn't reach mslhd")
+    }
+    guard reply.hasPrefix("OK ") else {
+        usbFail(reply.replacingOccurrences(of: "ERROR ", with: "msl: "))
+    }
+    print("")
+    print("  Saved to /Users/Shared/MSL, where Linux instances cannot read it.")
+    print("")
+    print("  Check it works:   msl public notify test <your-email>")
+    print("  Then add people:  msl public notify add <instance> <their-email>")
+}
+
+func runNotifyList(instance: String) {
+    guard let reply = sendControlRequestMultiline(.publicNotifyList(instance: instance)) else {
+        usbFail("msl: couldn't reach mslhd")
+    }
+    guard reply.hasPrefix("OK ") else {
+        print(reply.replacingOccurrences(of: "ERROR ", with: "msl: "))
+        exit(1)
+    }
+    let lines = String(reply.dropFirst(3)).split(separator: "\n").map(String.init)
+    var people: [String] = []
+    for line in lines {
+        let fields = line.components(separatedBy: "\t")
+        if fields.first == "CONFIGURED" {
+            if fields.count >= 3, fields[1] == "true" {
+                print("Sending as \(fields[2]).")
+            } else {
+                print("Email isn't set up yet. Run: msl public notify setup")
+            }
+            continue
+        }
+        guard fields.count >= 3 else { continue }
+        let waiting = fields[2] == "true" ? "" : "  (will get their key when you publish)"
+        people.append("  \(fields[1]) <\(fields[0])>\(waiting)")
+    }
+    print("")
+    if people.isEmpty {
+        print("Nobody is emailed about \(instance) yet.")
+        print("Add someone with: msl public notify add \(instance) <their-email>")
+    } else {
+        print("Emailed when \(instance)'s address changes:")
+        people.forEach { print($0) }
+    }
+}
+
+func printAuthorizeHelp(_ instance: String) {
+    print("msl public authorize <instance> <public-key-or-file> [label]")
+    print("")
+    print("Lets another computer log in, using a key that computer already has.")
+    print("Nothing secret travels: you copy its *public* key here.")
+    print("")
+    print("  On the other computer:  cat ~/.ssh/id_ed25519.pub")
+    print("  (no key there yet?)     ssh-keygen -t ed25519")
+    print("")
+    print("  Then here:              msl public authorize \(instance) ~/laptop.pub work-laptop")
+}
+
+/// Reads a public key from a file, or takes it literally.
+///
+/// Both forms are accepted because both are what people have to hand: a
+/// path when the file was copied across, and the text itself when it
+/// arrived in a message. A *private* key is caught here rather than sent
+/// to a guest - it is the single likeliest mistake, and the one worth
+/// being loud about.
+func readPublicKey(_ input: String) -> String? {
+    var text = input
+    let expanded = (input as NSString).expandingTildeInPath
+    if FileManager.default.fileExists(atPath: expanded),
+       let contents = try? String(contentsOfFile: expanded, encoding: .utf8) {
+        text = contents
+    }
+    if text.contains("PRIVATE KEY") {
+        print("msl: that is a PRIVATE key. Never send one anywhere.")
+        print("     You want the .pub file beside it - the public half.")
+        return nil
+    }
+    return text.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+func runPublicAuthorize(instance: String, keyOrFile: String, label: String) {
+    guard let key = readPublicKey(keyOrFile) else { exit(1) }
+    // A label defaults to the key's own comment, which is usually
+    // `user@machine` - already the right name for it.
+    var name = label
+    if name.isEmpty {
+        let fields = key.split(separator: " ").map(String.init)
+        name = fields.count >= 3 ? fields[2...].joined(separator: " ") : "a computer"
+    }
+    guard let reply = sendControlRequest(
+        .publicAuthorize(instance: instance, key: key, label: name)) else {
+        usbFail("msl: couldn't reach mslhd")
+    }
+    guard reply.hasPrefix("OK ") else {
+        usbFail(reply.replacingOccurrences(of: "ERROR ", with: "msl: "))
+    }
+    print(String(reply.dropFirst(3)))
+    print("")
+    print("It can reach \(instance) with its own key now - from here, and over the")
+    print("internet too once you run: msl public expose \(instance)")
+}
+
+func runPublicKeys(instance: String) {
+    guard let reply = sendControlRequestMultiline(.publicKeys(instance: instance)) else {
+        usbFail("msl: couldn't reach mslhd")
+    }
+    guard reply.hasPrefix("OK ") else {
+        print(reply.replacingOccurrences(of: "ERROR ", with: "msl: "))
+        exit(1)
+    }
+    let body = String(reply.dropFirst(3)).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !body.isEmpty else {
+        print("No computers are authorized for \(instance) yet.")
+        print("Add one with: msl public authorize \(instance) <their-key.pub>")
+        return
+    }
+    print("Computers authorized for \(instance):")
+    for line in body.split(separator: "\n") {
+        let fields = line.split(separator: "\t").map(String.init)
+        if fields.count >= 2 {
+            print("  \(fields[1])")
+            print("    \(fields[0])")
+        } else {
+            print("  \(line)")
+        }
+    }
+}
+
+func runPublicExpose(instance: String, backend: String) {
+    print("Publishing \(instance) beyond this Mac.")
+    print("Password logins are turned off first - an open port 22 is found by")
+    print("automated guessing within minutes. Keys only, and a key made for this")
+    print("instance alone.")
+    guard let reply = sendControlRequest(.publicExpose(instance: instance, backend: backend)) else {
+        usbFail("msl: couldn't reach mslhd")
+    }
+    guard reply.hasPrefix("OK ") else {
+        usbFail(reply.replacingOccurrences(of: "ERROR ", with: "msl: "))
+    }
+    printEndpoint(String(reply.dropFirst(3)).components(separatedBy: "\t"))
+    print("  Stop with: msl public revoke \(instance)")
+}
+
+func runPublicStatus(instance: String) {
+    guard let reply = sendControlRequest(.publicStatus(instance: instance)) else {
+        usbFail("msl: couldn't reach mslhd")
+    }
+    guard reply.hasPrefix("OK ") else {
+        print("\(instance) is not published. Publish it with: msl public expose \(instance)")
+        return
+    }
+    let body = String(reply.dropFirst(3))
+    if body.hasPrefix("PENDING") {
+        print("\(instance) is published, but the tunnel is not up at the moment -")
+        print("either it is still starting or the instance is down.")
+        return
+    }
+    printEndpoint(body.components(separatedBy: "\t"))
+}
+
 func usageAndExit() -> Never {
     FileHandle.standardError.write(CLIHelp.render(width: CLIHelp.terminalWidth(STDERR_FILENO),
                                                   styled: isatty(STDERR_FILENO) != 0).data(using: .utf8)!)
     exit(1)
+}
+
+/// Waits for a hibernated instance to come back, then reattaches to the
+/// same shell.
+///
+/// A hibernate does not kill anything in the guest: `saveMachineStateTo`
+/// writes the whole RAM, so the shell, its pty and its children are all
+/// still there - measured, a `sleep 9999` started before one was still
+/// running after it. Only the vsock died. So the right answer is to wait
+/// and pick the session back up, not to exit and let the next `msl run`
+/// strand it.
+///
+/// Returns the new connection, or nil to end the session (the person said
+/// so, or it never came back).
+enum ReattachOutcome {
+    /// Carry on, on this new connection.
+    case reattached(Int32)
+    /// The guest shut down, or the person said to stop. Not an error.
+    case ended
+    /// The connection went and never came back.
+    case abandoned
+}
+
+/// Dials a session's own vsock port through the daemon. Nil when the session
+/// is not there - which is the only reliable way to know, since a guest that
+/// is powering off still reports "running" for several seconds.
+func tryAttach(instance: String, port: UInt32) -> Int32? {
+    guard let controlFD = bestEffortConnectToDaemon() else { return nil }
+    defer { close(controlFD) }
+    let request = DaemonProtocol.ControlRequest
+        .attachSession(instance: instance, port: port).encode()
+    _ = request.withUnsafeBytes { write(controlFD, $0.baseAddress, $0.count) }
+    var status: UInt8 = 0
+    guard read(controlFD, &status, 1) == 1, status == DaemonProtocol.statusOK,
+          let next = try? FileDescriptorPassing.receive(from: controlFD)
+    else { return nil }
+    // The window may have been resized while this was detached; the guest
+    // applies these before replaying its scrollback.
+    let (r, c) = currentWindowSize()
+    writeFull(fd: next, bytes: ShellProtocol.encodeAttach(rows: r, cols: c))
+    return next
+}
+
+/// Waits for a hibernated instance to come back, then reattaches to the
+/// same shell.
+///
+/// A hibernate does not kill anything in the guest: `saveMachineStateTo`
+/// writes the whole RAM, so the shell, its pty and its children are all
+/// still there. Only the vsock died. So the right answer is to wait and
+/// pick the session back up, not to exit and let the next `msl run` strand
+/// it.
+///
+/// **A `poweroff` is not that**, and must not be answered with "press r to
+/// resume" - that offers to undo a deliberate shutdown. Told apart by
+/// *trying the attach*: a session that is still there answers, and one
+/// whose guest is halting does not. Inferring it from the instance's state
+/// does not work, because a guest on its way down reports "running", then
+/// "paused", for several seconds after the connection drops.
+func awaitReattach(instance: String, session: (id: String, port: UInt32),
+                   restoring termios: termios) -> ReattachOutcome {
+    let hibernated = FileManager.default.fileExists(
+        atPath: MSLPaths.appSupport.appendingPathComponent("vm-\(instance).state").path)
+
+    // Still running? Then the session either exists or it does not, and the
+    // attach says which. This is also the silent path for a connection that
+    // dropped for some other reason - mslhd restarting, say - where there is
+    // nothing to ask anybody.
+    if !hibernated, sendControlRequest(.status(instance: instance)) == "OK running",
+       let next = tryAttach(instance: instance, port: session.port) {
+        return .reattached(next)
+    }
+
+    guard hibernated else {
+        restoreMode(termios)
+        print("\n\u{1B}[2m\(instance) shut down.\u{1B}[0m")
+        return .ended
+    }
+    guard isatty(STDIN_FILENO) != 0 else { return .abandoned }
+
+    // The terminal goes back to normal while waiting: this is MSL talking,
+    // not the guest, and raw mode would eat the keypress below.
+    restoreMode(termios)
+    defer { _ = setRawMode() }
+
+    let dim = "\u{1B}[2m", reset = "\u{1B}[0m"
+    print("\n\(dim)[\(instance) is hibernated]\(reset)   r resume · q quit", terminator: "")
+    fflush(stdout)
+
+    let raw = setRawMode()
+    defer { restoreMode(raw) }
+
+    var waited = 0
+    while waited < 3600 {
+        var pfd = pollfd(fd: STDIN_FILENO, events: Int16(POLLIN), revents: 0)
+        if poll(&pfd, 1, 500) > 0, pfd.revents & Int16(POLLIN) != 0 {
+            var c: UInt8 = 0
+            if read(STDIN_FILENO, &c, 1) == 1 {
+                if c == UInt8(ascii: "q") || c == 3 /* ^C */ {
+                    print("\r\u{1B}[K", terminator: "")
+                    return .ended
+                }
+                if c == UInt8(ascii: "r") {
+                    print("\r\u{1B}[K\(dim)resuming \(instance)…\(reset)", terminator: "")
+                    fflush(stdout)
+                    _ = sendControlRequest(.resume(instance: instance))
+                }
+            }
+        }
+        waited += 1
+
+        // `.status` and nothing else: it is the one request that does not
+        // register or start an instance, and anything that did would resume
+        // the instance the user just hibernated.
+        guard sendControlRequest(.status(instance: instance)) == "OK running" else { continue }
+        guard let next = tryAttach(instance: instance, port: session.port) else {
+            // Running, but the session is gone - it was shut down rather
+            // than resumed.
+            print("\r\u{1B}[K\(dim)\(instance)'s session ended.\(reset)")
+            return .ended
+        }
+        print("\r\u{1B}[K", terminator: "")
+        fflush(stdout)
+        return .reattached(next)
+    }
+    print("\r\u{1B}[K\(dim)\(instance) didn't come back.\(reset)")
+    return .abandoned
 }
 
 /// Asks one setup question; Return keeps `defaultValue`. Nil on end of input.
@@ -943,10 +2049,8 @@ func runInstallSetup(for distro: GuestDistro) -> String? {
     while true {
         guard let answer = ask("Instance name", default: name) else { return nil }
         let taken = registryForLookup.distro(for: answer)
-        if !InstanceRegistry.isValidName(answer) {
-            print("    Use letters, numbers, - and _ (up to 32 characters).")
-        } else if mslCommands.contains(answer) {
-            print("    \(answer) is an msl command - pick another name.")
+        if let refusal = CLICommands.nameRefusal(answer) {
+            print("    \(refusal).")
         } else if let taken, taken != distro {
             print("    \(answer) is already a \(taken.rawValue) instance - pick another name.")
         } else {
@@ -983,13 +2087,13 @@ func runInstallSetup(for distro: GuestDistro) -> String? {
         } catch { print("    \(error)") }
     }
 
-    let boot = distro.bootFiles()
+    // This instance's own disk. It used to be the distro's, shared with
+    // every other instance of it - so this prompt had to warn that the size
+    // chosen here applied to them too. Each instance now has its own clone,
+    // so the question is simply about this one.
+    let boot = distro.bootFiles(instance: name)
     let current = DiskStorage.policy(forImageNamed: boot.storageKey, path: boot.disk.path)
     let currentGB = (max(current.size, DiskStorage.capacity(of: boot.disk.path)) + (1 << 30) - 1) >> 30
-    let others = registryForLookup.entries().filter { $0.value == distro && $0.key != name }.map(\.key).sorted()
-    if !others.isEmpty {
-        print("    (the disk is shared with \(others.joined(separator: ", ")))")
-    }
     var diskSize: UInt64?
     while true {
         guard let answer = ask("Disk size", default: "\(currentGB)G") else { return nil }
@@ -1055,12 +2159,240 @@ func openInApp(_ url: String) -> Bool {
 }
 
 
+// `msl <instance> --shipment` - package that instance into a file another
+// MSL can install. Handled before the switch below, because by the time an
+// instance name reaches it the next step is opening a shell.
+if splitArguments.shipment {
+    // `msl run work --shipment` names the instance in the second position,
+    // the same as `msl work --shipment` does in the first.
+    let named = args.first == "run" ? args.dropFirst().first : args.first
+    let instance = named ?? startupInstance()
+    runShipmentCreate(instance: instance,
+                      output: splitArguments.output, note: splitArguments.note)
+}
+
+/// `msl <instance> --shipment` - one instance, in one file.
+func runShipmentCreate(instance: String, output: String?, note: String?) -> Never {
+    guard let distro = registryForLookup.distro(for: instance) else {
+        FileHandle.standardError.write("msl: there's no instance called \(instance) - `msl list` shows them\n".data(using: .utf8)!)
+        exit(1)
+    }
+    // A live guest's filesystem is caught mid-write, so this refuses rather
+    // than shipping something that only looks fine.
+    let running = (DaemonClient.send(.status(instance: instance)) ?? "").contains("running")
+    let destination = URL(fileURLWithPath: output
+        ?? FileManager.default.currentDirectoryPath + "/\(instance).\(Shipment.fileExtension)")
+    do {
+        try Shipment.create(instance: instance, distro: distro, destination: destination,
+                            note: note, isRunning: running) { line in
+            FileHandle.standardError.write("msl: \(line)\n".data(using: .utf8)!)
+        }
+    } catch {
+        FileHandle.standardError.write("msl: \(error)\n".data(using: .utf8)!)
+        exit(1)
+    }
+    let size = DiskStorage.allocatedSize(of: destination.path)
+    print("OK shipped \(instance) to \(destination.path) (\(DiskStorage.format(size)))")
+    exit(0)
+}
+
+/// `msl shipment info|install <file>`.
+func runShipmentCommand(_ rest: [String]) -> Never {
+    let verb = rest.first ?? "info"
+    let paths = rest.dropFirst().filter { !$0.hasPrefix("-") }
+    guard let path = paths.first else {
+        FileHandle.standardError.write("usage: msl shipment create <instance> [file] | info <file> | install <file> [--name NAME]\n".data(using: .utf8)!)
+        exit(2)
+    }
+    let url = URL(fileURLWithPath: path)
+    switch verb {
+    case "create", "make":
+        // `msl shipment create <instance> [file]`
+        //
+        // Packing one was only possible from the app, which is the wrong
+        // shape for what shipments are *for*: reproducing an environment,
+        // building images, handing a machine to somebody. All of those are
+        // things people script.
+        let instance = path
+        guard let distro = registryForLookup.distro(for: instance) else {
+            FileHandle.standardError.write("msl: there's no instance called '\(instance)'\n"
+                .data(using: .utf8)!)
+            exit(1)
+        }
+        let running = DaemonClient.send(.status(instance: instance), timeout: 10)
+        if running == "OK running" || running == "OK paused" {
+            FileHandle.standardError.write("""
+                msl: stop \(instance) first - a filesystem copied while it is running is a \
+                filesystem caught mid-write, which is not a machine anybody can boot.
+                  msl stop \(instance)
+
+                """.data(using: .utf8)!)
+            exit(1)
+        }
+        let destination = paths.count > 1
+            ? URL(fileURLWithPath: (paths[1] as NSString).expandingTildeInPath)
+            : URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                .appendingPathComponent("\(instance).\(Shipment.fileExtension)")
+        var note: String?
+        for argument in rest where argument.hasPrefix("--note=") {
+            note = String(argument.dropFirst("--note=".count))
+        }
+        do {
+            try Shipment.create(instance: instance, distro: distro, destination: destination,
+                                note: note, progress: { print("  \($0)") })
+            let size = (try? FileManager.default.attributesOfItem(atPath: destination.path)[.size]
+                        as? NSNumber)??.uint64Value ?? 0
+            print("")
+            print("\(destination.lastPathComponent) - \(DiskStorage.format(size))")
+            print("Anyone with MSL can open it: msl shipment install \(destination.lastPathComponent)")
+        } catch {
+            FileHandle.standardError.write("msl: \(error)\n".data(using: .utf8)!)
+            exit(1)
+        }
+        exit(0)
+
+    case "info":
+        do {
+            let manifest = try Shipment.info(at: url)
+            let formatter = ISO8601DateFormatter()
+            print("\(manifest.source.instance) (\(manifest.source.distro))")
+            print("  made by     \(manifest.mslVersion) on \(formatter.string(from: manifest.created))")
+            if let host = manifest.host {
+                print("  made on     \(host.architecture)\(host.macOS.map { ", " + $0 } ?? "")")
+            }
+            if let id = manifest.id { print("  id          \(id)") }
+            // Where this environment is descended from. The whole point of
+            // shipments is passing a machine along, so knowing it came from
+            // another one is worth a line.
+            if let parent = manifest.parent { print("  came from   \(parent)") }
+            print("  filesystem  \(DiskStorage.format(manifest.disk.uncompressedSize)) uncompressed")
+            if let user = manifest.defaultUser { print("  account     \(user)") }
+            if let sandbox = manifest.sandbox, !sandbox.isOpen {
+                print("  sandbox     \(sandbox.closedGateCount) gate(s) closed")
+            }
+            if let apps = manifest.apps, !apps.isEmpty {
+                print("  apps        \(apps.prefix(6).joined(separator: ", "))\(apps.count > 6 ? ", …" : "")")
+            }
+            if let note = manifest.note { print("  note        \(note)") }
+        } catch {
+            FileHandle.standardError.write("msl: \(error)\n".data(using: .utf8)!)
+            exit(1)
+        }
+    case "install":
+        var name: String?
+        if let index = rest.firstIndex(of: "--name"), index + 1 < rest.count { name = rest[index + 1] }
+        do {
+            let manifest = try Shipment.info(at: url)
+            let chosen = name ?? manifest.source.instance
+            guard InstanceRegistry.isValidName(chosen) else {
+                FileHandle.standardError.write("msl: '\(chosen)' isn't a usable instance name\n".data(using: .utf8)!)
+                exit(1)
+            }
+            let outcomes = try Shipment.install(url, as: chosen,
+                                                existingInstances: registryForLookup.entries()) { line in
+                FileHandle.standardError.write("msl: \(line)\n".data(using: .utf8)!)
+            }
+            guard let distro = GuestDistro(rawValue: manifest.source.distro) else {
+                FileHandle.standardError.write("msl: unknown distro '\(manifest.source.distro)'\n".data(using: .utf8)!)
+                exit(1)
+            }
+            _ = DaemonClient.send(.createInstance(instance: chosen, distro: distro))
+            print("OK installed \(chosen) from \(url.lastPathComponent)")
+            // Best effort, said out loud: a setting that could not be
+            // honoured here is worth one line, not silence.
+            let applied = outcomes.compactMap { if case .applied(let k) = $0 { return k } else { return nil } }
+            let skipped = outcomes.compactMap { o -> String? in
+                if case .skipped(let k, let why) = o { return "\(k) (\(why))" } else { return nil }
+            }
+            if !applied.isEmpty { print("   settings kept for this instance: \(applied.joined(separator: ", "))") }
+            for line in skipped { print("   not applied: \(line)") }
+            print("run `msl \(chosen)` to start it")
+        } catch {
+            FileHandle.standardError.write("msl: \(error)\n".data(using: .utf8)!)
+            exit(1)
+        }
+    default:
+        FileHandle.standardError.write("msl: unknown shipment command '\(verb)'\n".data(using: .utf8)!)
+        exit(2)
+    }
+    exit(0)
+}
+
 switch args.first {
+case "shipment":
+    runShipmentCommand(Array(args.dropFirst()))
+
 case nil:
-    let instance = startupInstance()
-    let distro = effectiveDistro(forInstance: instance)
-    let user = resolveUser(instance: instance, distro: distro, command: "")
-    runShellSession(instance: instance, distro: distro, command: "", user: user)
+    // Orientation, not a shell - see `CLIOverview`. `msl run` is the shell
+    // this used to open, and says so in the list it prints.
+    printOverview()
+    exit(0)
+
+case "run":
+    // `msl run <instance> [command...]`, the spelled-out form of
+    // `msl <instance> [command...]`. A verbatim-tail command (see
+    // `CLICommands.verbatimTail`), so everything after the instance name
+    // reaches the guest with its own flags intact.
+    //
+    // An instance that is literally called `run` wins: the old CLI dropped
+    // the word `run` entirely, so plain `msl run` registered an instance by
+    // that name, and anyone who hit that must still be able to reach it.
+    let runTarget: String
+    if args.count > 1 {
+        runTarget = args[1]
+        // Only a name the user typed is checked. A name that came from
+        // `startupInstance()` is MSL's own pick and may legitimately not
+        // exist yet - on a first-ever run it is `default`, and
+        // `requireInstalled` is what greets an empty Mac properly.
+        if let refusal = openableRefusal(runTarget) {
+            FileHandle.standardError.write("msl: \(refusal)\n".data(using: .utf8)!)
+            exit(1)
+        }
+    } else if registryForLookup.distro(for: "run") != nil {
+        runTarget = "run"
+    } else {
+        runTarget = startupInstance()
+    }
+    let runDistro = effectiveDistro(forInstance: runTarget)
+    let runCommand = args.dropFirst(2).joined(separator: " ")
+    let runUser = resolveUser(instance: runTarget, distro: runDistro, command: runCommand)
+    runShellSession(instance: runTarget, distro: runDistro, command: runCommand, user: runUser)
+
+case "update":
+    // OIS's `myapp --update`, with MSL's own shape: the check is
+    // `UpdateCheck` (unchanged), the download is `UpdateDownload`, and the
+    // removal is `msl uninstall` run from a script that outlives this
+    // process (`UpdateHandoff`).
+    //
+    // Three levels, because they have three different consequences:
+    //   msl update              say what there is
+    //   msl update --download   fetch and verify it into Downloads
+    //   msl update --install    ...and then replace this MSL
+    //
+    // Nothing destructive happens without the word being typed. An update
+    // that removes MSL because somebody ran `msl update` to *look* is not a
+    // feature.
+    var updateWants = UpdateAction.check
+    for option in args.dropFirst() {
+        switch option {
+        case "--download", "-d", "--yes", "-y": updateWants = .download
+        case "--check", "-n": updateWants = .check
+        default:
+            FileHandle.standardError.write("msl: unknown option '\(option)' - usage: msl update [--download]\n".data(using: .utf8)!)
+            exit(2)
+        }
+    }
+    runUpdate(updateWants)
+
+case "version", "--version", "-v":
+    // `msl about` used to be read as an instance name and quietly downloaded
+    // Alpine to make one. The word people reach for needs to exist.
+    print(MSLVersion.display)
+    exit(0)
+
+case "distros":
+    printDistroTable()
+    exit(0)
 
 case "--":
     // `msl -- ls -la`: one-shot command against the most recently used
@@ -1079,10 +2411,22 @@ case "install":
           let distroToInstall = GuestDistro(rawValue: installNames[0]) else {
         usageAndExit()
     }
-    let manifestURLString = DistroInstaller.resolveManifestURLString(override: manifestURLOverride)
+    // Every source in turn, which is what the app does too - so a download
+    // that works in one does not mysteriously fail in the other. An explicit
+    // --manifest narrows this to exactly that one.
+    let sources: [DistroInstaller.ImageSource]
+    do {
+        sources = try DistroInstaller.resolveSources(override: manifestURLOverride)
+    } catch {
+        FileHandle.standardError.write("msl: \(error)\n".data(using: .utf8)!)
+        exit(1)
+    }
     let appSupport = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/MSL")
     do {
-        try DistroInstaller.install(distro: distroToInstall, manifestURLString: manifestURLString, appSupportDir: appSupport) { message in
+        // `--force` re-fetches a base that is already here, for one that is
+        // damaged rather than out of date.
+        try DistroInstaller.install(distro: distroToInstall, sources: sources, appSupportDir: appSupport,
+                                    force: args.contains("--force")) { message in
             FileHandle.standardError.write((message + "\n").data(using: .utf8)!)
         }
         print("OK installed \(distroToInstall.rawValue)")
@@ -1189,10 +2533,15 @@ case "gui":
     // briefly then re-checking with `kill -0` before this script - and so
     // the whole one-shot session - is allowed to end confirms it actually
     // survived detachment, not just that `setsid` was invoked.
+    // As the user, never root. A tunnel started as root leaves a root-owned
+    // socket in the sticky `/tmp/.X11-unix`, which the user then cannot
+    // replace - every later launch dies with "bind: Address already in
+    // use", and the only cure is a root cleanup. Starting it as the account
+    // that will use it avoids the whole situation.
     let (startExit, _) = runOneShotCommand(
         instance: guiInstance, distro: guiDistro,
-        command: "kill -0 $(cat /tmp/x11tunnel-0-5002.pid 2>/dev/null) 2>/dev/null || (setsid sh -c 'exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; exec /usr/local/bin/x11tunnel 0 5002' </dev/null >/tmp/x11tunnel.log 2>&1 & echo $! > /tmp/x11tunnel-0-5002.pid; sleep 1; kill -0 $(cat /tmp/x11tunnel-0-5002.pid) 2>/dev/null || (echo 'x11tunnel died immediately after starting - see /tmp/x11tunnel.log' >&2; exit 1))",
-        user: "", echo: false
+        command: GuestIntegration.tunnelStartCommand(display: 0, port: 5002, announce: false),
+        user: GuestUser.shellUser(instance: guiInstance, distro: guiDistro), echo: false
     )
     guard startExit == 0 else {
         FileHandle.standardError.write("msl: failed to start x11tunnel in \(guiInstance)\n".data(using: .utf8)!)
@@ -1234,10 +2583,12 @@ case "gui-native":
     // own invocation and silently skips ever starting x11tunnel. Same
     // post-background sleep+reverify as `gui` too - see its comment for
     // the detach-vs-teardown race this closes.
+    // As the user - see `gui` above for what a root-owned display socket
+    // costs.
     let (nativeStartExit, _) = runOneShotCommand(
         instance: nativeInstance, distro: nativeDistro,
-        command: "kill -0 $(cat /tmp/x11tunnel-1-5003.pid 2>/dev/null) 2>/dev/null || (setsid sh -c 'exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; exec /usr/local/bin/x11tunnel 1 5003 --announce' </dev/null >/tmp/x11tunnel-native.log 2>&1 & echo $! > /tmp/x11tunnel-1-5003.pid; sleep 1; kill -0 $(cat /tmp/x11tunnel-1-5003.pid) 2>/dev/null || (echo 'x11tunnel died immediately after starting - see /tmp/x11tunnel-native.log' >&2; exit 1))",
-        user: "", echo: false
+        command: GuestIntegration.tunnelStartCommand(display: 1, port: 5003, announce: true),
+        user: GuestUser.shellUser(instance: nativeInstance, distro: nativeDistro), echo: false
     )
     guard nativeStartExit == 0 else {
         FileHandle.standardError.write("msl: failed to start x11tunnel in \(nativeInstance)\n".data(using: .utf8)!)
@@ -1248,7 +2599,15 @@ case "gui-native":
         print("msl: native GUI ready for \(nativeInstance) - launch an X app with `msl gui-native \(nativeInstance) <app>` or `msl \(nativeInstance) -- 'DISPLAY=:1 <app>'`")
         exit(0)
     }
-    let nativeCommand = "DISPLAY=:1 " + nativeAppArgs.joined(separator: " ")
+    // The same command an app launched from the Applications tab gets, not
+    // a bare `DISPLAY=:1 <app>`: this verb is how MSL's own GUI work gets
+    // tested, and a test path that skips the menu bridge, the portal, the
+    // user scope and the extended PATH proves nothing about the path people
+    // actually use (found 2026-09-22, after testing Krita's menus through a
+    // launch that could never have had any).
+    let nativeCommand = GuestIntegration.launchCommand(
+        nativeAppArgs.joined(separator: " "), instance: nativeInstance,
+        settings: MSLExperimentalSettingsStore.load())
     let nativeUser = resolveUser(instance: nativeInstance, distro: nativeDistro, command: nativeCommand)
     runShellSession(instance: nativeInstance, distro: nativeDistro, command: nativeCommand, user: nativeUser)
 
@@ -1555,7 +2914,7 @@ case "ssh":
     let sshDistro = effectiveDistro(forInstance: sshInstance)
 
     // Cheap path: already configured and still answering.
-    let sshUser = LinuxUserSetup.defaultUser(for: sshDistro) ?? "msl"
+    let sshUser = LinuxUserSetup.defaultUser(forInstance: sshInstance) ?? "msl"
     var result = SSHSetup.verifyExisting(instance: sshInstance, expectedUser: sshUser)
     if result == nil {
         FileHandle.standardError.write("msl: setting up SSH for \(sshInstance) ...\n".data(using: .utf8)!)
@@ -1601,7 +2960,293 @@ case "status":
 // `list`/`ls` are aliases because they are what people try first. `msl
 // list` used to fall through to "treat it as an instance name" and create
 // one called "list" - see `CommandSuggestion`.
+case "admin":
+    // MSLAP. Phase 1 is read-only on purpose: the catalogue and the
+    // resolution are worth having before anything can refuse a request,
+    // because they are how the refusals get tested. `status` is also the
+    // honest answer to "what is this machine actually locked down to",
+    // which an administrator needs before trusting it with anything.
+    let adminSub = args.count > 1 ? args[1].lowercased() : "status"
+    switch adminSub {
+    case "status":
+        let instanceFilter = args.count > 2 ? args[2] : nil
+        printAdminStatus(instance: instanceFilter)
+    case "capabilities", "caps":
+        for group in MSLAPCapability.groups {
+            print(group)
+            for entry in MSLAPCapability.catalogue
+            where entry.capability.key.hasPrefix(group + ".") {
+                let mark = entry.enforced ? " "
+                    : entry.unavailable ? " (no such action in this version)"
+                    : " (not yet enforced)"
+                print("  \(entry.capability.key.padding(toLength: 34, withPad: " ", startingAt: 0))"
+                      + "\(entry.tier.label)\(mark)")
+            }
+        }
+    case "keygen":
+        // Local admin mode. Weaker than a fleet key and the output says so.
+        do {
+            let id = try MSLAPKeyStore.createLocalKey()
+            print("Created a local signing key and pinned it: \(id)")
+            print("  Private key: \(MSLAPKeyStore.directory.path)/mslap-local-key (0600)")
+            print("")
+            print("  This is LOCAL ADMIN mode. The signing key lives on this Mac, so")
+            print("  anyone with root here can re-sign a policy. It still stops the")
+            print("  policy being edited casually, which is the point for one person")
+            print("  locking down their own Mac. A fleet deployment keeps its private")
+            print("  key on another machine and uses `msl admin pin` instead.")
+        } catch {
+            print("msl admin keygen: \(error)")
+            exit(1)
+        }
+
+    case "certify", "revoke":
+        // An administrator's signed statement about a lineage.
+        //
+        // **The strong tier, and the only one a local user cannot forge.**
+        // Instance identities are signed by a key mslhd can read, so they
+        // are tamper-evident. A certificate is signed by the MSLAP key -
+        // which a fleet keeps OFF the machine - so nobody holding only
+        // this Mac can mint one. See READMES/31 §1.2.
+        let certifyRevoking = args[1].lowercased() == "revoke"
+        let certifyArgs = Array(args.dropFirst(2))
+        func certifyFlag(_ name: String) -> String? {
+            for (index, value) in certifyArgs.enumerated() where value == "--\(name)" {
+                return index + 1 < certifyArgs.count ? certifyArgs[index + 1] : nil
+            }
+            for value in certifyArgs where value.hasPrefix("--\(name)=") {
+                return String(value.dropFirst(name.count + 3))
+            }
+            return nil
+        }
+        let certifyPositional = certifyArgs.filter { !$0.hasPrefix("-") }
+
+        // A lineage, or an instance name - whichever the person has to
+        // hand. Looking it up is friendlier than making them paste 26
+        // characters of base32 they would have to find first.
+        var certifyLineage = certifyPositional.first
+        if let given = certifyLineage, given.count != InstanceIdentity.lineageLength {
+            guard case .valid(let identity) = InstanceIdentityStore.verdict(for: given) else {
+                FileHandle.standardError.write(
+                    "msl: '\(given)' is neither a lineage nor an instance with a verified identity\n"
+                        .data(using: .utf8)!)
+                exit(1)
+            }
+            certifyLineage = identity.lineage
+            print("\(given)'s lineage is \(identity.lineage).")
+        }
+        guard let certifyLineage else {
+            print("usage: msl admin \(certifyRevoking ? "revoke" : "certify") <lineage|instance> "
+                  + "[--label \"Acme Image 2026\"]" + (certifyRevoking ? " [--reason \"...\"]" : ""))
+            print("")
+            print("  Writes a signed statement that this image is yours (or withdrawn).")
+            print("  Signed with this Mac's admin key. A FLEET signs on the machine that")
+            print("  holds the key and copies the file to /Library/Application Support/MSL/")
+            print("  lineages/, where a non-administrator cannot add or remove one.")
+            exit(certifyPositional.isEmpty ? 2 : 1)
+        }
+        guard let certifyKey = MSLAPKeyStore.localPrivateKey() else {
+            let why = "msl: there is no admin signing key on this Mac. `msl admin keygen` makes "
+                    + "one, or sign on the machine that holds your fleet key and copy the file here.\n"
+            FileHandle.standardError.write(why.data(using: .utf8)!)
+            exit(1)
+        }
+        do {
+            let certificate = try LineageCertificate(
+                lineage: certifyLineage,
+                trust: certifyRevoking ? .revoked : .certified,
+                label: certifyFlag("label") ?? (certifyRevoking ? "a withdrawn image" : "an administrator's image"),
+                issuer: MSLAPPolicyStore.current()?.issuer ?? "this Mac's administrator",
+                reason: certifyFlag("reason")).signed(with: certifyKey)
+            let written = try LineageCertificateStore.install(certificate)
+            print("OK \(certifyRevoking ? "revoked" : "certified") lineage \(certifyLineage)")
+            print("   \(written.path)")
+            if certifyRevoking {
+                print("")
+                print("   Every instance of this lineage will now refuse to start, and no")
+                print("   capability can set that aside - a revocation that a policy could")
+                print("   override would be no revocation at all.")
+                print("")
+                print("   How strongly it is held depends on where this file is and who owns")
+                print("   the signing key - `msl admin status` says which. Signed here with a")
+                print("   key on this Mac, anyone with administrator access could re-sign it.")
+            } else {
+                print("")
+                print("   For a fleet, copy this file to each Mac at")
+                print("   /Library/Application Support/MSL/lineages/ (needs sudo), where a")
+                print("   non-administrator cannot add or remove one.")
+            }
+            exit(0)
+        } catch {
+            FileHandle.standardError.write("msl: \(error)\n".data(using: .utf8)!)
+            exit(1)
+        }
+
+    case "pin":
+        // Fleet mode: trust a public key whose private half is elsewhere.
+        guard args.count > 2 else {
+            print("usage: msl admin pin <base64-public-key>")
+            exit(1)
+        }
+        do {
+            let key = try MSLAPSigning.publicKey(fromBase64: args[2])
+            let id = try MSLAPKeyStore.pin(key)
+            print("Pinned signing key \(id). Policies signed by it will be honoured.")
+        } catch {
+            print("msl admin pin: \(error)")
+            exit(1)
+        }
+
+    case "keys":
+        let pinned = MSLAPKeyStore.pinned()
+        if pinned.isEmpty {
+            print("No signing keys are pinned. Any policy will load unsigned, at Advisory strength.")
+        } else {
+            for (id, key) in pinned.sorted(by: { $0.key < $1.key }) {
+                print("\(id)  \(key.rawRepresentation.base64EncodedString())")
+            }
+            if MSLAPKeyStore.isLocalAdminMode {
+                print("")
+                print("Local admin mode: the private key for one of these is on this Mac.")
+            }
+        }
+
+    case "sign":
+        guard args.count > 2 else {
+            print("usage: msl admin sign <policy.json> [--key <base64-private-key>]")
+            print("  With no --key, uses this Mac's local admin key (msl admin keygen).")
+            exit(1)
+        }
+        do {
+            let path = args[2]
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let policy = try decoder.decode(MSLAPPolicy.self, from: data)
+            let key: Curve25519.Signing.PrivateKey
+            if let index = args.firstIndex(of: "--key"), args.count > index + 1 {
+                key = try MSLAPSigning.privateKey(fromBase64: args[index + 1])
+            } else if let local = MSLAPKeyStore.localPrivateKey() {
+                key = local
+            } else {
+                print("msl admin sign: no key. Run `msl admin keygen`, or pass --key.")
+                exit(1)
+            }
+            let signed = try MSLAPSigning.sign(policy, with: key)
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            encoder.dateEncodingStrategy = .iso8601
+            try encoder.encode(signed).write(to: URL(fileURLWithPath: path), options: .atomic)
+            print("Signed \(path) with key \(signed.signature?.key ?? "?").")
+        } catch {
+            print("msl admin sign: \(error)")
+            exit(1)
+        }
+
+    case "enrol", "enroll", "install":
+        // Puts the policy where the person using this Mac cannot write it.
+        // That single step is the difference between advisory and
+        // enforceable, so it is a deliberate command with its own sudo
+        // prompt rather than something that happens quietly.
+        guard args.count > 2 else {
+            print("usage: msl admin enrol <policy.json>")
+            print("  Installs to \(MSLAPPolicyStore.systemURL.path) (needs sudo).")
+            exit(1)
+        }
+        do {
+            let source = URL(fileURLWithPath: args[2])
+            let data = try Data(contentsOf: source)
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .iso8601
+            let policy = try decoder.decode(MSLAPPolicy.self, from: data)
+
+            // What this will change, before changing it. A wall of JSON is
+            // not review; a list of what stops working is.
+            let denied = MSLAPCapability.catalogue.filter { !policy.allows($0.capability) }
+            print("This policy denies \(denied.count) capabilit\(denied.count == 1 ? "y" : "ies"):")
+            for entry in denied.prefix(12) { print("  \(entry.capability.key)  \(entry.title)") }
+            if denied.count > 12 { print("  ... and \(denied.count - 12) more") }
+            let unknown = policy.unknownCapabilities
+            if !unknown.isEmpty {
+                print("Ignoring \(unknown.count) name(s) this MSL does not know: "
+                      + unknown.map(\.key).joined(separator: ", "))
+            }
+            switch MSLAPSigning.verify(policy, pinned: MSLAPKeyStore.pinned()) {
+            case .success(let id): print("Signature: valid, key \(id)")
+            case .failure(let problem): print("Signature: \(problem.detail)")
+            }
+
+            let target = MSLAPPolicyStore.systemURL
+            print("")
+            print("Installing to \(target.path) - this needs your Mac password.")
+            let script = "mkdir -p '\(target.deletingLastPathComponent().path)' && "
+                       + "cp '\(source.path)' '\(target.path)' && "
+                       + "chown root:wheel '\(target.path)' && "
+                       + "chmod 644 '\(target.path)'"
+            let sudo = Process()
+            sudo.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            sudo.arguments = ["/bin/sh", "-c", script]
+            try sudo.run()
+            sudo.waitUntilExit()
+            guard sudo.terminationStatus == 0 else {
+                print("msl admin enrol: install failed (sudo exited \(sudo.terminationStatus))")
+                exit(1)
+            }
+            print("")
+            printAdminStatus(instance: nil)
+        } catch {
+            print("msl admin enrol: \(error)")
+            exit(1)
+        }
+
+    case "unenrol", "unenroll":
+        // A policy can forbid its own removal. That sounds circular and is
+        // not: it is the difference between a deployment an administrator
+        // sets up for someone and one that someone can simply walk out of.
+        // It binds this account, not root - `sudo rm` still works, and
+        // saying so is better than implying otherwise.
+        if !MSLAPGate.allows("admin.unenrol", instance: nil) {
+            print("msl admin unenrol: "
+                  + (MSLAPGate.reason("admin.unenrol", instance: nil)
+                     ?? "Not allowed by the MSL Admin Portal"))
+            print("  An administrator with sudo can still remove the file directly.")
+            exit(1)
+        }
+        // Removing management is itself an administrative act, and it has
+        // to remove the FALLBACK too or the last good policy keeps
+        // applying - which would look like MSL ignoring the admin.
+        let target = MSLAPPolicyStore.systemURL
+        print("Removing \(target.path) and the remembered fallback - this needs your Mac password.")
+        let script = "rm -f '\(target.path)' '\(MSLAPPolicyStore.lastGoodURL.path)'"
+        let sudo = Process()
+        sudo.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        sudo.arguments = ["/bin/sh", "-c", script]
+        try? sudo.run()
+        sudo.waitUntilExit()
+        try? FileManager.default.removeItem(at: MSLAPPolicyStore.userURL)
+        print("")
+        printAdminStatus(instance: nil)
+
+    default:
+        print("msl admin: unknown subcommand '\(adminSub)'")
+        print("  status [instance]    what this Mac is locked down to")
+        print("  capabilities         everything a policy can deny")
+        print("  keygen               create a local signing key (local admin mode)")
+        print("  pin <pubkey>         trust a fleet signing key")
+        print("  keys                 list pinned signing keys")
+        print("  sign <policy.json>   sign a policy in place")
+        print("  enrol <policy.json>  install system-wide (sudo) - makes it enforceable")
+        print("  unenrol              remove the policy and its fallback (sudo)")
+        exit(1)
+    }
+    exit(0)
+
 case "doctor":
+    if !MSLAPGate.allows("system.doctor", instance: nil) {
+        print("msl doctor: " + (MSLAPGate.reason("system.doctor", instance: nil)
+                                ?? "Not allowed by the MSL Admin Portal"))
+        exit(1)
+    }
     // Reports the state that no other command surfaces, and deletes only
     // what the user explicitly asks it to. `--fix` is a separate,
     // deliberate invocation rather than a prompt, so it is safe to run
@@ -1613,7 +3258,12 @@ case "doctor":
         binDirectory: MSLPaths.binDirectory,
         instances: registryForLookup.entries(),
         expectedTools: HostToolInstaller.tools,
-        daemonRunning: DaemonClient.isRunning())
+        daemonRunning: DaemonClient.isRunning(),
+        // `MSLAPGate.policy`, not `MSLAPPolicyStore.current()`: the gate
+        // includes the tamper fallback, so a policy somebody edited is
+        // still checked against the last one that verified rather than
+        // reported as no policy at all.
+        policy: MSLAPGate.policy)
     let findings = Diagnostics.run(environment)
 
     for finding in findings {
@@ -1647,7 +3297,37 @@ case "doctor":
     exit(0)
 
 case "instances", "list", "ls":
-    runControl(.instanceList)
+    // `msl list` is your instances; `msl list online` is what you could
+    // install. WSL spells the second one `--list --online`, so both the bare
+    // word and the flag are accepted - nobody should have to remember which.
+    switch args.count > 1 ? args[1] : "" {
+    case "":
+        runControl(.instanceList)
+    case "online", "--online", "available", "distros", "--distros":
+        printDistroTable()
+        exit(0)
+    case "installed", "--installed":
+        let rows = DistroListing.rows(catalog: nil,
+                                      instanceCounts: instanceCountsByDistro(),
+                                      isInstalled: { DistroInstallation.isInstalled($0) })
+            .filter(\.isInstalled)
+        guard !rows.isEmpty else {
+            print("No distro images downloaded yet - msl list online shows what there is.")
+            exit(0)
+        }
+        print("Downloaded distros:")
+        print(DistroListing.table(rows), terminator: "")
+        exit(0)
+    case let unknown:
+        FileHandle.standardError.write("""
+        msl: `msl list \(unknown)` isn't a thing. Try:
+             msl list              your instances
+             msl list online       every distro you can install
+             msl list installed    the distro images already downloaded
+
+        """.data(using: .utf8)!)
+        exit(1)
+    }
 
 case "new":
     // Explicit creation, so the near-miss guard below has something
@@ -1676,7 +3356,7 @@ case "new":
         }
         requireInstalled(instance: "", distro: setupDistro)
         guard let created = runInstallSetup(for: setupDistro) else { exit(1) }
-        print("next: msl \(created)")
+        print("next: msl run \(created)")
         exit(0)
     }
     guard newPositional.count == 1 else {
@@ -1684,6 +3364,12 @@ case "new":
         exit(1)
     }
     let newName = newPositional[0]
+    // Before the daemon is asked, so a refused name costs nothing and the
+    // message is the same one the interactive prompt gives.
+    if let refusal = CLICommands.nameRefusal(newName) {
+        FileHandle.standardError.write("msl: \(refusal)\n".data(using: .utf8)!)
+        exit(1)
+    }
     let newWarnings: [String]
     do {
         newWarnings = try InstanceSetup.validate(newOptions)
@@ -1712,9 +3398,9 @@ case "new":
         }
     }
     if !newDistro.isCustom && !DistroInstallation.isInstalled(newDistro) {
-        print("next: msl install \(newDistro.rawValue), then msl \(newName)")
+        print("next: msl install \(newDistro.rawValue), then msl run \(newName)")
     } else {
-        print("next: msl \(newName)")
+        print("next: msl run \(newName)")
     }
     exit(0)
 
@@ -1830,6 +3516,641 @@ case "remove":
     }
     runControl(.remove(instance: removeNames[0], keepDisk: !removeOptions.isEmpty))
 
+case "vault":
+    // Administrator-held container keys. `READMES/32` §4.1.
+    let vaultArgs = Array(args.dropFirst())
+    let vaultAction = (vaultArgs.first { ["unlock", "lock", "adopt", "status"].contains($0) }
+                       ?? "status")
+    let vaultNames = vaultArgs.filter {
+        !$0.hasPrefix("-") && !["unlock", "lock", "adopt", "status"].contains($0)
+    }
+    guard let vaultInstance = vaultNames.first else {
+        print("usage: msl vault <instance> [status|unlock|lock|adopt]")
+        print("")
+        print("  status   whether its disk is in a container, and whose key opens it")
+        print("  adopt    move the container to a passphrase YOU hold - after this,")
+        print("           nothing on this Mac can open it until somebody types it,")
+        print("           and there is no recovery if it is lost")
+        print("  unlock   supply that passphrase for this session")
+        print("  lock     forget it again and close the container")
+        exit(vaultNames.isEmpty && vaultArgs.isEmpty ? 2 : 1)
+    }
+    guard registryForLookup.distro(for: vaultInstance) != nil else {
+        FileHandle.standardError.write("msl: there's no instance called \(vaultInstance) - `msl list` shows them\n".data(using: .utf8)!)
+        exit(1)
+    }
+
+    if vaultAction == "status" {
+        guard case .valid(let vaultIdentity) = InstanceIdentityStore.verdict(for: vaultInstance) else {
+            print("\(vaultInstance): no verified identity, so MSL cannot tell which container is its.")
+            exit(0)
+        }
+        guard InstanceVault.exists(serial: vaultIdentity.serial) else {
+            print("\(vaultInstance): its disk is a plain file.")
+            print("      `msl protect \(vaultInstance)` moves it into an encrypted container.")
+            exit(0)
+        }
+        // Asked of the daemon: the unwrapped key lives in ITS memory, so
+        // this process's own table is always empty and would report every
+        // admin-held container as locked.
+        let vaultReply = sendControlRequestMultiline(
+            .vaultKey(instance: vaultInstance, action: "status", passphrase: ""))
+        // **No silent default.** An older daemon, or one that cannot
+        // answer, must not be reported as "opened by this Mac's own key" -
+        // that is the weaker rung, and claiming it for a container that is
+        // actually admin-held would be exactly the wrong way to be wrong.
+        guard vaultReply?.hasPrefix("OK") == true,
+              case let vaultFields = String(vaultReply!.dropFirst(2))
+                  .trimmingCharacters(in: .whitespaces).components(separatedBy: "\t"),
+              let vaultMode = VaultKeyMode(rawValue: vaultFields.first ?? "") else {
+            print("\(vaultInstance): its disk is in a container, but mslhd could not say whose key")
+            print("      opens it. Restart it (`launchctl kickstart -k gui/$UID/com.msl.mslhd`)")
+            print("      and try again - an older daemon does not know how to answer.")
+            exit(1)
+        }
+        let vaultOpen = vaultFields.count > 1 && vaultFields[1] == "1"
+        switch vaultMode {
+        case .machine:
+            print("\(vaultInstance): in an encrypted container, opened by this Mac's own key.")
+            print("      A copy of the file is useless elsewhere. Someone with administrator")
+            print("      access HERE could still reach the key - `msl vault \(vaultInstance) adopt`")
+            print("      moves it to a passphrase you hold instead.")
+        case .adminHeld:
+            print("\(vaultInstance): in an encrypted container, opened by a passphrase you hold.")
+            print("      \(vaultOpen ? "Unlocked - it can start until mslhd restarts." : "LOCKED - it will not start until unlocked.")")
+            print("      The key is never written down, so a reboot asks again.")
+        }
+        exit(0)
+    }
+
+    // A passphrase is read from the terminal, never taken as an argument:
+    // an argument list is world-readable through `ps`.
+    var vaultPassphrase = ""
+    if vaultAction != "lock" {
+        guard isatty(STDIN_FILENO) == 1 else {
+            FileHandle.standardError.write(
+                "msl: run this at a terminal - the passphrase is typed, never passed as an argument\n"
+                    .data(using: .utf8)!)
+            exit(1)
+        }
+        if vaultAction == "adopt" {
+            print("Moving \(vaultInstance)'s container to a passphrase you hold.")
+            print("")
+            print("  After this, NOTHING on this Mac can open it until somebody types that")
+            print("  passphrase - including MSL after a reboot. **There is no recovery if it")
+            print("  is lost: the disk becomes unreadable permanently.**")
+            print("")
+        }
+        guard let typed = String(validatingCString: getpass("Passphrase: ")), !typed.isEmpty else {
+            FileHandle.standardError.write("msl: no passphrase given\n".data(using: .utf8)!)
+            exit(1)
+        }
+        if vaultAction == "adopt" {
+            guard let again = String(validatingCString: getpass("Again: ")), again == typed else {
+                FileHandle.standardError.write("msl: the two did not match\n".data(using: .utf8)!)
+                exit(1)
+            }
+        }
+        vaultPassphrase = typed
+    }
+    runControl(.vaultKey(instance: vaultInstance, action: vaultAction,
+                         passphrase: vaultPassphrase))
+
+case "protect", "unprotect":
+    // Moves an instance's disk into an encrypted container, or back out.
+    //
+    // A real copy of the whole disk - `clonefile` cannot cross into a
+    // container - so the size is said BEFORE anything starts rather than
+    // discovered as a long silence.
+    let protectVerb = args.first ?? "protect"
+    let protectNames = args.dropFirst().filter { !$0.hasPrefix("-") }
+    guard protectNames.count == 1 else {
+        FileHandle.standardError.write("usage: msl \(protectVerb) <instance>\n".data(using: .utf8)!)
+        exit(2)
+    }
+    let protectName = protectNames[0]
+    guard registryForLookup.distro(for: protectName) != nil else {
+        FileHandle.standardError.write("msl: there's no instance called \(protectName) - `msl list` shows them\n".data(using: .utf8)!)
+        exit(1)
+    }
+    let protectDiskPath = InstanceDisk.url(instance: protectName).path
+    let protectSize = DiskStorage.allocatedSize(of: protectDiskPath)
+    if protectVerb == "protect" {
+        print("Moving \(protectName)'s disk into an encrypted container.")
+        print("")
+        print("  This is a real copy of \(DiskStorage.format(protectSize)) - MSL's instant")
+        print("  clone trick cannot cross into a container - so it takes a few minutes and")
+        print("  needs that much free space while it runs. The original is removed only")
+        print("  after the copy inside has been read back and checked, so there is no")
+        print("  moment where both are gone.")
+        print("")
+        print("  What it buys: a copy of the file is useless without this Mac. What it does")
+        print("  NOT buy: anything inside the instance is still readable to anyone who can")
+        print("  open a shell in it.")
+    } else {
+        print("Moving \(protectName)'s disk back out of its container, as a plain file.")
+        print("  \(DiskStorage.format(protectSize)) to copy. After this, a copy of the file")
+        print("  is readable by anyone who has it.")
+    }
+    print("")
+    print("Progress is in ~/Library/Logs/MSL/mslhd.log - this command waits.")
+    runControlWithTimeout(.protectInstance(instance: protectName,
+                                           enable: protectVerb == "protect"),
+                          timeout: 3600)
+
+case "identity":
+    // **Report before enforce.** Nothing refuses anything on an identity
+    // yet, deliberately: this touches the boot path of every instance on
+    // every Mac, and a week of a read-only verdict is the only way to find
+    // out what real machines say before a refusal can strand anybody.
+    // See READMES/31-INSTANCE-IDENTITY.md step 3.
+    let identityNames = args.dropFirst().filter { !$0.hasPrefix("-") }
+    let identityAccepted = InstanceIdentityKey.accepted()
+    let identityAll = InstanceIdentityStore.all(accepting: identityAccepted)
+    let identityDuplicates = InstanceIdentityStore.duplicateSerials(accepting: identityAccepted)
+
+    func printIdentity(_ name: String) {
+        let verdict = InstanceIdentityStore.verdict(for: name, accepting: identityAccepted)
+        switch verdict {
+        case .unidentified:
+            print("\(name): no identity recorded")
+            print("      Made before MSL issued them, or issued on another Mac. Nothing refuses it.")
+        case .invalid(let why):
+            print("\(name): identity does NOT verify")
+            print("      \(why)")
+            print("      Somebody edited it, or it was signed by a key this Mac does not accept.")
+        case .valid(let identity):
+            let what = identity.isClone
+                ? "copy \(identity.generation) of its lineage"
+                : "an original"
+            print("\(name): \(what)")
+            print("      lineage   \(identity.lineage)")
+            print("      copies    \(identity.depth) (\(identity.generation))")
+            print("      born as   \(identity.origin) on machine \(identity.machine)")
+            print("      signed by \(identity.issuer)")
+            // The administrator's statement about this lineage, if any.
+            // Printed with its strength, because a certificate in the
+            // user-writable location is a different thing from one a
+            // non-administrator cannot touch.
+            switch LineageCertificateStore.verdict(for: identity.lineage) {
+            case .none:
+                break
+            case .certified(let label, let certIssuer, let rootOwned):
+                print("      certified as \"\(label)\"" + (certIssuer.map { " by \($0)" } ?? ""))
+                print("      " + (rootOwned
+                    ? "the certificate is root-owned, so a non-administrator cannot change it"
+                    : "the certificate is user-writable - advisory only on this Mac"))
+            case .revoked(let label, let reason):
+                print("      WITHDRAWN: \"\(label)\" has been revoked by its administrator"
+                      + (reason.map { " - \($0)" } ?? ""))
+                print("      This instance will not start.")
+            case .invalid(let why):
+                print("      its lineage certificate does NOT verify: \(why)")
+            }
+            if identity.origin != name {
+                // Worth saying out loud: the name it answers to now is not
+                // the name a policy scope written at birth would match, and
+                // `origin` is the signed field that closes that.
+                print("      renamed since (scopes match '\(identity.origin)' too)")
+            }
+            if let clash = identityDuplicates[identity.serial] {
+                print("      ALSO CLAIMED BY \(clash.filter { $0 != name }.joined(separator: ", "))")
+                print("      Two instances cannot be the same instance - one of them is a copy.")
+            }
+        }
+    }
+
+    // The way back from a marker that went missing innocently - a disk
+    // cleanup, an /etc restore, somebody tidying. MSL will not do this on
+    // its own, because rewriting a marker stamps an instance's identity
+    // onto whatever disk is actually there; asking for it explicitly is
+    // the point.
+    if args.dropFirst().contains("--rewrite-marker") {
+        guard let one = identityNames.first else {
+            FileHandle.standardError.write("usage: msl identity <instance> --rewrite-marker\n".data(using: .utf8)!)
+            exit(2)
+        }
+        print("This tells MSL that \(one)'s disk really is the one it recorded.")
+        print("Only do it if you know that is true - if the disk was replaced, this makes")
+        print("MSL stop noticing.")
+        runControl(.rewriteIdentityMarker(instance: one))
+    }
+
+    if let one = identityNames.first {
+        guard registryForLookup.distro(for: one) != nil else {
+            FileHandle.standardError.write("msl: there's no instance called \(one) - `msl list` shows them\n".data(using: .utf8)!)
+            exit(1)
+        }
+        printIdentity(one)
+        exit(0)
+    }
+
+    let known = registryForLookup.list()
+    guard !known.isEmpty else {
+        print("No instances registered.")
+        exit(0)
+    }
+    for name in known { printIdentity(name) }
+
+    // Whether the one-shot pass has run, because it is what decides
+    // whether an instance with no identity gets given one - and somebody
+    // reading this list deserves to know which regime they are in.
+    print("")
+    if let record = InstanceIdentityMigration.record() {
+        print("Tracking provenance since \(record.completed.formatted(date: .abbreviated, time: .shortened)).")
+        if MSLAPGate.policy != nil {
+            print("      This Mac is managed, so an instance that turns up without an identity")
+            print("      from now on is NOT given one - it appeared after tracking started.")
+        } else {
+            print("      This Mac is not managed, so an instance without an identity is given one.")
+        }
+    } else {
+        print("Provenance tracking has not started yet - it begins the next time mslhd starts.")
+    }
+    // State left by an instance that no longer exists - the same class of
+    // finding `msl doctor` already reports for app lists and disks.
+    let orphanIdentities = identityAll.keys.filter { !known.contains($0) }.sorted()
+    if !orphanIdentities.isEmpty {
+        print("")
+        print("Identities left by removed instances: \(orphanIdentities.joined(separator: ", "))")
+        print("      `msl doctor` can clear them.")
+    }
+    exit(0)
+
+case "forward", "unforward":
+    let forwardVerb = args.first ?? "forward"
+    let forwardArgs = Array(args.dropFirst())
+    let viaSSH = forwardArgs.contains("--ssh")
+    let forwardPositional = forwardArgs.filter { !$0.hasPrefix("-") }
+
+    if forwardVerb == "unforward" {
+        // Just a port: a host port is unique across this Mac, so naming
+        // the instance as well would be noise the user could get wrong.
+        guard forwardPositional.count == 1, let port = UInt16(forwardPositional[0]), port > 0 else {
+            FileHandle.standardError.write("usage: msl unforward <port on this Mac>\n".data(using: .utf8)!)
+            exit(2)
+        }
+        runControl(.forwardRemove(hostPort: port))
+    }
+
+    let forwardInstance = forwardPositional.first ?? startupInstance()
+    guard registryForLookup.distro(for: forwardInstance) != nil else {
+        FileHandle.standardError.write("msl: there's no instance called \(forwardInstance) - `msl list` shows them\n".data(using: .utf8)!)
+        exit(1)
+    }
+    let forwardPair = forwardPositional.dropFirst().first
+
+    guard let forwardPair, forwardPair != "list" else {
+        // No pair, or an explicit `list`: show what is forwarded. Live is
+        // reported separately from recorded, because a forward whose
+        // listener died is the "looks fine and is not" state and a list
+        // that could not tell them apart would be what hides it.
+        guard let reply = sendControlRequestMultiline(.forwardList(instance: forwardInstance)) else {
+            FileHandle.standardError.write("msl: couldn't reach mslhd\n".data(using: .utf8)!)
+            exit(1)
+        }
+        guard reply.hasPrefix("OK") else {
+            print(reply.replacingOccurrences(of: "ERROR ", with: "msl: "))
+            exit(1)
+        }
+        // Each field trimmed: the reply is `OK <body>`, so dropping two
+        // characters leaves the separating space on the first line only -
+        // which printed as `localhost: 8080` for the first forward and
+        // `localhost:8081` for every other one.
+        let rows = String(reply.dropFirst(2)).split(separator: "\n")
+            .map { $0.components(separatedBy: "\t").map { $0.trimmingCharacters(in: .whitespaces) } }
+            .filter { $0.count >= 4 }
+        guard !rows.isEmpty else {
+            print("Nothing is forwarded for \(forwardInstance).")
+            print("\nForward one: msl forward \(forwardInstance) 8080:3000")
+            exit(0)
+        }
+        print("Forwarded for \(forwardInstance):")
+        for row in rows {
+            let route = row[2] == "viaSSH" ? " through SSH" : ""
+            let live = row[3] == "1" ? "" : "  (not running - starts with the instance)"
+            print("  localhost:\(row[0])  ->  \(forwardInstance):\(row[1])\(route)\(live)")
+        }
+        exit(0)
+    }
+
+    guard let ports = PortForward.parsePair(forwardPair) else {
+        FileHandle.standardError.write("usage: msl forward <instance> <port on this Mac>:<port in Linux> [--ssh]\n"
+            .data(using: .utf8)!)
+        exit(2)
+    }
+    if let note = PortForward.privilegedPortNote(ports.host) {
+        FileHandle.standardError.write("msl: \(note)\n".data(using: .utf8)!)
+        exit(1)
+    }
+    // **Multiline, not `runControl`.** `runControl` reads a single line, and
+    // the most useful thing this command says - that nothing is listening
+    // on the guest side, and which route reaches a loopback-bound server -
+    // arrives on the second. Sending it and then truncating it away was
+    // worse than never writing it: the forward reported OK and the reason
+    // it would not carry traffic was dropped on the floor.
+    guard let reply = sendControlRequestMultiline(
+        .forwardAdd(instance: forwardInstance, hostPort: ports.host,
+                    guestPort: ports.guest, viaSSH: viaSSH)) else {
+        FileHandle.standardError.write("msl: couldn't reach mslhd\n".data(using: .utf8)!)
+        exit(1)
+    }
+    print(reply.replacingOccurrences(of: "ERROR ", with: "msl: "))
+    exit(reply.hasPrefix("OK") ? 0 : 1)
+
+case "rename", "clone":
+    let transferVerb = args.first ?? "rename"
+    let transferNames = args.dropFirst().filter { !$0.hasPrefix("-") }
+    guard transferNames.count == 2 else {
+        FileHandle.standardError.write("usage: msl \(transferVerb) <instance> <new name>\n".data(using: .utf8)!)
+        exit(2)
+    }
+    // Said before it happens, because both have a consequence that is
+    // obvious afterwards and not before. A rename leaves the generated
+    // app bundles behind (their launch command names the old instance),
+    // and a clone's copy shares the original's host keys and machine-id
+    // until the guest regenerates them.
+    if transferVerb == "rename" {
+        print("Renaming \(transferNames[0]) to \(transferNames[1]). Its apps are rescanned the next "
+              + "time you open the Applications tab - any Launchpad entries and Dock pins for the old "
+              + "name are removed, since a generated app launches an instance by name.")
+    } else {
+        print("Cloning \(transferNames[0]) to \(transferNames[1]): its disk, accounts, files and "
+              + "settings, as a separate instance. The copy keeps the original's SSH host key until "
+              + "the guest makes a new one, so `msl ssh` may warn about a changed key.")
+    }
+    runControl(transferVerb == "rename"
+        ? .renameInstance(instance: transferNames[0], newName: transferNames[1])
+        : .cloneInstance(instance: transferNames[0], newName: transferNames[1]))
+
+case "dns":
+    // Part of the privacy options: who answers this instance's name lookups.
+    // Traffic still leaves through the Mac, which the wording says plainly.
+    let dnsArgs = Array(args.dropFirst())
+    let dnsPositional = dnsArgs.filter { !$0.hasPrefix("-") }
+    let dnsInstance = dnsPositional.first.flatMap { registryForLookup.distro(for: $0) != nil ? $0 : nil } ?? startupInstance()
+    guard let dnsDistro = registryForLookup.distro(for: dnsInstance) else {
+        FileHandle.standardError.write("msl: there's no instance called \(dnsInstance) - `msl list` shows them\n".data(using: .utf8)!)
+        exit(1)
+    }
+    let dnsWanted = dnsPositional.first(where: { $0 != dnsInstance })
+    guard let dnsWanted else {
+        do {
+            let reading = try GuestDNS.read(instance: dnsInstance, distro: dnsDistro)
+            switch reading.source {
+            case .unknown:
+                print("\(dnsInstance) resolves with: whatever the distro decides")
+            case .stubOnly:
+                // True, and useless on its own: the stub forwards somewhere
+                // this read could not see.
+                print("\(dnsInstance) resolves through a local stub (\(reading.servers.joined(separator: ", "))) - the distro decides where it forwards")
+            case .configured:
+                print("\(dnsInstance) is set to resolve with: \(reading.servers.joined(separator: ", "))")
+            case .resolved, .resolvConf:
+                print("\(dnsInstance) resolves with: \(reading.servers.joined(separator: ", "))")
+            }
+            print("\nChange it: msl dns \(dnsInstance) auto|cloudflare|google|quad9|<address>")
+        } catch {
+            FileHandle.standardError.write("msl: couldn't ask \(dnsInstance) - \(error)\n".data(using: .utf8)!)
+            exit(1)
+        }
+        exit(0)
+    }
+    let dnsChoice: GuestDNS.Choice
+    switch dnsWanted.lowercased() {
+    case "auto", "automatic", "default": dnsChoice = .automatic
+    case "cloudflare": dnsChoice = .cloudflare
+    case "google": dnsChoice = .google
+    case "quad9": dnsChoice = .quad9
+    default:
+        let servers = dnsWanted.split(separator: ",").map(String.init)
+        guard servers.allSatisfy(GuestDNS.isValidServer) else {
+            FileHandle.standardError.write("msl: '\(dnsWanted)' is not an address or a known choice (auto, cloudflare, google, quad9)\n".data(using: .utf8)!)
+            exit(2)
+        }
+        dnsChoice = GuestDNS.Choice(name: "Custom", servers: servers)
+    }
+    do {
+        guard try GuestDNS.apply(dnsChoice, instance: dnsInstance, distro: dnsDistro) else {
+            FileHandle.standardError.write("msl: \(dnsInstance) refused the change\n".data(using: .utf8)!)
+            exit(1)
+        }
+        if dnsChoice.servers.isEmpty {
+            print("\(dnsInstance) is back to the distro's own DNS.")
+        } else {
+            print("\(dnsInstance) now resolves with \(dnsChoice.servers.joined(separator: ", ")).")
+            print("Lookups are hidden from your local network, not from this Mac: traffic still leaves through it.")
+        }
+        exit(0)
+    } catch {
+        FileHandle.standardError.write("msl: couldn't change DNS in \(dnsInstance) - \(error)\n".data(using: .utf8)!)
+        exit(1)
+    }
+
+case "vpn":
+    // The hide.me client, inside one instance. MSL installs it and reports
+    // what it finds; logging in and connecting stay with the user and their
+    // own account, which is why this prints commands instead of running
+    // them. See `GuestVPN`.
+    let vpnArgs = Array(args.dropFirst())
+    let vpnPositional = vpnArgs.filter { !$0.hasPrefix("-") }
+    let vpnInstance = vpnPositional.first.flatMap { registryForLookup.distro(for: $0) != nil ? $0 : nil } ?? startupInstance()
+    guard let vpnDistro = registryForLookup.distro(for: vpnInstance) else {
+        FileHandle.standardError.write("msl: there's no instance called \(vpnInstance) - `msl list` shows them\n".data(using: .utf8)!)
+        exit(1)
+    }
+    let vpnAction = vpnPositional.first(where: { $0 != vpnInstance })?.lowercased() ?? "status"
+    func printVPNStatus() {
+        do {
+            let status = try GuestVPN.status(instance: vpnInstance, distro: vpnDistro)
+            if status.installed {
+                print("The hide.me client is installed in \(vpnInstance).")
+            } else {
+                print("hide.me is not installed in \(vpnInstance).")
+            }
+            print("  WireGuard in the kernel: \(status.wireGuard ? "yes" : "no")")
+            print("  Logged in: \(status.hasToken ? "yes" : "no")")
+            print("  Connected: \(status.connected ? "yes" : "no")")
+            if let next = status.nextStep() { print("\n\(next)") }
+            if !status.installed { print("Install it: msl vpn \(vpnInstance) install") }
+            print("\nThe tunnel is this instance's only. Your Mac's own traffic doesn't go through it.")
+        } catch {
+            FileHandle.standardError.write("msl: couldn't ask \(vpnInstance) - \(error)\n".data(using: .utf8)!)
+            exit(1)
+        }
+    }
+    switch vpnAction {
+    case "status":
+        printVPNStatus()
+        exit(0)
+    case "install":
+        print("Downloading hide.me \(GuestVPN.version) into \(vpnInstance)...")
+        do {
+            let result = try GuestVPN.install(instance: vpnInstance, distro: vpnDistro)
+            print(result.message)
+            guard result == .installed else { exit(1) }
+            print("You need your own hide.me account - the free servers work with one too.")
+            printVPNStatus()
+            exit(0)
+        } catch {
+            FileHandle.standardError.write("msl: install failed in \(vpnInstance) - \(error)\n".data(using: .utf8)!)
+            exit(1)
+        }
+    case "remove", "uninstall":
+        do {
+            try GuestVPN.remove(instance: vpnInstance, distro: vpnDistro)
+            print("Removed the hide.me client from \(vpnInstance).")
+            exit(0)
+        } catch {
+            FileHandle.standardError.write("msl: couldn't remove it from \(vpnInstance) - \(error)\n".data(using: .utf8)!)
+            exit(1)
+        }
+    default:
+        FileHandle.standardError.write("msl: vpn takes status, install or remove\n".data(using: .utf8)!)
+        exit(2)
+    }
+
+case "lock":
+    // The same switch as the app's Locking card. Enforced by mslhd, so it
+    // covers `msl`, the Dock and anything else that can start an instance.
+    let lockArgs = Array(args.dropFirst())
+    let lockNames = lockArgs.filter { $0 != "on" && $0 != "off" }
+    let lockInstance = lockNames.first ?? startupInstance()
+    guard registryForLookup.distro(for: lockInstance) != nil else {
+        FileHandle.standardError.write("msl: there's no instance called \(lockInstance) - `msl list` shows them\n".data(using: .utf8)!)
+        exit(1)
+    }
+    let wanted = lockArgs.contains("on") ? true : (lockArgs.contains("off") ? false : nil)
+    guard let wanted else {
+        let locked = InstanceLockStore.load().isLocked(lockInstance)
+        print("\(lockInstance) is \(locked ? "locked - starting it asks for Touch ID or your password" : "unlocked").")
+        print("Change it: msl lock \(lockInstance) on|off")
+        exit(0)
+    }
+    guard !wanted || BiometricAuth.isAvailable() else {
+        FileHandle.standardError.write("msl: this Mac has no Touch ID or password set, so there is nothing to ask for\n".data(using: .utf8)!)
+        exit(1)
+    }
+    guard InstanceLockStore.setLocked(wanted, for: lockInstance) else {
+        FileHandle.standardError.write("msl: couldn't save that setting\n".data(using: .utf8)!)
+        exit(1)
+    }
+    print("\(lockInstance) is now \(wanted ? "locked" : "unlocked").")
+    if wanted { print("Starting it will ask; while it's running or suspended it won't ask again.") }
+    exit(0)
+
+case "kitty":
+    // The cat. `msl kitty` shows what a shell opens with; `msl kitty "words"`
+    // gives her a cowsay speech bubble instead; `on`/`off` decide whether
+    // she turns up at the top of every shell.
+    let kittyArgs = Array(args.dropFirst())
+    switch kittyArgs.first {
+    case "on", "off":
+        var settings = PersonalitySettingsStore.load()
+        settings.kitty = kittyArgs[0] == "on"
+        guard PersonalitySettingsStore.save(settings) else {
+            FileHandle.standardError.write("msl: couldn't save that setting\n".data(using: .utf8)!)
+            exit(1)
+        }
+        print("The cat is \(settings.kitty ? "on" : "off") in every shell.")
+        exit(0)
+    case .none:
+        // What a shell would actually show, not the cat in isolation - the
+        // whole point of `msl kitty` is to see what you are turning on.
+        let preview = PersonalitySettingsStore.load()
+        print(PersonalityBanner.render(settings: PersonalitySettings(greeters: preview.greeters, kitty: true),
+                                       greeting: Greeter.nextGreeting()?.text,
+                                       columns: Int(currentWindowSize().cols)) ?? Kitty.art)
+        if !preview.kitty { print("\nShe is off in shells right now: msl kitty on") }
+        exit(0)
+    default:
+        print(Kitty.say(kittyArgs.joined(separator: " ")))
+        exit(0)
+    }
+
+case "greeter":
+    // The line under the msl@distro banner. It prints on every single
+    // session, so it deserves a switch.
+    let greeterArgs = Array(args.dropFirst())
+    switch greeterArgs.first {
+    case "on", "off":
+        var settings = PersonalitySettingsStore.load()
+        settings.greeters = greeterArgs[0] == "on"
+        guard PersonalitySettingsStore.save(settings) else {
+            FileHandle.standardError.write("msl: couldn't save that setting\n".data(using: .utf8)!)
+            exit(1)
+        }
+        print("Greeters are \(settings.greeters ? "on" : "off").")
+        exit(0)
+    case .none:
+        let settings = PersonalitySettingsStore.load()
+        print("Greeters are \(settings.greeters ? "on" : "off"), the cat is \(settings.kitty ? "on" : "off").")
+        print("Change either: msl greeter on|off, msl kitty on|off")
+        // The same renderer the shell uses, so this is not a description of
+        // what happens but the thing itself.
+        if let banner = PersonalityBanner.render(settings: settings,
+                                                 greeting: Greeter.nextGreeting()?.text,
+                                                 columns: Int(currentWindowSize().cols)) {
+            print("\nEvery shell opens with:\n")
+            print(banner)
+        } else {
+            print("\nShells open with nothing extra.")
+        }
+        exit(0)
+    default:
+        FileHandle.standardError.write("usage: msl greeter [on|off]\n".data(using: .utf8)!)
+        exit(2)
+    }
+
+case "fix-home":
+    // The other half of running apps as the user instead of root: apps that
+    // already ran as root left root-owned files in the account's home, and
+    // the account cannot edit its own settings until they are handed back.
+    let fixNames = args.dropFirst().filter { !$0.hasPrefix("-") }
+    let fixDryRun = args.contains("--dry-run") || args.contains("-n")
+    let fixInstance = fixNames.first ?? startupInstance()
+    guard let fixDistro = registryForLookup.distro(for: fixInstance) else {
+        FileHandle.standardError.write("msl: there's no instance called \(fixInstance) - `msl list` shows them\n".data(using: .utf8)!)
+        exit(1)
+    }
+    guard let fixUser = GuestUser.forUserFacingWork(in: fixInstance) else {
+        print("\(fixInstance) has no Linux account yet, so there is nothing to hand over.")
+        print("Open it once (msl \(fixInstance)) and create your account first.")
+        exit(0)
+    }
+    let fixReport: HomeOwnership.Report?
+    do {
+        fixReport = try HomeOwnership.scan(instance: fixInstance, distro: fixDistro)
+    } catch {
+        FileHandle.standardError.write("msl: couldn't check \(fixInstance) - \(error)\n".data(using: .utf8)!)
+        exit(1)
+    }
+    guard let report = fixReport else {
+        print("msl: couldn't find \(fixUser)'s home directory in \(fixInstance).")
+        exit(1)
+    }
+    guard report.needsRepair else {
+        print("\(report.home) is already \(fixUser)'s. Nothing to do.")
+        exit(0)
+    }
+    print("\(report.wrongCount) file(s) in \(report.home) don't belong to \(fixUser).")
+    print("They were made by apps MSL used to run as root.")
+    for sample in report.samples.prefix(10) { print("    \(sample)") }
+    if report.wrongCount > report.samples.count { print("    ...") }
+    if fixDryRun {
+        print("\nDry run. To hand them back: msl fix-home \(fixInstance)")
+        exit(0)
+    }
+    print("\nGiving them to \(fixUser)...")
+    do {
+        let repaired = try HomeOwnership.repair(instance: fixInstance, distro: fixDistro)
+        print("OK handed \(repaired) file(s) back to \(fixUser).")
+        exit(0)
+    } catch {
+        FileHandle.standardError.write("msl: couldn't repair \(fixInstance) - \(error)\n".data(using: .utf8)!)
+        exit(1)
+    }
+
 case "remove-distro":
     let distroNames = args.dropFirst().filter { !$0.hasPrefix("-") }
     guard distroNames.count == 1, let doomed = GuestDistro(rawValue: distroNames[0]) else {
@@ -1848,6 +4169,14 @@ case "remove-distro":
     runControl(.removeDistro(distro: doomed))
 
 case "uninstall":
+    // A managed Mac can be stopped from having MSL removed from under it.
+    // Binds this account, not root - `sudo` still works, and the message
+    // says so rather than implying otherwise.
+    if !MSLAPGate.allows("system.uninstall", instance: nil) {
+        print("msl uninstall: " + (MSLAPGate.reason("system.uninstall", instance: nil)
+                                   ?? "Not allowed by the MSL Admin Portal"))
+        exit(1)
+    }
     // Removes MSL. Keeps the Linux, unless explicitly told otherwise - see
     // `Uninstaller`, which owns the plan, the order and the safety rules.
     // This is the only implementation; MSL.app's button runs this command.
@@ -1921,7 +4250,19 @@ case "uninstall":
             parts.append("sudo rm -rf " + uninstallReport.needsSudo.map { "'\($0)'" }.joined(separator: " "))
         }
         if hasReceipt { parts.append("sudo pkgutil --forget com.msl.app") }
-        print("\nmsl: the installer put \(uninstallReport.needsSudo.isEmpty ? "a receipt" : "these") in place as the system, so finishing needs your password:\n    \(parts.joined(separator: " && "))")
+        // **Finish it, rather than handing somebody a `sudo rm -rf` to
+        // paste.** That is not an uninstaller finishing; it is an
+        // uninstaller stopping. People who will not paste it are left with
+        // MSL half-removed and no idea which half, and people who will are
+        // being trained to run `sudo rm -rf` from something they read on a
+        // screen.
+        print("\nmsl: a few parts belong to the system, so macOS will ask for your password.")
+        if let why = Uninstaller.finishPrivileged(uninstallReport) {
+            print("msl: \(why)")
+            print("msl: to finish by hand: \(parts.joined(separator: " && "))")
+        } else {
+            print("msl: done - nothing of MSL is left on this Mac.")
+        }
     }
     if !uninstallReport.failed.isEmpty {
         print("")
@@ -1941,6 +4282,131 @@ case "uninstall":
         print("\nmsl: MSL and everything it stored are gone.")
     }
     exit(0)
+
+case "public":
+    // Reaching an instance from outside this Mac. The verb is deliberately
+    // not a flag on `msl ssh`: publishing a machine to the internet should
+    // read as its own decision, not as an option on something routine.
+    switch args.count > 1 ? args[1] : "status" {
+    case "expose", "on":
+        var instance = defaultInstance
+        var backend = "relay-pinggy"
+        var force = false
+        for argument in args.dropFirst(2) {
+            if argument == "--yes" || argument == "-y" {
+                force = true
+            } else if argument.hasPrefix("--via=") {
+                // `--via=user@host:2222` publishes through a server you own,
+                // which is the backend a real mini server wants: the address
+                // is yours and nothing expires.
+                let value = String(argument.dropFirst("--via=".count))
+                if value.hasPrefix("relay-") {
+                    backend = value
+                } else if value == "tailscale" || value.hasPrefix("tailscale:") {
+                    backend = value.contains(":") ? value : "tailscale:2222"
+                } else {
+                    backend = selfHostedToken(value)
+                }
+            } else if argument.hasPrefix("relay-") {
+                backend = argument
+            } else {
+                instance = argument
+            }
+        }
+        confirmPublish(instance: instance, force: force)
+        runPublicExpose(instance: instance, backend: backend)
+    case "revoke", "off":
+        runControl(.publicRevoke(instance: args.count > 2 ? args[2] : defaultInstance))
+    case "status":
+        runPublicStatus(instance: args.count > 2 ? args[2] : defaultInstance)
+    case "authorize", "add-key":
+        guard args.count >= 4 else {
+            printAuthorizeHelp(defaultInstance)
+            exit(args.count >= 3 ? 0 : 1)
+        }
+        runPublicAuthorize(instance: args[2], keyOrFile: args[3],
+                           label: args.count > 4 ? args[4] : "")
+    case "deauthorize", "remove-key":
+        guard args.count >= 4 else {
+            print("msl public deauthorize <instance> <label-or-fingerprint>")
+            exit(1)
+        }
+        runControl(.publicDeauthorize(instance: args[2], match: args[3]))
+    case "tips", "how":
+        // `msl public tips <instance> [windows|mac|linux|freebsd]`
+        runPublicTips(instance: args.count > 2 ? args[2] : defaultInstance,
+                      platform: args.count > 3 ? args[3] : "")
+    case "keys":
+        runPublicKeys(instance: args.count > 2 ? args[2] : defaultInstance)
+    case "key":
+        // Where this Mac's own key is, and a way straight to it. Asked
+        // often enough - after a publish, the next thing people want is the
+        // file itself - that hunting for a path under /Users/Shared is the
+        // wrong answer.
+        runPublicKeyLocation(instance: args.count > 2 ? args[2] : defaultInstance,
+                             reveal: args.contains("--reveal") || args.contains("-r"))
+    case "notify", "email":
+        runPublicNotify(args, defaultInstance: defaultInstance)
+    case "invite":
+        guard args.count >= 4 else {
+            print("msl public invite <instance> <name>")
+            print("")
+            print("Makes them a key and prints everything they need, ready to paste")
+            print("into a message. Use this when you have not set up email.")
+            exit(1)
+        }
+        runPublicInvite(instance: args[2], label: args[3...].joined(separator: " "))
+    default:
+        usageAndExit()
+    }
+
+case "usb":
+    // `msl usb` with no verb lists, because listing is the only thing that
+    // is safe to do by accident.
+    switch args.count > 1 ? args[1] : "list" {
+    case "list":
+        runUSBList()
+    case "attach":
+        guard args.count >= 3 else { usageAndExit() }
+        var device = ""
+        var instance = defaultInstance
+        for argument in args.dropFirst(2) {
+            if argument.hasPrefix("-") { usageAndExit() }
+            else if device.isEmpty { device = argument }
+            else { instance = argument }
+        }
+        guard !device.isEmpty else { usageAndExit() }
+        runUSBAttach(device: device, instance: instance)
+    case "relay":
+        // Prints a socket path for a root helper to serve a device on, and
+        // exits. `msl usb attach` does this and starts the helper itself;
+        // this exposes the halfway point for scripts, for a future USB
+        // panel in MSL.app, and for driving the privileged path by hand.
+        //
+        // Safe to expose: the socket is useless to anything that is not
+        // root, because mslhd checks the peer's uid before it will relay a
+        // byte.
+        guard args.count >= 3 else { usageAndExit() }
+        runControl(.usbRelay(instance: args.count > 3 ? args[3] : defaultInstance, device: args[2]))
+    case "detach":
+        guard args.count >= 3 else { usageAndExit() }
+        let instance = args.count > 3 ? args[3] : defaultInstance
+        runControl(.usbDetach(instance: instance, device: args[2]))
+    case "test":
+        // Attaches MSL's synthetic device: proves the whole passthrough
+        // path end to end without any hardware plugged in.
+        //
+        // `--relay` drives the *privileged* half of that path instead - the
+        // root helper, the handshake socket, the uid check and the pump -
+        // with the same device that needs no hardware. Without it there is
+        // no way to verify the capture tier on a Mac with nothing plugged
+        // in, which is exactly the Mac this was developed on.
+        let relayTest = args.contains("--relay")
+        let testInstance = args.dropFirst(2).first { !$0.hasPrefix("-") } ?? defaultInstance
+        runUSBAttach(device: "synthetic", instance: testInstance, forceRelay: relayTest)
+    default:
+        usageAndExit()
+    }
 
 case "snapshot":
     guard args.count >= 2 else { usageAndExit() }
@@ -1969,13 +4435,12 @@ case "power-test":
     runControl(.powerTest(event: args[1]))
 
 case "storage":
-    // Show or change how much disk an instance may use. The image is
-    // per-distro, not per-instance (see `InstanceRegistry`), so this
-    // reports the name of the file it is actually talking about rather
-    // than pretending the setting is private to one instance.
+    // Show or change how much disk an instance may use. Private to that
+    // instance since each one has its own disk (`InstanceDisk`); it used to
+    // be the distro's image, shared by every instance of it.
     let storageInstance = args.count > 1 && !args[1].hasPrefix("-") ? args[1] : defaultInstance
     let storageDistro = effectiveDistro(forInstance: storageInstance)
-    let storageBoot = storageDistro.bootFiles()
+    let storageBoot = storageDistro.bootFiles(instance: storageInstance)
     let imageName = storageBoot.storageKey
     let imagePath = storageBoot.disk.path
     let verb = args.count > 2 ? args[2] : "show"
@@ -2015,8 +4480,17 @@ case "storage":
             exit(1)
         }
         let mode: StorageMode = verb == "fixed" ? .fixed : .dynamic
-        DiskStorage.setPolicy(StoragePolicy(mode: mode, size: size, autoGrow: mode == .dynamic),
-                              forImageNamed: imageName)
+        // Reported, never assumed: `setPolicy` refuses a change MSLAP
+        // forbids, and printing "is now fixed at 32G" over a refusal is
+        // worse than the refusal itself.
+        guard DiskStorage.setPolicy(StoragePolicy(mode: mode, size: size, autoGrow: mode == .dynamic),
+                                    forImageNamed: imageName) else {
+            let why = MSLAPGate.reason("resources.disk", instance: storageInstance)
+                ?? MSLAPGate.reason("resources.edit", instance: storageInstance)
+                ?? "the disk settings could not be saved"
+            FileHandle.standardError.write("msl: \(why)\n".data(using: .utf8)!)
+            exit(1)
+        }
         print("msl: \(storageInstance) is now \(verb) at \(DiskStorage.format(size))")
 
         // Applying it needs the VM stopped: a guest's disk capacity is
@@ -2078,6 +4552,15 @@ case "install-tools":
     let toolResult = HostToolInstaller.install(from: toolSource)
     for tool in toolResult.installed { print("installed \(tool)") }
     for tool in toolResult.missing { print("missing \(tool) - not in \(HostToolInstaller.runningBinaryDirectory.path)") }
+    // Generated apps embed a copy of the launcher from the day they were
+    // made. MSL.app refreshes them at startup; without this, deploying from
+    // the command line left every already-added app running the old copy -
+    // which is exactly how a launch fix can look like it did nothing.
+    let refreshed = LinuxAppBundle.refreshLaunchers()
+    if refreshed > 0 { print("refreshed \(refreshed) generated app(s)") }
+    for tool in toolResult.skippedOlder {
+        print("kept the newer installed \(tool) - this build's copy is older")
+    }
     for (tool, reason) in toolResult.failed { print("failed \(tool): \(reason)") }
     if DaemonClient.installLaunchAgent() {
         print("installed the mslhd LaunchAgent (\(MSLPaths.launchAgentPlist.path))")
@@ -2110,8 +4593,13 @@ case "apps":
     }
 
     func descriptor(for app: LinuxApp) -> LinuxAppBundle.Descriptor {
+        // `qualifiedName`, the same as the app's own descriptor: two
+        // packagings of one application (a Flatpak Calculator and a Snap
+        // Calculator) both wanted `Calculator.app`, so installing the
+        // second silently replaced the first.
         LinuxAppBundle.Descriptor(
-            instance: appsInstance, distro: appsDistro, displayName: app.name,
+            instance: appsInstance, distro: appsDistro, displayName: app.qualifiedName,
+            menuName: app.name,
             command: app.command, icon: LinuxAppCatalog.icon(for: app, instance: appsInstance))
     }
 
@@ -2124,7 +4612,7 @@ case "apps":
             exit(0)
         }
         for app in apps {
-            let marker = installed.contains(LinuxAppBundle.fileSafeName(app.name)) ? "*" : " "
+            let marker = installed.contains(LinuxAppBundle.fileSafeName(app.qualifiedName)) ? "*" : " "
             let hasIcon = LinuxAppCatalog.hasRealIcon(for: app, instance: appsInstance) ? "icon" : "    "
             print("\(marker) \(hasIcon)  \(app.name.padding(toLength: min(28, max(app.name.count, 28)), withPad: " ", startingAt: 0))  \(app.command)")
         }
@@ -2138,11 +4626,7 @@ case "apps":
         }
         let wanted = args.dropFirst(3).joined(separator: " ")
         let apps = loadApps(rescanning: false)
-        guard let app = apps.first(where: { $0.name.lowercased() == wanted.lowercased() })
-            ?? apps.first(where: { $0.name.lowercased().contains(wanted.lowercased()) }) else {
-            FileHandle.standardError.write("msl: no application matching '\(wanted)' in \(appsInstance)\n".data(using: .utf8)!)
-            exit(1)
-        }
+        let app = resolveApp(named: wanted, in: apps, instance: appsInstance)
         do {
             let url = try LinuxAppBundle.generate(descriptor(for: app))
             print("created \(url.path)")
@@ -2175,11 +4659,7 @@ case "apps":
         }
         let wantedPin = args.dropFirst(3).joined(separator: " ")
         let appsForPin = loadApps(rescanning: false)
-        guard let app = appsForPin.first(where: { $0.name.lowercased() == wantedPin.lowercased() })
-            ?? appsForPin.first(where: { $0.name.lowercased().contains(wantedPin.lowercased()) }) else {
-            FileHandle.standardError.write("msl: no application matching '\(wantedPin)' in \(appsInstance)\n".data(using: .utf8)!)
-            exit(1)
-        }
+        let app = resolveApp(named: wantedPin, in: appsForPin, instance: appsInstance)
         let pinDescriptor = descriptor(for: app)
         if appsAction == "pin", !LinuxAppBundle.exists(pinDescriptor) {
             do {
@@ -2245,27 +4725,22 @@ case "files", "--files":
     exit(0)
 
 case let instanceName?:
-    // ...but not if it looks like a fat-fingered subcommand.
+    // A word MSL doesn't recognise is an instance name - that is what makes
+    // `msl work` open a shell with no ceremony, and `msl fedora` set up a
+    // Fedora on a fresh install with nothing else to remember.
     //
-    // Order matters, and the two passes above the check are what keep this
-    // safe. An instance that already exists is always addressable, whatever
-    // it is called; and a bare distro name means `--distro <that>` (see
-    // `effectiveDistro`), so `msl fedora` must keep working no matter how
-    // close it lands to some future subcommand. Only a name that is neither
-    // is a candidate for "did you mean".
+    // It was also unguarded. Any word at all became a real instance with a
+    // real disk: a leading `-` from a mistyped flag, and `msl about` quietly
+    // downloading Alpine to make an instance called "about" (2026-10-01).
+    // `openableRefusal` is the whole policy, and it is deliberately narrow -
+    // an existing instance always opens, and a new one is created only when
+    // the distro was said out loud. Both documented forms survive intact.
     //
     // Refuses rather than prompting: `msl work ls -la` runs in scripts, and
     // a confirmation prompt would hang a non-interactive invocation. An
     // exit code and a suggestion cost a working pipeline nothing.
-    if registryForLookup.distro(for: instanceName) == nil,
-       GuestDistro(rawValue: instanceName) == nil,
-       let suggestion = CommandSuggestion.nearest(instanceName, in: mslCommands) {
-        FileHandle.standardError.write("""
-        msl: no instance named '\(instanceName)' - did you mean `msl \(suggestion)`?
-             If you really want an instance called '\(instanceName)', run:
-                 msl new \(instanceName)
-
-        """.data(using: .utf8)!)
+    if let refusal = openableRefusal(instanceName) {
+        FileHandle.standardError.write("msl: \(refusal)\n".data(using: .utf8)!)
         exit(1)
     }
 
@@ -2279,4 +4754,156 @@ case let instanceName?:
     let command = args.dropFirst().joined(separator: " ")
     let user = resolveUser(instance: instanceName, distro: distro, command: command)
     runShellSession(instance: instanceName, distro: distro, command: command, user: user)
+}
+
+/// What MSLAP is enforcing on this Mac, and - just as importantly - how
+/// much that is worth. An administrator who believes a policy is binding
+/// when it sits in a file the user can edit is the failure this prints
+/// against, so the strength line is never omitted or softened.
+func printAdminStatus(instance: String?) {
+    switch MSLAPPolicyStore.load() {
+    case .unmanaged:
+        print("MSL Admin Portal: not managed")
+        print("  No policy is installed, so nothing is restricted.")
+        print("  Capabilities a policy could restrict: \(MSLAPCapability.catalogue.count)")
+        print("  See them with: msl admin capabilities")
+
+    case .broken(let failure, let fallback):
+        // Deliberately not reported as "unmanaged": a policy is present
+        // and cannot be honoured, which an administrator must hear about.
+        print("MSL Admin Portal: POLICY PRESENT BUT NOT IN FORCE")
+        switch failure {
+        case .unreadable(let path):
+            print("  Cannot read \(path)")
+        case .malformed(let path, let detail):
+            print("  \(path) is not a valid policy")
+            print("  \(detail)")
+        case .schemaTooNew(let path, let schema):
+            print("  \(path) uses schema \(schema); this MSL understands \(MSLAPPolicy.currentSchema)")
+        case .needsNewerMSL(let path, let required):
+            print("  \(path) requires MSL \(required); this is \(MSLVersion.marketing)")
+        case .signatureInvalid(let path, let detail):
+            // The loudest of the lot: this is the one that means somebody
+            // edited a managed policy.
+            print("  \(path) FAILED ITS SIGNATURE CHECK")
+            print("  \(detail)")
+        case .none:
+            break
+        }
+        if let fallback {
+            // Tampering must never be a way to REMOVE restrictions.
+            let denied = MSLAPCapability.catalogue
+                .filter { !fallback.allows($0.capability) }.count
+            print("  Still enforcing the last policy that verified"
+                  + " (\(denied) capabilit\(denied == 1 ? "y" : "ies") denied).")
+            if let issuer = fallback.issuer { print("  That policy was issued by \(issuer).") }
+        } else {
+            print("  Nothing is being enforced. Fix or remove the policy.")
+        }
+
+    case .managed(let loaded):
+        let policy = loaded.policy
+        print("MSL Admin Portal: managed")
+        if let issuer = policy.issuer { print("  Issued by:  \(issuer)") }
+        if let issued = policy.issued {
+            print("  Issued:     \(ISO8601DateFormatter().string(from: issued))")
+        }
+        print("  Policy:     \(loaded.url.path)")
+        print("  Strength:   \(loaded.strength.title)")
+        print("              \(loaded.strength.detail)")
+        if let signedBy = loaded.signedBy {
+            let mode = MSLAPKeyStore.isLocalAdminMode ? "local admin key" : "fleet key"
+            print("  Signature:  valid, by \(signedBy) (\(mode))")
+            if MSLAPKeyStore.isLocalAdminMode {
+                // Said plainly, because it is the difference between
+                // "nobody can change this" and "nobody can change this by
+                // accident".
+                print("              The signing key is on this Mac, so anyone with root can re-sign.")
+            }
+        } else if let problem = loaded.signatureProblem {
+            print("  Signature:  \(problem.detail)")
+        }
+        if let message = policy.message { print("  Message:    \(message)") }
+
+        let unknown = policy.unknownCapabilities
+        if !unknown.isEmpty {
+            // Ignored rather than enforced, and said out loud - a policy
+            // written for a newer MSL must not look like it is in force.
+            print("  Ignored:    \(unknown.count) capability name(s) this MSL does not know")
+            for capability in unknown { print("                \(capability.key)") }
+        }
+
+        print("")
+        if let instance {
+            print("  For instance '\(instance)':")
+        } else {
+            print("  Application-wide (pass an instance name to see its rules):")
+        }
+        var denied = 0
+        for group in MSLAPCapability.groups {
+            var lines: [String] = []
+            for entry in MSLAPCapability.catalogue
+            where entry.capability.key.hasPrefix(group + ".") {
+                let decision = policy.decision(for: entry.capability, instance: instance)
+                guard !decision.allowed else { continue }
+                denied += 1
+                var line = "    \(entry.capability.key.padding(toLength: 32, withPad: " ", startingAt: 0))denied"
+                if let by = decision.deniedByCapability, by != entry.capability {
+                    line += " (by \(by.key))"
+                }
+                if let reason = decision.deniedBy?.reason { line += " - \(reason)" }
+                if entry.unavailable {
+                    line += "  [no such action in this version]"
+                } else if !entry.enforced {
+                    line += "  [not yet enforced]"
+                }
+                lines.append(line)
+            }
+            if !lines.isEmpty {
+                print("  \(group)")
+                lines.forEach { print($0) }
+            }
+        }
+        if denied == 0 { print("    nothing denied") }
+
+        // Protected instances, and whether they really are.
+        //
+        // Shown here rather than only in `msl doctor` because this is the
+        // screen an administrator reads when deciding whether a deployment
+        // does what they asked for - and "cloning is denied" reads as
+        // finished when it is not. See READMES/32-PROTECTED-INSTANCES.md.
+        // Certified lineages. Shown because this is the one tier that
+        // holds against a determined local user, so an administrator
+        // deciding whether a deployment is sound needs to see it.
+        if instance == nil {
+            let certificates = LineageCertificateStore.all()
+            if !certificates.isEmpty {
+                print("")
+                print("  Lineage certificates:")
+                for (lineage, verdict) in certificates.sorted(by: { $0.key < $1.key }) {
+                    switch verdict {
+                    case .none:
+                        continue
+                    case .certified(let label, _, let rootOwned):
+                        print("    \(lineage.prefix(8))…  \(label)"
+                              + (rootOwned ? "" : "  [user-writable, advisory]"))
+                    case .revoked(let label, _):
+                        print("    \(lineage.prefix(8))…  \(label)  [WITHDRAWN]")
+                    case .invalid(let why):
+                        print("    \(lineage.prefix(8))…  does not verify: \(why)")
+                    }
+                }
+            }
+        }
+
+        if instance == nil,
+           let protection = ProtectedInstance.summary(
+               instances: registryForLookup.list(), policy: MSLAPGate.policy) {
+            print("")
+            print("  Images protected from being copied:")
+            print(protection)
+            print("")
+            print("  `msl doctor` says what to do about any route left open.")
+        }
+    }
 }

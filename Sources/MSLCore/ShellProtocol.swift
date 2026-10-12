@@ -34,6 +34,15 @@ public enum ShellProtocol {
         case data = 0x02
         case resize = 0x03
         case exit = 0x04
+        /// Guest to host, once, before any `data`: "this session is
+        /// detachable - here is its id and the vsock port to reattach on".
+        /// Its **absence** is how a host detects an older `shellinit`, so
+        /// no version number is needed anywhere.
+        case session = 0x05
+        /// Host to guest, on a session's own port: reattach, with the
+        /// terminal size which may have changed while detached.
+        case attach = 0x06
+        case detach = 0x07
     }
 
     public enum ShellProtocolError: Error, CustomStringConvertible {
@@ -51,17 +60,55 @@ public enum ShellProtocol {
     /// `user` empty means "root" (the guest's own default when `userlen`
     /// is 0 - see the wire format above), matching every session before
     /// `msl -u`/`--user` existed.
-    public static func encodeExec(command: String, rows: UInt16, cols: UInt16, user: String = "") -> [UInt8] {
+    /// `sessionID`, when given, is appended as a trailing field.
+    ///
+    /// Safe against every `shellinit` already shipped: its `EXEC` parsing
+    /// walks `rows, cols, userlen, user, cmdlen, cmd` and stops, so bytes
+    /// after the command are simply ignored. A guest that *does* understand
+    /// it answers with a `session` frame; one that doesn't answers with
+    /// nothing, and the host keeps the old behaviour. That is the whole
+    /// negotiation - no version field, no fallback on error.
+    public static func encodeExec(command: String, rows: UInt16, cols: UInt16,
+                                  user: String = "", sessionID: String = "") -> [UInt8] {
         let userBytes = Array(user.utf8)
-        let cmdBytes = Array(command.utf8)
+        let commandBytes = Array(command.utf8)
+        let idBytes = Array(sessionID.utf8)
         var payload: [UInt8] = []
         appendU16BE(rows, &payload)
         appendU16BE(cols, &payload)
-        appendU16BE(UInt16(min(userBytes.count, Int(UInt16.max))), &payload)
+        appendU16BE(UInt16(userBytes.count), &payload)
         payload.append(contentsOf: userBytes)
-        appendU16BE(UInt16(min(cmdBytes.count, Int(UInt16.max))), &payload)
-        payload.append(contentsOf: cmdBytes)
+        appendU16BE(UInt16(commandBytes.count), &payload)
+        payload.append(contentsOf: commandBytes)
+        if !idBytes.isEmpty {
+            appendU16BE(UInt16(idBytes.count), &payload)
+            payload.append(contentsOf: idBytes)
+        }
         return encodeFrame(type: .exec, payload: payload)
+    }
+
+    /// Reattach, carrying the terminal size so a full-screen app redraws
+    /// into the right shape before the scrollback is replayed.
+    public static func encodeAttach(rows: UInt16, cols: UInt16) -> [UInt8] {
+        var payload: [UInt8] = []
+        appendU16BE(rows, &payload)
+        appendU16BE(cols, &payload)
+        return encodeFrame(type: .attach, payload: payload)
+    }
+
+    /// A session id: hex, which is all `shellinit` accepts in the name.
+    public static func newSessionID() -> String {
+        var bytes = [UInt8](repeating: 0, count: 8)
+        for i in bytes.indices { bytes[i] = UInt8.random(in: 0...255) }
+        return bytes.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Parses a `session` frame's `"<id> <port>"` payload.
+    public static func parseSession(_ payload: [UInt8]) -> (id: String, port: UInt32)? {
+        guard let text = String(bytes: payload, encoding: .utf8) else { return nil }
+        let parts = text.split(separator: " ")
+        guard parts.count == 2, let port = UInt32(parts[1]) else { return nil }
+        return (String(parts[0]), port)
     }
 
     public static func encodeData<C: Collection>(_ bytes: C) -> [UInt8] where C.Element == UInt8 {

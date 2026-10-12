@@ -239,6 +239,10 @@ final class X11KeymapProvider: @unchecked Sendable {
 
     private let lock = NSLock()
     private var current: (keymap: X11Keymap, info: X11MacKeyboardInfo)?
+    /// What each Unicode slot is bound to right now, and the slots in
+    /// least-recently-used order - see `X11Keymap.unicodeSlots`.
+    private var slotKeysyms: [UInt8: UInt32] = [:]
+    private var slotOrder: [UInt8] = Array(X11Keymap.unicodeSlots)
     private var optionModeValue: X11OptionKeyMode = .leftAltRightAltGr
     private var observers: [NSObjectProtocol] = []
 
@@ -266,6 +270,36 @@ final class X11KeymapProvider: @unchecked Sendable {
         lock.unlock()
         guard changed else { return }
         DispatchQueue.main.async { self.rebuild(notify: true) }
+    }
+
+    /// Slots for `keysyms` (at most `X11Keymap.unicodeSlots.count`
+    /// distinct ones): a keysym already bound keeps its slot, a new one takes
+    /// the least recently used slot not needed by this batch. `changed` says
+    /// whether the keymap had to change - only then must clients be told
+    /// before the keys go out.
+    func unicodeSlots(for keysyms: [UInt32]) -> (slots: [UInt32: UInt8], changed: Bool) {
+        _ = keymap // make sure `current` exists
+        lock.lock(); defer { lock.unlock() }
+        var assignment: [UInt32: UInt8] = [:]
+        var changed = false
+        let bound = Dictionary(slotKeysyms.map { ($0.value, $0.key) }, uniquingKeysWith: { a, _ in a })
+        for keysym in keysyms where assignment[keysym] == nil {
+            if let slot = bound[keysym] {
+                assignment[keysym] = slot
+            }
+        }
+        let reserved = Set(assignment.values)
+        for keysym in keysyms where assignment[keysym] == nil {
+            guard let slot = slotOrder.first(where: { !reserved.contains($0) && !assignment.values.contains($0) }) else { break }
+            slotKeysyms[slot] = keysym
+            current?.keymap.setUnicodeSlot(slot, keysym: keysym)
+            assignment[keysym] = slot
+            changed = true
+        }
+        // Most recently used last.
+        let used = Set(assignment.values)
+        slotOrder = slotOrder.filter { !used.contains($0) } + slotOrder.filter { used.contains($0) }
+        return (assignment, changed)
     }
 
     private func lockedCurrent() -> (keymap: X11Keymap, info: X11MacKeyboardInfo)? {
@@ -297,8 +331,11 @@ final class X11KeymapProvider: @unchecked Sendable {
 
     private func rebuild(notify: Bool) {
         dispatchPrecondition(condition: .onQueue(.main))
-        let built = X11MacKeyboard.buildKeymap(optionMode: optionMode)
+        var built = X11MacKeyboard.buildKeymap(optionMode: optionMode)
         lock.lock()
+        // A layout switch rebuilds the keymap from scratch; the characters
+        // bound to Unicode slots stay bound.
+        for (slot, keysym) in slotKeysyms { built.keymap.setUnicodeSlot(slot, keysym: keysym) }
         let previous = current
         current = built
         lock.unlock()

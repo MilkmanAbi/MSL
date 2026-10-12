@@ -108,20 +108,86 @@ extension GuestDistro {
 
 /// A small round badge with the distro's symbol - the thing that makes a
 /// sidebar row scannable.
+///
+/// `appearance` overrides any part of it the instance's owner has chosen
+/// (`InstanceAppearance`). Left at its default this draws exactly what it
+/// always drew, so every place that shows a *distro* rather than an instance
+/// - the New Instance sheet, the account sheet - needs no change.
 struct DistroBadge: View {
     let distro: GuestDistro
     var size: CGFloat = 26
+    var appearance = InstanceAppearance()
+    /// A chosen picture, already decoded. Passed in rather than loaded here:
+    /// this view draws on every sidebar redraw.
+    var image: NSImage?
+
+    private var tint: Color {
+        appearance.tint.flatMap(Color.init(hex:)) ?? distro.tint
+    }
+
+    private var symbol: String { appearance.symbol ?? distro.symbol }
 
     var body: some View {
         RoundedRectangle(cornerRadius: size * 0.28, style: .continuous)
-            .fill(distro.tint.gradient)
+            .fill(tint.gradient)
             .frame(width: size, height: size)
-            .overlay(
-                Image(systemName: distro.symbol)
-                    .font(.system(size: size * 0.5, weight: .semibold))
-                    .foregroundStyle(.white)
-            )
-            .shadow(color: distro.tint.opacity(0.25), radius: 2, y: 1)
+            .overlay {
+                if let image {
+                    // Clipped to the same shape, so a photo reads as a badge
+                    // rather than a floating square.
+                    Image(nsImage: image)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: size, height: size)
+                        .clipShape(RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
+                } else {
+                    Image(systemName: symbol)
+                        .font(.system(size: size * 0.5, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .shadow(color: tint.opacity(0.25), radius: 2, y: 1)
+    }
+}
+
+/// One instance's badge, with whatever its owner chose.
+///
+/// A plain `DistroBadge` draws the distro; this draws the *instance*, which
+/// is a different question once someone has four Debians. Every instance
+/// context uses this - the sidebar row and the Instance view's header - and
+/// the distro-only places keep using `DistroBadge`.
+struct InstanceBadge: View {
+    @EnvironmentObject private var model: AppModel
+    let instance: Instance
+    var size: CGFloat = 26
+
+    var body: some View {
+        DistroBadge(distro: instance.distro, size: size,
+                    appearance: model.appearance(of: instance.name),
+                    image: model.logo(of: instance.name))
+    }
+}
+
+extension Color {
+    /// `#RRGGBB`, as `InstanceAppearance` stores it. Nil for anything else,
+    /// so a hand-edited appearance file falls back to the distro's colour
+    /// rather than drawing black.
+    init?(hex: String) {
+        let text = hex.hasPrefix("#") ? String(hex.dropFirst()) : hex
+        guard text.count == 6, let value = UInt32(text, radix: 16) else { return nil }
+        self.init(.sRGB,
+                  red: Double((value >> 16) & 0xFF) / 255,
+                  green: Double((value >> 8) & 0xFF) / 255,
+                  blue: Double(value & 0xFF) / 255)
+    }
+
+    /// Back to `#RRGGBB`, for comparing a swatch against what is stored.
+    var storedHex: String? {
+        guard let components = NSColor(self).usingColorSpace(.sRGB) else { return nil }
+        return String(format: "#%02X%02X%02X",
+                      Int((components.redComponent * 255).rounded()),
+                      Int((components.greenComponent * 255).rounded()),
+                      Int((components.blueComponent * 255).rounded()))
     }
 }
 
@@ -184,6 +250,15 @@ struct DetailRow: View {
                 .textSelection(.enabled)
         }
         .font(.callout)
+        // Every one of these is something someone wants to paste somewhere:
+        // a mount path, an IP, an SSH command. Selecting the text works, but
+        // right-click is where the hand goes.
+        .contextMenu {
+            Button("Copy \(label)") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(value, forType: .string)
+            }
+        }
     }
 }
 

@@ -382,3 +382,55 @@ final class SSHAutoSetupTests: XCTestCase {
         XCTAssertTrue(summary.contains(SSHSetup.privateKeyPath))
     }
 }
+
+/// A reachability check that gives up after one probe is a check that
+/// reports a guest still coming up as broken.
+final class SSHReachabilityWaitTests: XCTestCase {
+
+    func testAnUnreachableHostIsGivenUpOnWithinTheWindow() {
+        // Bounded, and the bound is real: this sits behind a card in the UI,
+        // and a blocking connect to an unreachable address runs to the
+        // system's own TCP timeout - around 75 seconds - if it is not.
+        let started = Date()
+        // 198.51.100.x is TEST-NET-2, reserved and routed nowhere.
+        let reached = SSHSetup.waitUntilReachable(host: "198.51.100.9", within: 2, every: 0.5)
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertFalse(reached)
+        XCTAssertLessThan(elapsed, 12, "the ceiling is not being honoured")
+    }
+
+    func testTheProbeIntervalIsHonoured() {
+        // The background watch polls every two seconds rather than three
+        // times a second; a minute of the default would be 200 connects.
+        let started = Date()
+        _ = SSHSetup.waitUntilReachable(host: "198.51.100.9", within: 1.2, every: 1.0)
+        XCTAssertGreaterThan(Date().timeIntervalSince(started), 1.0,
+                             "it returned before the window was up - the interval is being ignored")
+    }
+
+    func testAReachableHostAnswersAtOnce() {
+        // Something that is definitely listening on this Mac: the test only
+        // means anything if the positive case is fast.
+        let listener = socket(AF_INET, SOCK_STREAM, 0)
+        defer { close(listener) }
+        var address = sockaddr_in()
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0                       // any free port
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let size = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafePointer(to: &address) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(listener, $0, size) }
+        }
+        listen(listener, 1)
+        var bound = sockaddr_in()
+        var boundSize = socklen_t(MemoryLayout<sockaddr_in>.size)
+        _ = withUnsafeMutablePointer(to: &bound) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(listener, $0, &boundSize) }
+        }
+        let port = UInt16(bigEndian: bound.sin_port)
+
+        let started = Date()
+        XCTAssertTrue(SSHSetup.waitUntilReachable(host: "127.0.0.1", port: port, within: 5))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 2, "a listening port should answer at once")
+    }
+}

@@ -332,7 +332,7 @@ When you [add a Linux app to your Applications folder](#add-to-applications), MS
 
 *An honest map of what's solid and what's still experimental.*
 
-This is MSL-1.0.0 - still held together with love. Here's where things stand, so nothing catches you out.
+This is MSL-2.0.0 - still held together with love. Here's where things stand, so nothing catches you out.
 
 <a id="whats-ready--solid"></a>
 
@@ -3592,4 +3592,3 @@ MSL is free software.
 
 **Related:** [Welcome to MSL](#welcome) · [Under the hood](#how-it-works)
 
-This took like months btw.

@@ -242,7 +242,7 @@ extension HelpArticle {
         keywords: ["status", "experimental", "beta", "limitations", "known issues", "roadmap"],
         related: ["trouble-maintenance", "memory-dynamic", "maintenance"],
         body: #"""
-        This is MSL-1.0.0 — still held together with love. Here's where things stand, so nothing catches you out.
+        This is MSL-2.0.0 — still held together with love. Here's where things stand, so nothing catches you out.
 
         ## Solid {#solid}
 

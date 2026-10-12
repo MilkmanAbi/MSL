@@ -34,7 +34,16 @@ func makeConfiguration(instance: String, distro: GuestDistro) -> VMConfiguration
     // A custom image brings its own kernel, initramfs, disk and possibly
     // command line (`CustomImage`); a published distro resolves to the
     // shared kernel and its `rootfs*.img`, exactly as before.
-    let boot = distro.bootFiles(appSupport: URL(fileURLWithPath: appSupport))
+    // **The one place an instance is guaranteed its own disk.** Every boot
+    // goes through here, so this is both where a new instance gets its clone
+    // of the distro's base and where a machine upgraded from the old shared
+    // layout migrates: an instance whose disk is missing gets one, which for
+    // an upgrade is a clone of the very image it was already using. A failure
+    // is left to the normal missing-disk path below, which already says the
+    // distro needs installing.
+    let support = URL(fileURLWithPath: appSupport)
+    try? InstanceDisk.ensure(instance: instance, distro: distro, appSupport: support)
+    let boot = distro.bootFiles(instance: instance, appSupport: support)
     return VMConfiguration(
         name: instance,
         bootMode: .persistentDisk,
@@ -88,6 +97,11 @@ func cleanupStaleWebDAVMounts() {
         umount.waitUntilExit()
     }
 }
+// A daemon cannot draw anything, so it spawns MSL.app to put the screen up,
+// then dies properly - macOS still writes the crash report, which is where
+// a crash like this actually gets diagnosed.
+CrashScreen.install(for: .daemon, viewer: "/Applications/MSL.app/Contents/MacOS/MSLApp")
+
 cleanupStaleWebDAVMounts()
 
 let server = DaemonServer(registry: registry, makeConfiguration: makeConfiguration(instance:distro:))
@@ -112,10 +126,17 @@ Thread {
     }
 }.start()
 
+// Anything that was published beyond this Mac goes back up, starting the
+// instances it needs. After the accept loop is running, so a session that
+// arrives mid-restore is served normally, and on its own thread, so a slow
+// relay cannot delay the daemon being ready.
+server.restorePublishedInstances()
+
 let resilience = SystemResilienceMonitor(
     managersSnapshot: { server.allManagers() },
     hostDidWake: { server.hostDidWake() })
 resilience.powerTransitionBegan = { server.beginPowerTransition() }
+server.powerResponseInFlight = { [weak resilience] in resilience?.isResponding ?? false }
 resilience.start()
 
 // Lets `msl power-test <event>` drive the real handlers. Without it, the

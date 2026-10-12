@@ -11,15 +11,26 @@ public struct MSLExperimentalSettings: Codable, Equatable, Sendable {
     /// Command+letter reaches Linux apps as Control+letter: Cmd+C copies,
     /// Cmd+Z undoes, Cmd+S saves, as on a Mac. Command then stops being
     /// Super for those apps.
-    public var linuxShortcuts = false
+    ///
+    /// On by default: a Mac keyboard that does nothing in Linux apps is the
+    /// single most jarring thing about running them, and the two reasons to
+    /// be careful are handled. `X11KeyboardRouter.isReservedForMac` keeps
+    /// macOS's own window and session commands (⌘Q, ⌘H, ⌘M, ⌘`, anything
+    /// with ⌃⌘), and `X11TerminalApps` sends ⌘C to a terminal as
+    /// Ctrl+Shift+C so it copies instead of killing the running command.
+    public var linuxShortcuts = true
     /// Mac text navigation: Cmd+arrows go to the line or document edges,
     /// Option+arrows move by word, Cmd/Option+Delete delete to the line
-    /// start or the previous word.
-    public var macTextNavigation = false
+    /// start or the previous word. On by default, with the same reasoning.
+    public var macTextNavigation = true
     /// Cmd+Shift+3/4/5 send Print, Shift+Print and Alt+Print - the Linux
-    /// screenshot keys. macOS takes these for its own screenshots unless
-    /// they are turned off in System Settings > Keyboard > Keyboard Shortcuts.
-    public var screenshotKeys = false
+    /// screenshot keys.
+    ///
+    /// On by default, and harmless there: macOS takes these for its own
+    /// screenshots first, so this only does anything once someone has turned
+    /// the macOS ones off in System Settings > Keyboard > Keyboard Shortcuts
+    /// - at which point sending them on is exactly what they asked for.
+    public var screenshotKeys = true
     /// What the two Option keys are to Linux apps. Not a toggle, but still
     /// experimental: the default suits PC-style apps.
     public var optionKeyMode: X11OptionKeyMode = .leftAltRightAltGr
@@ -33,9 +44,104 @@ public struct MSLExperimentalSettings: Codable, Equatable, Sendable {
     /// file managers themselves still run when started directly. On by
     /// default.
     public var preferMSLFiles = true
+
+    /// Close Linux apps before a hibernate and open them again on resume.
+    ///
+    /// On by default because the alternative is worse, not because it is
+    /// free: without it a hibernated instance comes back with its apps
+    /// alive in restored RAM but blind - their X server died with the Mac
+    /// side - so they sit there holding singleton locks and cannot be
+    /// started again. See `AppSessionRestore`.
+    public var reopenAppsAfterHibernate = true
     /// Linux app menus (File, Edit, ...) move into the Mac's menu bar, read
     /// over D-Bus. Takes effect for apps launched after it is turned on.
-    public var globalMenuBar = false
+    ///
+    /// On by default from v2. It is what makes a Linux application feel like
+    /// a Mac application rather than a window with a menu bar drawn inside
+    /// it, and the thing that used to make it risky - a dozen menus running
+    /// into a MacBook's notch - is handled now by `MenuBarFitting`, which
+    /// keeps what fits and puts the rest behind one final menu.
+    public var globalMenuBar = true
+
+    /// Copy and paste between Linux apps and the Mac, bridged through
+    /// `NSPasteboard` (see `X11Clipboard`).
+    ///
+    /// On by default: copying in a Linux app and pasting in a Mac one is
+    /// half of what "the shortcuts work" means, and the keyboard mapping
+    /// above is what makes people try it.
+    ///
+    /// Experimental because of what it still does not cover: `PRIMARY`
+    /// (X11's select-to-copy, so `xterm` and Motif apps do not reach the
+    /// Mac's clipboard) and anything that is neither text, an image, nor
+    /// files.
+    public var guestClipboard = true
+
+    /// Sign-in pages open in the *guest's* browser, not the Mac's.
+    ///
+    /// Everything else still opens on the Mac - this is only the handful of
+    /// links that are the start of an OAuth flow, and it exists because
+    /// those cannot work on the Mac at all. A sign-in ends by returning its
+    /// answer to the machine that began it: either to `127.0.0.1:PORT`,
+    /// where the Linux app is listening, or to a private scheme like
+    /// `discord://` that only Linux knows how to route. Opened on the Mac,
+    /// the answer arrives on the Mac and the Linux app waits forever.
+    ///
+    /// On by default, and narrow by construction: it needs a browser in the
+    /// guest and a URL that really looks like an authorisation request, or
+    /// the link goes to the Mac as before.
+    public var signInInLinuxBrowser = true
+
+    /// Linux apps get the Mac's camera and microphone the moment they open
+    /// them, without MSL Peripherals asking first.
+    ///
+    /// For ROS2 and anything else that starts camera nodes over and over:
+    /// being asked every time is right for Cheese and wrong for a robot.
+    /// macOS's own permission is still asked for, once - no app can skip
+    /// that - and the camera light and microphone indicator still show
+    /// whenever something is actually capturing. Off by default: the
+    /// normal answer to "a Linux app wants your camera" is to ask.
+    public var omitPeripheralsPrompt = false
+
+    /// Linux windows drawn closer to the Mac's own UI size - see
+    /// `X11DisplayScale`. Off by default: one X pixel per point is what
+    /// every app has been tested at.
+    public var nativeScaling = false
+
+    /// Linux OpenGL apps render on the Mac's GPU instead of the guest's
+    /// CPU (see `GPUBridge` and `Guest/virtual-gpu/`).
+    ///
+    /// **CPU rendering (llvmpipe) is the default and always works** - this
+    /// only moves OpenGL onto the GPU when it is worth it. Off by default,
+    /// and not only because it is new: the host renderer goes through
+    /// Apple's OpenGL, which stops at **GL 4.1**, while the guest's own
+    /// llvmpipe offers 4.5. **Anything needing newer OpenGL than 4.1 will
+    /// not run on the GPU** - Blender wants 4.3 and reports "Unsupported
+    /// hardware" on the GPU while running fine on the CPU. So this helps
+    /// apps that stay at 4.1 or below (many games, Chromium's GL, older
+    /// CAD) and should be left off for anything that needs more. It also
+    /// needs `virgl_test_server` installed; without it this does nothing.
+    public var gpuAcceleration = false
+
+    /// Which round of shipped defaults this file has been brought up to.
+    ///
+    /// **Why a version is needed at all.** `save` writes every key, so a
+    /// file written before a flag's default changed holds an explicit
+    /// `false` for it - and changing the default in this struct then reaches
+    /// nobody who has ever opened the Experimental Features window. The
+    /// symptom is the worst kind: the release notes say a feature is on, and
+    /// on the machines that matter it is off.
+    ///
+    /// So each promotion gets a generation, and `migrate` applies **only the
+    /// flags that round promoted**, leaving every other stored value exactly
+    /// as it is. That distinction matters: this Mac's file has
+    /// `globalMenuBar: false` and `gpuAcceleration: true`, both deliberate,
+    /// and a blanket "reset to defaults" would silently undo them.
+    public var defaultsGeneration = MSLExperimentalSettings.currentGeneration
+
+    /// 1: the original shipped set.
+    /// 2: the keyboard and clipboard integration turned on (2026-09-30).
+    /// 3: the global menu bar turned on (2026-09-30).
+    public static let currentGeneration = 3
 
     public init() {}
 
@@ -54,6 +160,48 @@ public struct MSLExperimentalSettings: Codable, Equatable, Sendable {
         openLinksOnMac = try c.decodeIfPresent(Bool.self, forKey: .openLinksOnMac) ?? defaults.openLinksOnMac
         preferMSLFiles = try c.decodeIfPresent(Bool.self, forKey: .preferMSLFiles) ?? defaults.preferMSLFiles
         globalMenuBar = try c.decodeIfPresent(Bool.self, forKey: .globalMenuBar) ?? defaults.globalMenuBar
+        guestClipboard = try c.decodeIfPresent(Bool.self, forKey: .guestClipboard) ?? defaults.guestClipboard
+        // A key the file has never held decodes to the shipped default, so a
+        // flag that is new *and* on needs no generation of its own - only one
+        // whose default changes after people already have it stored.
+        signInInLinuxBrowser = try c.decodeIfPresent(Bool.self, forKey: .signInInLinuxBrowser)
+            ?? defaults.signInInLinuxBrowser
+        omitPeripheralsPrompt = try c.decodeIfPresent(Bool.self, forKey: .omitPeripheralsPrompt) ?? defaults.omitPeripheralsPrompt
+        nativeScaling = try c.decodeIfPresent(Bool.self, forKey: .nativeScaling) ?? defaults.nativeScaling
+        gpuAcceleration = try c.decodeIfPresent(Bool.self, forKey: .gpuAcceleration) ?? defaults.gpuAcceleration
+        reopenAppsAfterHibernate = try c.decodeIfPresent(Bool.self, forKey: .reopenAppsAfterHibernate)
+            ?? defaults.reopenAppsAfterHibernate
+        // A file with no generation predates the idea, so it is generation 1.
+        defaultsGeneration = try c.decodeIfPresent(Int.self, forKey: .defaultsGeneration) ?? 1
+        migrate()
+    }
+
+    /// Brings an older file up to the current round of shipped defaults.
+    ///
+    /// Touches only the flags each generation promoted. Anything the person
+    /// has set for themselves on any other flag survives untouched - see
+    /// `defaultsGeneration`.
+    private mutating func migrate() {
+        if defaultsGeneration < 2 {
+            // Generation 2: the Mac keyboard reaching Linux apps, and the
+            // clipboard that makes it worth having. All four were off only
+            // because they were new, not because they were risky - and the
+            // two things that made them risky are handled now (macOS keeps
+            // its own shortcuts, terminals get Ctrl+Shift).
+            linuxShortcuts = true
+            macTextNavigation = true
+            screenshotKeys = true
+            guestClipboard = true
+        }
+        if defaultsGeneration < 3 {
+            // Generation 3: Linux app menus in the Mac menu bar. It is what
+            // makes a Linux window a window rather than a window with a menu
+            // bar drawn inside it, and `MenuBarFitting` handles the thing
+            // that used to make it risky - more menus than fit before a
+            // MacBook's notch.
+            globalMenuBar = true
+        }
+        defaultsGeneration = Self.currentGeneration
     }
 }
 
@@ -69,17 +217,101 @@ public enum MSLExperimentalSettingsStore {
     }
 
     public static func load(from url: URL = fileURL) -> MSLExperimentalSettings {
+        loadIfReadable(from: url) ?? MSLExperimentalSettings()
+    }
+
+    /// The settings, or `nil` when a file exists but could not be read.
+    ///
+    /// **The difference matters, and losing it cost real settings.** `load`
+    /// answers "no file" and "I could not read the file" with the same
+    /// shipped defaults. Anything that then *writes* what it loaded turns a
+    /// transient read failure into permanent data loss - and
+    /// `ExperimentalFeaturesModel.reload()` does exactly that, because
+    /// assigning `settings` saves. It happened on 2026-09-30: the app was
+    /// replaced on disk under a running copy, a read failed mid-swap, and
+    /// the person's deliberate `globalMenuBar` and `gpuAcceleration` choices
+    /// were overwritten with defaults.
+    ///
+    /// So a reader that might write back asks this instead, and does nothing
+    /// on `nil`. A missing file still returns defaults - that is a real
+    /// answer, not a failure.
+    public static func loadIfReadable(from url: URL = fileURL) -> MSLExperimentalSettings? {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return MSLExperimentalSettings()
+        }
         guard let data = try? Data(contentsOf: url),
               let settings = try? JSONDecoder().decode(MSLExperimentalSettings.self, from: data)
-        else { return MSLExperimentalSettings() }
+        else { return nil }
         return settings
     }
 
+    /// Which MSLAP capability governs each switch.
+    ///
+    /// Settings are app-wide, so none of these take an instance. A switch
+    /// with no entry here is not something a policy can restrict - the
+    /// catalogue has no capability for it, and inventing one would be a
+    /// promise with nothing behind it.
+    static let capabilityForSetting: [(String, (MSLExperimentalSettings) -> Bool)] = [
+        ("integrations.shortcuts", { $0.linuxShortcuts }),
+        ("integrations.shortcuts", { $0.macTextNavigation }),
+        ("integrations.shortcuts", { $0.screenshotKeys }),
+        ("integrations.linksToMac", { $0.openLinksOnMac }),
+        ("sharing.filePicker", { $0.preferMSLFiles }),
+        ("integrations.globalMenuBar", { $0.globalMenuBar }),
+        ("sharing.clipboard", { $0.guestClipboard }),
+        ("integrations.signInBrowser", { $0.signInInLinuxBrowser }),
+        ("graphics.scaling", { $0.nativeScaling }),
+        ("graphics.gpu", { $0.gpuAcceleration }),
+    ]
+
     public static func save(_ settings: MSLExperimentalSettings, to url: URL = fileURL) throws {
+        // MSLAP, per switch rather than per file. Refusing the whole save
+        // because one restricted switch moved would silently discard every
+        // other change the person made in the same panel; refusing only
+        // the restricted ones keeps the rest working, which is what an
+        // administrator denying `sharing.clipboard` actually means.
+        //
+        // Only CHANGES are checked - a policy arriving after a switch was
+        // already on must not make saving anything else impossible.
+        var settings = settings
+        if MSLAPGate.policy != nil {
+            let current = load(from: url)
+            for (capability, read) in capabilityForSetting
+            where read(settings) != read(current)
+                && !MSLAPGate.allows(capability, instance: nil) {
+                settings = Self.reverting(settings, toward: current, capability: capability)
+            }
+        }
         MSLPaths.ensureDirectory(url.deletingLastPathComponent())
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(settings).write(to: url, options: .atomic)
+    }
+}
+
+extension MSLExperimentalSettingsStore {
+    /// Puts back every switch governed by one capability, leaving the rest
+    /// of the save alone.
+    static func reverting(_ settings: MSLExperimentalSettings,
+                          toward current: MSLExperimentalSettings,
+                          capability: String) -> MSLExperimentalSettings {
+        var result = settings
+        switch capability {
+        case "integrations.shortcuts":
+            result.linuxShortcuts = current.linuxShortcuts
+            result.macTextNavigation = current.macTextNavigation
+            result.screenshotKeys = current.screenshotKeys
+            result.optionKeyMode = current.optionKeyMode
+        case "integrations.linksToMac": result.openLinksOnMac = current.openLinksOnMac
+        case "sharing.filePicker": result.preferMSLFiles = current.preferMSLFiles
+        case "integrations.globalMenuBar": result.globalMenuBar = current.globalMenuBar
+        case "sharing.clipboard": result.guestClipboard = current.guestClipboard
+        case "integrations.signInBrowser": result.signInInLinuxBrowser = current.signInInLinuxBrowser
+        case "graphics.scaling": result.nativeScaling = current.nativeScaling
+        case "graphics.gpu": result.gpuAcceleration = current.gpuAcceleration
+        default: break
+        }
+        return result
     }
 }
 

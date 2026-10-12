@@ -16,7 +16,10 @@ struct InstanceView: View {
         var id: String { rawValue }
     }
 
-    @State private var tab: Tab = .apps
+    /// `MSL_START_TAB=Sandbox` opens straight onto a tab. A development
+    /// hook: a panel that only appears three clicks in is a panel that gets
+    /// shipped without anyone having looked at it.
+    @State private var tab: Tab = Tab(rawValue: ProcessInfo.processInfo.environment["MSL_START_TAB"] ?? "") ?? .apps
 
     var body: some View {
         VStack(spacing: 0) {
@@ -95,7 +98,11 @@ struct InstanceView: View {
 
     private var header: some View {
         HStack(alignment: .center, spacing: Design.Spacing.medium) {
-            DistroBadge(distro: instance.distro, size: 44)
+            Button { model.editingLogo = instance } label: {
+                InstanceBadge(instance: instance, size: 44)
+            }
+            .buttonStyle(.plain)
+            .help("Change \(instance.name)'s logo")
             VStack(alignment: .leading, spacing: 3) {
                 Text(instance.name)
                     .font(.title2).bold()
@@ -192,23 +199,46 @@ private struct OverviewTab: View {
     @EnvironmentObject private var model: AppModel
     let instance: Instance
 
+    /// Read from the registry only - never a guest round trip, because this
+    /// is a view body and the instance may not even be running.
+    private var account: String? { LinuxUserSetup.defaultUser(forInstance: instance.name) }
+
+    private var accountFootnote: String {
+        account == nil
+            ? "MSL has no Linux account for this distribution yet, so it acts as root. Open the Terminal tab to create one; after that, apps run as you."
+            : "Applications MSL starts run as this account, not as root - the same as they would on any Linux desktop."
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: Design.Spacing.large) {
-            Card(title: "Instance") {
+            Card(title: "Instance", footnote: accountFootnote) {
                 DetailRow(label: "Name", value: instance.name)
                 Divider()
                 DetailRow(label: "Distribution", value: instance.distro.displayName)
                 Divider()
                 DetailRow(label: "State", value: instance.state.label)
-
+                Divider()
+                // Worth a row of its own. When MSL was running everything as
+                // root there was nothing anywhere that said so - the apps
+                // just behaved oddly, wrote into root's home, and in
+                // Nautilus's case refused to start. One line answers it.
+                DetailRow(label: "Apps run as", value: account ?? "root - no Linux account yet",
+                          monospaced: true)
             }
 
             SSHCard(instance: instance)
+            // Straight after the local SSH card: it is the same question
+            // one step further out, and reading them together is how
+            // "reachable from here" and "reachable from anywhere" stay
+            // distinguishable.
+            PublicAccessCard(instance: instance)
 
             ResourcesCard(instance: instance)
 
             StorageCard(instance: instance)
                 .id(StorageCard.anchorID)
+
+            InstanceLockCard(instance: instance)
 
             Card(title: "Shared with macOS",
                  footnote: "Your home folder is mounted inside the instance, so the same files are reachable from both sides.") {
@@ -236,6 +266,24 @@ private struct ToolsTab: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Design.Spacing.large) {
+            Card(title: "Shipment",
+                 footnote: "A shipment is this whole instance - its apps, files, account and settings - in one file. Another Mac's MSL can install it as a working instance, even if it has never downloaded \(instance.distro.displayName).") {
+                if model.shipping.contains(instance.name) {
+                    HStack(spacing: Design.Spacing.small) {
+                        ProgressView().controlSize(.small)
+                        Text(model.shipmentStatus[instance.name] ?? "working…")
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Button("Create Shipment…") { model.createShipment(instance) }
+                        .disabled(instance.isLive || !instance.isInstalled)
+                    if instance.isLive {
+                        Text("Shut \(instance.name) down first - a shipment taken while it runs catches its filesystem mid-write.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+
             Card(title: "Background service",
                  footnote: "mslhd hosts every instance. Without it running, nothing can start - including apps launched from your Applications folder or Dock.") {
                 Toggle("Start MSL's service automatically", isOn: Binding(
@@ -279,6 +327,7 @@ private struct ToolsTab: View {
             SnapshotsCard(instance: instance)
 
             MaintenanceCard(instance: instance)
+            HomeOwnershipCard(instance: instance)
 
             Card(title: "Instance") {
                 HStack {
@@ -502,9 +551,24 @@ private struct SSHCard: View {
             return "Ready. The same shortcut works anywhere ssh does - a terminal, scp, "
                  + "or VS Code's Remote-SSH."
         }
-        return "Set up, but \(result.host) isn't answering on port 22. If the Sandbox tab's "
-             + "Network gate is closed, that is why: it detaches the network card, and vsock "
-             + "is unaffected - which is why `msl \(instance.name)` still works."
+        // **Local Network comes first, because it is nearly always the
+        // answer.** macOS requires an app's permission to reach an address
+        // on the local network, MSL is ad-hoc signed, and every reinstall
+        // used to arrive as a brand-new application with that permission
+        // gone - so SSH that had worked for a week stopped the moment MSL
+        // was rebuilt, while `ssh` from Terminal kept working because
+        // Terminal has its own grant. The message blamed the Sandbox gate
+        // instead and sent people looking in the wrong place entirely.
+        //
+        // The signature is pinned to the bundle identifier now, so the
+        // grant survives a rebuild - but it still has to be given once, and
+        // this is where somebody finds out that is what is missing.
+        return "Set up, but \(result.host) isn't answering on port 22. Most often that is "
+             + "MSL not having Local Network permission - macOS asks once, and `ssh` from "
+             + "Terminal keeps working either way, which is what makes it confusing. "
+             + "Permissions & Startup has it. Failing that, the Sandbox tab's Network gate "
+             + "detaches the network card while leaving vsock alone, which is why "
+             + "`msl \(instance.name)` still works."
     }
 
     private func copy(_ text: String, as token: String) {

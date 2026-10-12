@@ -60,6 +60,10 @@ public enum SSHSetup {
 
         @discardableResult
         public static func save(_ record: Record, instance: String) -> Bool {
+            // Recording an SSH setup is what makes the guest reachable, so
+            // it is the point a policy can refuse. `forget` stays open:
+            // removing access reduces exposure.
+            guard MSLAPGate.allows("system.ssh", instance: instance) else { return false }
             let url = file(for: instance)
             guard MSLPaths.ensureDirectory(url.deletingLastPathComponent()) else { return false }
             guard let data = try? JSONEncoder().encode(record) else { return false }
@@ -297,6 +301,29 @@ public enum SSHSetup {
         return socketError == 0
     }
 
+    /// `canReach`, retried while a just-started sshd finishes binding.
+    ///
+    /// Polled rather than slept: a guest that is ready in 200 ms should not
+    /// cost a flat two seconds, and one that needs longer should get it. The
+    /// ceiling is what an sshd that is genuinely not coming up costs before
+    /// MSL says so.
+    public static func waitUntilReachable(host: String, port: UInt16 = 22,
+                                          within: TimeInterval = 10,
+                                          every interval: TimeInterval = 0.3) -> Bool {
+        let deadline = Date().addingTimeInterval(within)
+        while true {
+            // Each probe carries its own short timeout, so an unreachable
+            // address is cheap to ask about and the ceiling above is real.
+            if canReach(host: host, port: port, timeout: 1) { return true }
+            guard Date() < deadline else { return false }
+            // `every` so a long watch can be gentle. The default suits the
+            // setup path, which has just started sshd and expects an answer
+            // within a second or two; a background watch over a minute wants
+            // far fewer probes than three a second.
+            Thread.sleep(forTimeInterval: interval)
+        }
+    }
+
     // MARK: - ~/.ssh/config
 
     public static func alias(for instance: String) -> String { "msl-\(instance)" }
@@ -524,8 +551,16 @@ public enum SSHSetup {
         ActivityLog.shared.record(.control, instance: instance, "SSH access configured",
                                   detail: "\(user)@\(host)")
 
+        // **Waited for, not sampled once.** This runs the instant after the
+        // guest has been told to start sshd, and a daemon that has been asked
+        // to start is not yet a daemon that has bound a port. A single probe
+        // here lost that race and returned `reachable: false`, which the
+        // panel then showed - "isn't answering on port 22", blaming the
+        // sandbox - about a guest that was answering perfectly well a second
+        // later (reported 2026-10-02, with `nc` to the same address
+        // succeeding from the same Mac).
         return Result(host: host, user: user, alias: alias(for: instance),
-                      reachable: canReach(host: host), fingerprint: fingerprint)
+                      reachable: waitUntilReachable(host: host), fingerprint: fingerprint)
     }
 
     /// The cheap check the automatic path runs before doing anything: if a

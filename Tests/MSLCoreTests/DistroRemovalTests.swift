@@ -52,23 +52,29 @@ final class DistroRemovalTests: XCTestCase {
         XCTAssertNil(DaemonProtocol.ControlRequest.removeDistro(distro: .debian).startsInstance)
     }
 
-    func testTheInstallationsFilesAreTheImageAndItsRepairBackup() {
+    /// The image, the repair backup, and the record of what was downloaded.
+    ///
+    /// The last one matters: `msl install` skips a base whose recorded
+    /// checksum already matches, so a marker left behind by a removal would
+    /// make the next install believe the download was still there and skip
+    /// fetching it.
+    func testTheInstallationsFilesAreTheImageItsBackupAndItsDownloadRecord() {
         let root = URL(fileURLWithPath: "/tmp/msl-test-root")
         XCTAssertEqual(DistroInstallation.files(for: .debian, in: root).map(\.lastPathComponent),
-                       ["rootfs-debian.img", "rootfs-debian.img.pre-repair"])
+                       ["rootfs-debian.img", "rootfs-debian.img.pre-repair", ".rootfs-debian.img.installed"])
         XCTAssertEqual(DistroInstallation.files(for: .alpine, in: root).map(\.lastPathComponent),
-                       ["rootfs.img", "rootfs.img.pre-repair"])
+                       ["rootfs.img", "rootfs.img.pre-repair", ".rootfs.img.installed"])
     }
 
     func testForgettingADefaultUserLeavesTheOthers() throws {
         let path = FileManager.default.temporaryDirectory.appendingPathComponent("msl-users-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: path) }
         let registry = DefaultUserRegistry(path: path)
-        try registry.setDefaultUser("abi", for: .debian)
-        try registry.setDefaultUser("abi2", for: .arch)
-        try registry.forgetDefaultUser(for: .debian)
-        XCTAssertNil(registry.defaultUser(for: .debian))
-        XCTAssertEqual(registry.defaultUser(for: .arch), "abi2")
-        try registry.forgetDefaultUser(for: .fedora)   // never set - harmless
+        try registry.setDefaultUser("abi", forInstance: "work")
+        try registry.setDefaultUser("abi2", forInstance: "play")
+        try registry.forgetDefaultUser(forInstance: "work")
+        XCTAssertNil(registry.defaultUser(forInstance: "work"))
+        XCTAssertEqual(registry.defaultUser(forInstance: "play"), "abi2")
+        try registry.forgetDefaultUser(forInstance: "ghost")   // never set - harmless
     }
 }

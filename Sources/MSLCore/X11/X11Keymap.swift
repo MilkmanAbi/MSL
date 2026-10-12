@@ -214,6 +214,26 @@ struct X11Keymap {
         }
     }
 
+    // MARK: - Unicode injection slots
+
+    /// Keycodes no Mac key uses (Mac keys end at 135, the virtual keys at
+    /// 127), reserved for typing text that has no key: the emoji picker,
+    /// dictation, input-method commits. X11 can only deliver a keycode, so a
+    /// character gets a keycode by being bound to one of these for a while -
+    /// the same trick `xdotool type` uses, done here by the server itself.
+    static let unicodeSlots: ClosedRange<UInt8> = 224...255
+
+    /// Binds one slot to one keysym (ONE_LEVEL, so held modifiers can't pick
+    /// another level). `nil` unbinds it.
+    mutating func setUnicodeSlot(_ keycode: UInt8, keysym: UInt32?) {
+        precondition(Self.unicodeSlots.contains(keycode), "not a unicode slot: \(keycode)")
+        if let keysym {
+            keys[keycode] = [X11KeyGroup(type: TypeIndex.oneLevel, syms: [keysym])]
+        } else {
+            keys.removeValue(forKey: keycode)
+        }
+    }
+
     private static func fixedGroup(_ syms: [UInt32]) -> X11KeyGroup {
         X11KeyGroup(type: syms.count > 1 ? TypeIndex.twoLevel : TypeIndex.oneLevel, syms: syms)
     }
@@ -811,7 +831,12 @@ struct X11Keymap {
         if old.effectiveMods != new.effectiveMods { changed |= 1 << 0 } // ModifierState
         if old.baseMods != new.baseMods { changed |= 1 << 1 } // ModifierBase
         if old.lockedMods != new.lockedMods { changed |= 1 << 3 } // ModifierLock
-        if old.effectiveMods != new.effectiveMods { changed |= 1 << 8 | 1 << 9 | 1 << 10 | 1 << 11 } // compat/grab/lookup mods
+        // Bits 8-12: compat state, grab mods, compat grab mods, lookup
+        // mods, compat lookup mods. The event writes `compatLookupMods` as
+        // a real field, so leaving its bit (1 << 12) out meant a client
+        // that selected only that part never heard about a change to the
+        // very field it asked for.
+        if old.effectiveMods != new.effectiveMods { changed |= 1 << 8 | 1 << 9 | 1 << 10 | 1 << 11 | 1 << 12 }
         if old.buttons != new.buttons { changed |= 1 << 13 } // PointerButtons
         return changed
     }

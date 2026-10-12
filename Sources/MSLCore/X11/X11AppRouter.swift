@@ -56,6 +56,27 @@ public enum X11AppRouter {
     private static var nextHostSlot: UInt32 = 1
     private static var slotsByApp: [String: UInt32] = [:]
 
+    /// The highest slot whose client indices still fit the resource-ID
+    /// space, and therefore the last one that can be handed out.
+    ///
+    /// A client index occupies the top 11 bits of every resource ID its
+    /// connection mints (`id >> 21` recovers it), so it must stay <= 2047.
+    /// `seedClientIndex` gives slot *n* the indices starting at
+    /// `n * 32 + 1`, which puts the ceiling at slot 63.
+    ///
+    /// Past it the arithmetic does not trap, it **wraps**: slot 64 seeds
+    /// index 2049, and `UInt32(2049) << 21` masks down to `1 << 21` - the
+    /// base already owned by the very first host. Two processes would then
+    /// mint identical window IDs, which is `gui-bugs.md` #36, a bug this
+    /// project has already fixed once. Nothing reclaims a slot when a host
+    /// exits and `mslhd` is a long-running daemon, so 64 distinct app
+    /// names over its lifetime is reachable - not hypothetical.
+    ///
+    /// Refusing to route is a real answer rather than a failure: the
+    /// caller falls back to hosting the connection in `mslhd` itself,
+    /// which costs that app its own Dock tile and nothing else.
+    static let maxHostSlot: UInt32 = (X11State.maxClientIndex - 1) / X11State.clientIndexStride
+
     /// Hands `fd` to the right host process, starting one if needed.
     /// Returns `false` if that could not be arranged, so the caller can
     /// fall back to hosting the connection itself.
@@ -74,20 +95,46 @@ public enum X11AppRouter {
         guard let binary = ensureShimBinary(named: name) else { return false }
         // A restarted host keeps the slot it had, so an app that quits and
         // reopens doesn't consume slots without bound.
-        let slot = slotsByApp[name] ?? {
-            let assigned = nextHostSlot
-            nextHostSlot += 1
-            slotsByApp[name] = assigned
-            return assigned
-        }()
+        guard let slot = slotsByApp[name] ?? claimHostSlot(for: name) else {
+            FileHandle.standardError.write(
+                "[x11] out of host slots (\(maxHostSlot) apps this session) - hosting \(name) in-process\n"
+                    .data(using: .utf8)!)
+            return false
+        }
         guard spawn(binary: binary, socketPath: socketPath, hostSlot: slot, instance: instance) else { return false }
+        return waitForHost(fd: fd, prefix: prefix, socketPath: socketPath)
+    }
 
-        // The host has to bind its socket before it can be handed anything.
-        for _ in 0..<100 {
-            usleep(50_000) // 50ms, up to 5s
+    /// Waits for a just-spawned host to bind its socket, then hands the
+    /// connection over.
+    ///
+    /// Tries BEFORE sleeping. The old loop slept first, so every cold app
+    /// start paid a guaranteed 50 ms even when the host was ready
+    /// instantly, and then slept a flat 50 ms between tries for a full
+    /// five seconds - all of it with `spawnLock` held, which serialized
+    /// two apps launched together behind each other. The backoff starts
+    /// tighter and grows, so a fast host is picked up in single-digit
+    /// milliseconds and a dead one still gives up in about the same total.
+    private static func waitForHost(fd: Int32, prefix: [UInt8], socketPath: String) -> Bool {
+        var delay: UInt32 = 2_000 // 2ms
+        var waited: UInt32 = 0
+        while waited < 5_000_000 { // 5s
             if X11FDChannel.send(fd: fd, payload: prefix, toSocketPath: socketPath) { return true }
+            usleep(delay)
+            waited += delay
+            delay = min(delay * 2, 50_000)
         }
         return false
+    }
+
+    /// The next free slot, or nil once they are exhausted. Must be called
+    /// with `spawnLock` held.
+    private static func claimHostSlot(for name: String) -> UInt32? {
+        guard nextHostSlot <= maxHostSlot else { return nil }
+        let assigned = nextHostSlot
+        nextHostSlot += 1
+        slotsByApp[name] = assigned
+        return assigned
     }
 
     static func socketPath(forApp name: String) -> String {

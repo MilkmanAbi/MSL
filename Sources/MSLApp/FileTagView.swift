@@ -107,11 +107,24 @@ struct FileInfoSheet: View {
 
                     Divider()
                     section("General") {
-                        row("Kind", item.kind ?? "--")
+                        row("Kind", generalKind)
                         row("Size", FileFormat.size(item))
                         row("Where", (item.path as NSString).deletingLastPathComponent)
                         row("Created", FileFormat.date(item.created))
                         row("Modified", FileFormat.date(item.modified))
+                    }
+
+                    // The part Finder's Get Info can't show for a guest file:
+                    // its real Linux mode, straight from the inode.
+                    if let mode = files.linuxMode(for: item) {
+                        Divider()
+                        section("Linux permissions") {
+                            row("Access", LinuxFileMode.lsString(mode))
+                            row("Octal", LinuxFileMode.octalString(mode))
+                            if LinuxFileMode.isRegularFile(mode) {
+                                row("Executable", LinuxFileMode.isExecutable(mode) ? "Yes" : "No")
+                            }
+                        }
                     }
 
                     Divider()
@@ -152,6 +165,15 @@ struct FileInfoSheet: View {
             }
         }
         .frame(width: 380, height: 460)
+    }
+
+    /// The type word for the General section: a symlink, pipe, socket or
+    /// device says so plainly; everything else keeps macOS's own kind name.
+    private var generalKind: String {
+        if let mode = files.linuxMode(for: item), let label = LinuxFileMode.kind(mode).label {
+            return label
+        }
+        return item.kind ?? "--"
     }
 
     private func section(_ title: String,

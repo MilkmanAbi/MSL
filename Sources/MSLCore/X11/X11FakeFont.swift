@@ -29,4 +29,13 @@ enum X11FakeFont {
         CTFontGetAdvancesForGlyphs(ctFont, .horizontal, &glyph, &advance, 1)
         return advance.width
     }()
+
+    /// The integer cell the client is told about (`QueryFont` rounds) and
+    /// the grid every glyph is drawn on. Menlo 13's real advance is 7.83:
+    /// drawing at that while reporting 8 drifted a line of text 13 px off
+    /// an 80-column grid, and a fractional ImageText background box left
+    /// half-painted seams between xterm rows and at the end of each run.
+    static let cellWidth = Int(charWidth.rounded())
+    static let cellAscent = Int(ascent.rounded())
+    static let cellDescent = Int(descent.rounded())
 }

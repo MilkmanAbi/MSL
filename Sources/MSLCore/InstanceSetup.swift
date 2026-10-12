@@ -178,7 +178,7 @@ public enum InstanceSetup {
         }
 
         if let disk = options.disk {
-            let boot = distro.bootFiles()
+            let boot = distro.bootFiles(instance: instance)
             let imageName = boot.storageKey
             let imagePath = boot.disk.path
             DiskStorage.setPolicy(disk, forImageNamed: imageName)
@@ -210,7 +210,7 @@ public enum InstanceSetup {
     /// What an instance has, for `msl resources <instance>` with no options.
     public static func summary(instance: String, distro: GuestDistro) -> [String] {
         let policy = ResourcePolicyStore.load(instance: instance)
-        let boot = distro.bootFiles()
+        let boot = distro.bootFiles(instance: instance)
         let disk = DiskStorage.policy(forImageNamed: boot.storageKey, path: boot.disk.path)
         var lines = [
             "\(instance) (\(distro.rawValue))",

@@ -30,7 +30,10 @@ struct MaintenanceCard: View {
             // would send e2fsck at a missing file and come back with an
             // honest but baffling "operational error".
             if !instance.isInstalled {
-                Text("This distro isn't installed yet, so there's no disk to check or repair.")
+                // The instance, not the distro: each one has its own disk
+                // now, and an instance can be waiting on a download while
+                // another of the same distro is running happily.
+                Text("\(instance.name) has no disk yet, so there's nothing to check or repair. It gets one the first time it starts.")
                     .foregroundStyle(.secondary)
             } else if let status {
                 diskSection(status)

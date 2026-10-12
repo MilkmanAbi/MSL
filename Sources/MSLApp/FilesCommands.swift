@@ -49,6 +49,11 @@ struct FilesCommands: Commands {
                 .disabled(files?.focusedItem == nil)
             Button("Rename") { files?.beginRenamingSelection() }
                 .disabled(files?.canWrite != true || files?.selection.count != 1)
+            // Batch rename for a multi-selection: Power Rename.
+            Button("Rename Items…") {
+                if let files { files.beginPowerRename(files.selection) }
+            }
+            .disabled(files?.canWrite != true || (files?.selection.count ?? 0) < 2)
             Button("Compress") { files.map { $0.compress($0.selection) } }
                 .disabled(files?.canWrite != true || files?.selection.isEmpty != false)
             Button("Duplicate") { files.map { $0.duplicate($0.selection) } }
@@ -77,11 +82,18 @@ struct FilesCommands: Commands {
             .disabled(files?.selection.isEmpty != false)
 
             Divider()
-            // Finder's wording and its ⌥⌘C, matching the context menu's
-            // twin - both now go through `copyPaths`.
-            Button("Copy as Pathname") { files?.copyPathOfSelection() }
+            // Finder's wording and its ⌥⌘C for the Mac path; the twin below
+            // is the one Finder can't have. Both match the context menu.
+            Button("Copy as Mac Path") { files?.copyPathOfSelection() }
                 .keyboardShortcut("c", modifiers: [.command, .option])
                 .disabled(files?.selection.isEmpty != false)
+            // ⌃⌘C, not ⌥⌘L (that's Downloads in the Go menu) - and ⌥⌘C is
+            // already the Mac path right above.
+            Button("Copy as Linux Path") {
+                if let files { files.copyLinuxPaths(files.selection) }
+            }
+            .keyboardShortcut("c", modifiers: [.command, .control])
+            .disabled(files.map { !$0.hasLinuxPath($0.selection) } ?? true)
             Button("Open in Terminal") {
                 if let files, let item = files.focusedItem { files.openInTerminal(item) }
             }
@@ -89,6 +101,12 @@ struct FilesCommands: Commands {
             Button("Reveal in Finder") { files?.revealSelectionInFinder() }
                 .keyboardShortcut("r", modifiers: .command)
                 .disabled(files?.selection.isEmpty != false)
+
+            // The selected folder if there is one, otherwise the folder being
+            // looked at - so it does the obvious thing whether or not
+            // anything is selected, and there is always something to open.
+            Button("Git…") { files?.showGitForSelectionOrCurrentFolder() }
+                .keyboardShortcut("g", modifiers: [.command, .control])
 
             Divider()
             Button("Move to Trash") { files.map { $0.delete($0.selection) } }

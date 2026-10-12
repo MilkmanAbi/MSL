@@ -4,7 +4,9 @@ import Foundation
 public enum HelpGuide {
     public static let chapters: [HelpChapter] = [
         .welcome, .gettingStarted, .mainWindow, .applications, .terminal, .overview,
-        .tools, .sandbox, .files, .power, .troubleshooting, .commandLine, .reference,
+        .instances, .tools, .sandbox, .files, .graphics, .experiments, .power,
+        .publicAccess, .adminPortal, .updates,
+        .troubleshooting, .commandLine, .reference,
     ]
 
     public static let articles: [HelpArticle] = chapters.flatMap(\.articles)

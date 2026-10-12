@@ -7,6 +7,10 @@ struct RootView: View {
         NavigationSplitView {
             Sidebar()
                 .navigationSplitViewColumnWidth(min: 220, ideal: 248, max: 320)
+                // On the sidebar rather than beside the two sheets below:
+                // two `.sheet` modifiers on one view is a SwiftUI coin toss,
+                // and this one is opened from both columns.
+                .sheet(item: $model.editingLogo) { InstanceLogoSheet(instance: $0) }
         } detail: {
             Group {
                 if let instance = model.selectedInstance {
@@ -215,7 +219,15 @@ private struct InstanceRow: View {
 
     var body: some View {
         HStack(spacing: Design.Spacing.small + 2) {
-            DistroBadge(distro: instance.distro)
+            // A real Button, not a tap gesture on the image: a gesture here
+            // competes with the row's own selection, and the ⓘ in the New
+            // Instance sheet already taught us that something which only
+            // looks clickable is worse than nothing (2026-09-30).
+            Button { model.editingLogo = instance } label: {
+                InstanceBadge(instance: instance)
+            }
+            .buttonStyle(.plain)
+            .help("Change \(instance.name)'s logo")
             VStack(alignment: .leading, spacing: 1) {
                 Text(instance.name)
                     .lineLimit(1)
@@ -236,19 +248,46 @@ private struct InstanceRow: View {
 
 struct InstanceMenu: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.openWindow) private var openWindow
     let instance: Instance
 
     var body: some View {
         if instance.state == .running {
             Button("Suspend") { model.suspend(instance) }
+            Button("Hibernate") { model.hibernate(instance) }
             Button("Shut Down") { model.shutDown(instance) }
         } else {
-            Button("Start") { model.start(instance) }
-                .disabled(model.atCap && !instance.isLive)
+            Button(instance.isInstalled ? "Start" : "Install \(instance.distro.displayName)…") {
+                if instance.isInstalled { model.start(instance) } else { model.installDistro(instance.distro) }
+            }
+            .disabled(model.atCap && !instance.isLive)
         }
         Divider()
         Button("Open in Terminal.app") { model.openTerminal(instance) }
+        Button("Browse Files") {
+            model.selection = instance.name
+            MSLFilesLauncher.reveal(instance: instance.name) { openWindow(id: "files") }
+        }
+        .disabled(!instance.isLive)
+        Button("Refresh Apps") { model.scanApps(instance) }
+            .disabled(!instance.isLive || model.isScanning(instance))
         Button("Show Apps in Finder") { model.revealInFinder(instance) }
+        Divider()
+        // Also on the badge itself, which is where it belongs - this is for
+        // the people who never think to click an icon.
+        Button("Change Logo…") { model.editingLogo = instance }
+        Divider()
+        Button("Create Shipment…") { model.createShipment(instance) }
+            .disabled(instance.isLive || !instance.isInstalled)
+        Divider()
+        Button("Copy Name") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(instance.name, forType: .string)
+        }
+        Button("Copy Shell Command") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("msl run \(instance.name)", forType: .string)
+        }
         Divider()
         Button("Remove…", role: .destructive) { model.requestRemove(instance) }
         Button(instance.distro.isCustom

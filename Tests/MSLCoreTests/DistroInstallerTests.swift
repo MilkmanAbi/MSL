@@ -45,6 +45,142 @@ final class DistroInstallerTests: XCTestCase {
         return "file://" + url.path
     }
 
+    // MARK: - Falling back between image sources
+
+    /// A source that cannot possibly answer: a manifest that is not there.
+    private var brokenSource: DistroInstaller.ImageSource {
+        DistroInstaller.ImageSource(
+            name: "Broken",
+            manifestURL: "file://" + served.appendingPathComponent("no-such-manifest.json").path)
+    }
+
+    private func workingSource(_ name: String = "Working") throws -> DistroInstaller.ImageSource {
+        let url = try writeManifest(DistroInstaller.Manifest(
+            kernel: try publish("Image", "kernel-bytes"),
+            initramfs: try publish("initramfs", "initramfs-bytes"),
+            distros: ["debian": try publish("debian.img", "debian-rootfs")]))
+        return DistroInstaller.ImageSource(name: name, manifestURL: url)
+    }
+
+    func testFallsBackToTheNextSourceWhenTheFirstIsDown() throws {
+        var log: [String] = []
+        try DistroInstaller.install(
+            distro: .debian, sources: [brokenSource, try workingSource()],
+            appSupportDir: destination) { log.append($0) }
+
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: destination.appendingPathComponent("rootfs-debian.img").path),
+            "the image should have arrived from the second source")
+        XCTAssertTrue(log.contains { $0.contains("Broken didn't work") },
+                      "the person should be told the first source failed: \(log)")
+        XCTAssertTrue(log.contains { $0.contains("downloading from Broken") })
+    }
+
+    /// The first source is tried twice before moving on - that is the "retry
+    /// one more time" half of the behaviour, and it is invisible without a
+    /// count.
+    func testEachSourceIsTriedTwiceBeforeMovingOn() throws {
+        var log: [String] = []
+        try DistroInstaller.install(
+            distro: .debian, sources: [brokenSource, try workingSource()],
+            appSupportDir: destination) { log.append($0) }
+        let retries = log.filter { $0.contains("retrying from Broken") }
+        XCTAssertEqual(retries.count, DistroInstaller.attemptsPerSource - 1,
+                       "expected one retry of the broken source, got: \(log)")
+    }
+
+    func testAWorkingFirstSourceIsNotAbandoned() throws {
+        var log: [String] = []
+        try DistroInstaller.install(
+            distro: .debian, sources: [try workingSource("First"), brokenSource],
+            appSupportDir: destination) { log.append($0) }
+        XCTAssertFalse(log.contains { $0.contains("Broken") },
+                       "the second source should never have been reached: \(log)")
+    }
+
+    func testEveryFailureIsReportedWhenNoSourceWorks() throws {
+        var thrown: Error?
+        XCTAssertThrowsError(try DistroInstaller.install(
+            distro: .debian, sources: [brokenSource, brokenSource],
+            appSupportDir: destination)) { thrown = $0 }
+        let text = "\(thrown.map { "\($0)" } ?? "")"
+        // Two sources, two attempts each.
+        XCTAssertEqual(text.components(separatedBy: "attempt").count - 1, 4,
+                       "every attempt should be listed: \(text)")
+    }
+
+    /// Cancelling must stop, not move on. Without this the person presses
+    /// Cancel and watches the download restart up to four more times.
+    func testCancellingDoesNotFallBackOrRetry() throws {
+        let cancellation = DistroInstaller.InstallCancellation()
+        cancellation.cancel()
+        var log: [String] = []
+        XCTAssertThrowsError(try DistroInstaller.install(
+            distro: .debian, sources: [try workingSource(), brokenSource],
+            appSupportDir: destination,
+            cancellation: cancellation) { log.append($0) }) { error in
+            guard case DistroInstaller.InstallerError.cancelled = error else {
+                return XCTFail("expected .cancelled, got \(error)")
+            }
+        }
+        XCTAssertFalse(log.contains { $0.contains("retrying") }, "a cancel must not retry: \(log)")
+    }
+
+    // MARK: - Which sources are used
+
+    func testHuggingFaceIsTriedBeforeSourceForge() {
+        XCTAssertEqual(DistroInstaller.defaultSources.count, 2)
+        XCTAssertEqual(DistroInstaller.defaultSources[0], DistroInstaller.huggingFaceSource)
+        XCTAssertEqual(DistroInstaller.defaultSources[1], DistroInstaller.sourceForgeSource)
+        XCTAssertTrue(DistroInstaller.huggingFaceSource.manifestURL.contains("huggingface.co"))
+        XCTAssertTrue(DistroInstaller.sourceForgeSource.manifestURL.contains("sourceforge.net"))
+    }
+
+    /// An explicit choice means exactly that one. A test pointed at a local
+    /// fixture must never quietly reach the real internet instead.
+    func testAnExplicitManifestIsTheOnlySource() throws {
+        let sources = try DistroInstaller.resolveSources(override: "file:///tmp/whatever.json")
+        XCTAssertEqual(sources.count, 1)
+        XCTAssertEqual(sources[0].manifestURL, "file:///tmp/whatever.json")
+    }
+
+    /// The fallback against the **real** hosts, not a fixture.
+    ///
+    /// Skipped unless `MSL_LIVE_SOURCE_TEST=1`, because the rest of this
+    /// suite must not need the internet. Run it after changing either
+    /// published manifest:
+    ///
+    ///     MSL_LIVE_SOURCE_TEST=1 swift test --filter testLiveSourcesAnswer
+    func testLiveSourcesAnswer() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["MSL_LIVE_SOURCE_TEST"] == "1",
+                          "set MSL_LIVE_SOURCE_TEST=1 to check the published manifests")
+
+        // Both real sources must serve a manifest naming the same distros,
+        // or a fallback would quietly install something different.
+        let hugging = try DistroInstaller.fetchManifest(from: DistroInstaller.huggingFaceSource.manifestURL)
+        let sourceForge = try DistroInstaller.fetchManifest(from: DistroInstaller.sourceForgeSource.manifestURL)
+        XCTAssertEqual(Set(hugging.distros.keys), Set(sourceForge.distros.keys),
+                       "the two sources publish different distro sets")
+        for (name, artifact) in hugging.distros {
+            XCTAssertEqual(artifact.sha256, sourceForge.distros[name]?.sha256,
+                           "\(name) differs between the two sources - a fallback would install other bytes")
+        }
+        XCTAssertEqual(hugging.kernel.sha256, sourceForge.kernel.sha256)
+        XCTAssertEqual(hugging.initramfs.sha256, sourceForge.initramfs.sha256)
+
+        // And an unreachable first source really does hand over.
+        let broken = DistroInstaller.ImageSource(
+            name: "unreachable", manifestURL: "https://huggingface.invalid/manifest.json")
+        var reached: String?
+        for source in [broken, DistroInstaller.sourceForgeSource] {
+            if (try? DistroInstaller.fetchManifest(from: source.manifestURL)) != nil {
+                reached = source.name
+                break
+            }
+        }
+        XCTAssertEqual(reached, DistroInstaller.sourceForgeSource.name)
+    }
+
     func testInstallsKernelInitramfsAndImage() throws {
         let manifestURL = try writeManifest(DistroInstaller.Manifest(
             kernel: try publish("Image", "kernel-bytes"),
@@ -229,5 +365,103 @@ final class DistroInstallerTests: XCTestCase {
         let json = #"{"kernel":{"version":"1","url":"u","sha256":"s","size":1},"initramfs":{"version":"1","url":"u","sha256":"s","size":1},"distros":{}}"#
         let manifest = try JSONDecoder().decode(DistroInstaller.Manifest.self, from: Data(json.utf8))
         XCTAssertNil(manifest.kernel.compression, "manifests from before compressed images must keep working")
+    }
+}
+
+// MARK: - Download progress
+
+/// The line under the progress bar must not change width as it counts.
+///
+/// It used to: `ByteCountFormatter` chose its unit and decimals per call, and
+/// the rate disappeared whenever a sample saw no growth - so the text jumped
+/// shorter every few seconds and the whole block jiggled (reported
+/// 2026-10-01).
+final class TransferProgressTests: XCTestCase {
+    private func line(_ completed: UInt64, _ total: UInt64, _ rate: Double) -> String {
+        DistroInstaller.TransferProgress(completed: completed, total: total,
+                                         bytesPerSecond: rate).description
+    }
+
+    func testWidthStaysConstantThroughoutADownload() {
+        let total: UInt64 = 534 * 1_000_000
+        var widths = Set<Int>()
+        // Every percent of the way, at wildly different speeds.
+        for percent in 0...100 {
+            let done = UInt64(Double(total) * Double(percent) / 100)
+            let rate = Double((percent % 17) + 1) * 500_000
+            widths.insert(line(done, total, rate).count)
+        }
+        XCTAssertEqual(widths.count, 1,
+                       "the line changes width as it counts: \(widths.sorted())")
+    }
+
+    func testRateIsAlwaysShownEvenAtZero() {
+        // A sample that sees no growth must not make the figure vanish - that
+        // was half the jitter.
+        XCTAssertTrue(line(100_000_000, 534_000_000, 0).contains("MB/s"))
+    }
+
+    func testUnitDoesNotSwitchMidDownload() {
+        // Chosen from the total, so a download that starts in MB stays in MB.
+        let total: UInt64 = 900 * 1_000_000
+        XCTAssertTrue(line(1, total, 1).hasSuffix("MB/s"))
+        XCTAssertTrue(line(1, total, 1).contains(" of 900.0 MB"))
+        XCTAssertTrue(line(total, total, 1).contains(" of 900.0 MB"))
+    }
+
+    func testGigabyteDownloadsReadInGB() {
+        let total: UInt64 = 3 * 1_000_000_000
+        XCTAssertTrue(line(total / 2, total, 1).contains("of 3.0 GB"))
+    }
+
+    func testFractionIsClampedAndSafeAtZeroTotal() {
+        XCTAssertEqual(DistroInstaller.TransferProgress(completed: 5, total: 0, bytesPerSecond: 0).fraction, 0)
+        XCTAssertEqual(DistroInstaller.TransferProgress(completed: 20, total: 10, bytesPerSecond: 0).fraction, 1)
+    }
+}
+
+/// A distribution is downloaded once and kept.
+///
+/// Every instance of it is cloned from that base, so re-fetching a few
+/// hundred megabytes to replace a byte-identical file is pure waste - which
+/// is what `msl install` did for a distro you already had, because only the
+/// kernel and initramfs were being skipped.
+final class BaseIsKeptTests: XCTestCase {
+    private var support: URL!
+
+    override func setUpWithError() throws {
+        support = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("msl-base-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+    }
+    override func tearDownWithError() throws { try? FileManager.default.removeItem(at: support) }
+
+    private var disk: URL { GuestDistro.debian.baseImageURL(appSupport: support) }
+
+    func testAnUnrecordedBaseIsNotTreatedAsDownloaded() throws {
+        try Data("image".utf8).write(to: disk)
+        XCTAssertNil(DistroInstaller.installedMarker(for: disk))
+    }
+
+    func testARecordedBaseIsRecognisedByItsChecksum() throws {
+        try Data("image".utf8).write(to: disk)
+        DistroInstaller.recordInstalled("abc123", for: disk)
+        XCTAssertEqual(DistroInstaller.installedMarker(for: disk), "abc123")
+    }
+
+    /// A new release has a different checksum, so it still downloads.
+    func testADifferentChecksumMeansADifferentRelease() throws {
+        try Data("image".utf8).write(to: disk)
+        DistroInstaller.recordInstalled("old", for: disk)
+        XCTAssertNotEqual(DistroInstaller.installedMarker(for: disk), "new")
+    }
+
+    /// Deleting the image by hand must not leave MSL believing it is there.
+    func testTheRecordMeansNothingWithoutTheImage() throws {
+        try Data("image".utf8).write(to: disk)
+        DistroInstaller.recordInstalled("abc123", for: disk)
+        try FileManager.default.removeItem(at: disk)
+        XCTAssertNil(DistroInstaller.installedMarker(for: disk),
+                     "a record without an image would skip a download that is genuinely needed")
     }
 }

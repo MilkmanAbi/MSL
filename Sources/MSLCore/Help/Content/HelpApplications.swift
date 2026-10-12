@@ -6,7 +6,7 @@ extension HelpChapter {
     static let applications = HelpChapter(
         id: "applications", title: "Applications Tab", symbol: "square.grid.2x2", tint: .purple,
         blurb: "Linux GUI apps as real Mac windows — find them, open them, keep them in your Dock.",
-        articles: [.appsTab, .openingApps, .addToApplications, .pinToDock, .appSources, .linuxWindows])
+        articles: [.appsTab, .openingApps, .appMenu, .addToApplications, .pinToDock, .appSources, .linuxWindows])
 }
 
 extension HelpArticle {
@@ -236,5 +236,63 @@ extension HelpArticle {
         > Some apps use corners of X11 that mslgd doesn't draw perfectly yet. That's mslgd's fault, not yours, and not
         > the app's. Trying the same app from another source (a Flatpak instead of the package, say) occasionally
         > helps. ( ˘•ω•˘ )
+        """#)
+
+    static let appMenu = HelpArticle(
+        id: "app-menu", title: "The app right-click menu", symbol: "contextualmenu.and.cursorarrow",
+        summary: "Everything you can do to one app from its tile in the Applications tab.",
+        keywords: ["right click", "context menu", "secondary click", "app menu", "launchpad", "dock", "pin",
+                   "graphics", "copy command", "refresh"],
+        related: ["apps-tab", "opening-apps", "add-to-applications", "pin-to-dock", "gpu-acceleration"],
+        body: #"""
+        Right-click any app in the Applications tab (or Control-click, or a two-finger click) for everything MSL
+        can do with that one app.
+
+        ## What is on it {#items}
+
+        | Item | What it does |
+        |---|---|
+        | **Open** | Launches it. The same as double-clicking. |
+        | **Add to Launchpad** | Makes a real Mac app for it in your Applications folder, so Spotlight and Launchpad find it. |
+        | **Remove from Launchpad** | Takes that away again. |
+        | **Add to Dock** | Keeps it in the Dock, so it is one click away whether or not MSL is open. |
+        | **Pin to Top** | Moves it to the front of this list. For the handful you actually use. |
+        | **Graphics** | Whether this app's OpenGL runs on the GPU or the CPU. |
+        | **Copy Command** | The command its desktop entry runs, for pasting into a terminal. |
+        | **Copy Launch Command** | The same, wrapped in `msl <instance> ...` so it runs from your Mac. |
+        | **Refresh This List** | Scans the instance for applications again. |
+
+        The command itself is shown at the bottom of the menu, so you can see what an app will actually run
+        without copying it anywhere.
+
+        ## Graphics, per app {#graphics}
+
+        The **Graphics** submenu is the useful one when something will not render:
+
+        | Choice | Means |
+        |---|---|
+        | **Default** | Follow the [GPU acceleration](help:gpu-acceleration) switch in Experimental Features. |
+        | **GPU** | Always the Mac's graphics hardware. OpenGL 4.1 at most. |
+        | **CPU** | Always software rendering. OpenGL 4.5, slower for heavy 3D. |
+
+        This is how you keep one app working while everything else uses the GPU — Blender wants OpenGL newer than
+        the GPU path offers, so pinning it to **CPU** is the fix. It applies from that app's next launch.
+
+        ## The badges on a tile {#badges}
+
+        | Badge | Means |
+        |---|---|
+        | A tick | It is in your Applications folder. |
+        | A pin | It is pinned to the top of this list. |
+        | A spinner | MSL is fetching a better icon for it from the instance. |
+        | **System**, **Flatpak**, **Snap**, **User** | Where the app came from. |
+        | **CPU** or **GPU** next to that | This app has been pinned to one graphics path. |
+        
+        ## Changing how one app starts {#custom-command}
+
+        **Custom Launch Command** replaces what MSL runs when you open this app — for a game that needs a particular
+        engine build, or a binary that wants an environment variable. See
+        [Changing how an app starts](help:instances-custom-command).
+
         """#)
 }

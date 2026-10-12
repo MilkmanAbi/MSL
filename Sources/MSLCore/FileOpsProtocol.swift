@@ -131,6 +131,29 @@ public enum FileOpsProtocol {
         return buf
     }
 
+    /// Re-encodes parsed entries into a LIST2 *response body*, so the daemon
+    /// can normalize a guest's LIST-or-LIST2 listing into one wire shape and
+    /// the app decode it with `parseList2` regardless of the guest's age.
+    /// Used by mslhd's `FILE_LIST` relay - the app has no vsock of its own, so
+    /// the daemon lists on its behalf and hands the bytes back (base64'd).
+    /// Names are already valid UTF-8 here (anything else was dropped when the
+    /// listing was first parsed), so nothing is lost re-encoding from String.
+    public static func encodeEntriesAsList2(_ entries: [Entry]) -> [UInt8] {
+        var buf: [UInt8] = []
+        for entry in entries {
+            let name = Array(entry.name.utf8)
+            // A name past 65535 bytes can't be length-prefixed; Linux caps a
+            // path component at 255, so this only ever skips genuine garbage.
+            guard name.count <= Int(UInt16.max) else { continue }
+            appendU16LE(UInt16(name.count), &buf)
+            buf.append(contentsOf: name)
+            appendU64LE(entry.size, &buf)
+            appendU64LE(entry.mtime, &buf)
+            appendU32LE(entry.mode, &buf)
+        }
+        return buf
+    }
+
     private static func readU32LE(_ b: [UInt8], _ i: Int) -> UInt32 {
         UInt32(b[i]) | (UInt32(b[i + 1]) << 8) | (UInt32(b[i + 2]) << 16) | (UInt32(b[i + 3]) << 24)
     }

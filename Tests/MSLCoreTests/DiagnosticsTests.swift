@@ -76,11 +76,13 @@ final class DiagnosticsTests: XCTestCase {
         XCTAssertEqual(bundleFinding?.severity, .problem)
     }
 
-    func testRegisteredInstanceWithNoImageIsReported() {
+    /// An instance whose distro was never downloaded has nothing to clone,
+    /// so it cannot start - a problem, and the advice is to install.
+    func testInstanceWhoseDistroWasNeverDownloadedIsAProblem() {
         let findings = Diagnostics.run(environment(instances: ["work": .fedora]))
         XCTAssertTrue(findings.contains {
-            $0.severity == .problem && $0.title.contains("fedora image not installed")
-        })
+            $0.severity == .problem && $0.title.contains("fedora isn't downloaded")
+        }, "expected a problem about the missing download, got: \(findings.map(\.title))")
     }
 
     func testMissingToolsAreReported() throws {
@@ -134,5 +136,51 @@ final class DiagnosticsTests: XCTestCase {
         let findings = Diagnostics.run(environment(instances: ["test-box": .alpine]))
         XCTAssertTrue(findings.flatMap { $0.removable }.isEmpty,
                       "a hyphen-named live instance must have nothing proposed for deletion")
+    }
+}
+
+extension DiagnosticsTests {
+    /// The whole morning of 2026-09-22: the MSL.app being used was from
+    /// 16 September, so none of the week's fixes were in it - apps still ran
+    /// as root, the app list was the old instance's, and the UI was the old
+    /// one. Nothing in the app said how old it was.
+    func testStaleAppIsReported() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("msl-stale-\(UUID().uuidString)")
+        let macos = root.appendingPathComponent("MSL.app/Contents/MacOS")
+        let tools = root.appendingPathComponent("bin")
+        try fm.createDirectory(at: macos, withIntermediateDirectories: true)
+        try fm.createDirectory(at: tools, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let app = macos.appendingPathComponent("MSLApp")
+        try "app".write(to: app, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.modificationDate: Date(timeIntervalSinceNow: -6 * 86_400)],
+                             ofItemAtPath: app.path)
+        let daemon = tools.appendingPathComponent("mslhd")
+        try "tool".write(to: daemon, atomically: true, encoding: .utf8)
+
+        let finding = Diagnostics.staleAppFinding(bundle: root.appendingPathComponent("MSL.app"),
+                                                  toolsDirectory: tools)
+        XCTAssertEqual(finding?.severity, .problem)
+        XCTAssertEqual(finding?.title.contains("6 day(s) older"), true)
+    }
+
+    /// A current app is not a finding, and neither is a missing one.
+    func testCurrentAppIsQuiet() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("msl-current-\(UUID().uuidString)")
+        let macos = root.appendingPathComponent("MSL.app/Contents/MacOS")
+        let tools = root.appendingPathComponent("bin")
+        try fm.createDirectory(at: macos, withIntermediateDirectories: true)
+        try fm.createDirectory(at: tools, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+        try "app".write(to: macos.appendingPathComponent("MSLApp"), atomically: true, encoding: .utf8)
+        try "tool".write(to: tools.appendingPathComponent("mslhd"), atomically: true, encoding: .utf8)
+
+        XCTAssertNil(Diagnostics.staleAppFinding(bundle: root.appendingPathComponent("MSL.app"),
+                                                 toolsDirectory: tools))
+        XCTAssertNil(Diagnostics.staleAppFinding(bundle: root.appendingPathComponent("Nope.app"),
+                                                 toolsDirectory: tools))
     }
 }

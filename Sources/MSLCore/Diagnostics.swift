@@ -53,10 +53,19 @@ public enum Diagnostics {
         public let instances: [String: GuestDistro]
         public let expectedTools: [String]
         public let daemonRunning: Bool
+        /// The MSLAP policy in force, or nil on an unmanaged Mac.
+        ///
+        /// Injected like every other path here, so the protection checks
+        /// run against a policy a test built rather than whatever is
+        /// installed on the machine running the test.
+        public let policy: MSLAPPolicy?
 
         public init(
             appSupport: URL, generatedApps: URL, binDirectory: URL,
-            instances: [String: GuestDistro], expectedTools: [String], daemonRunning: Bool
+            instances: [String: GuestDistro], expectedTools: [String], daemonRunning: Bool,
+            // Defaulted so every existing call site keeps compiling and
+            // keeps meaning what it meant: no policy, no protection checks.
+            policy: MSLAPPolicy? = nil
         ) {
             self.appSupport = appSupport
             self.generatedApps = generatedApps
@@ -64,7 +73,39 @@ public enum Diagnostics {
             self.instances = instances
             self.expectedTools = expectedTools
             self.daemonRunning = daemonRunning
+            self.policy = policy
         }
+    }
+
+    /// Whether the installed MSL.app is older than the command-line tools
+    /// it would overwrite, and by how long.
+    ///
+    /// This is the shape of a bug that cost a whole morning: `MSL.app` in
+    /// /Applications was weeks older than everything else, so the app being
+    /// used had none of the fixes - and because it reinstalls its own tools
+    /// at launch, opening it could also drag `mslhd` and `msl` back in time.
+    /// Nothing anywhere said so; the app looks the same either way.
+    public static func staleAppFinding(bundle: URL, toolsDirectory: URL,
+                                       now: Date = Date()) -> Finding? {
+        func modified(_ url: URL) -> Date? {
+            (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+        }
+        let appBinary = bundle.appendingPathComponent("Contents/MacOS/MSLApp")
+        guard FileManager.default.fileExists(atPath: appBinary.path),
+              let appDate = modified(appBinary),
+              let toolDate = modified(toolsDirectory.appendingPathComponent("mslhd"))
+        else { return nil }
+        let days = toolDate.timeIntervalSince(appDate) / 86_400
+        guard days >= 1 else { return nil }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        return Finding(
+            severity: .problem,
+            title: "\(bundle.lastPathComponent) is \(Int(days)) day(s) older than MSL's tools",
+            detail: "The app at \(bundle.path) is from \(formatter.string(from: appDate)) and the "
+                  + "installed tools are from \(formatter.string(from: toolDate)). That app has none "
+                  + "of the newer fixes, and opening it reinstalls its own copies of the tools. "
+                  + "Replace it with a current build.")
     }
 
     public static func run(_ environment: Environment) -> [Finding] {
@@ -74,10 +115,123 @@ public enum Diagnostics {
         findings.append(contentsOf: instanceFindings(environment))
         findings.append(contentsOf: orphanFindings(environment))
         findings.append(contentsOf: diskFindings(environment))
+        findings.append(contentsOf: protectionFindings(environment))
+        findings.append(contentsOf: identityFindings(environment))
         return findings
     }
 
     // MARK: - Checks
+
+    /// What each instance's identity says, and nothing more.
+    ///
+    /// **Report before enforce.** Nothing refuses a start on an identity
+    /// yet, deliberately: this touches the boot path of every instance on
+    /// every Mac, and a read-only verdict is the only way to learn what
+    /// real machines say before a refusal can strand anybody. See
+    /// `READMES/31-INSTANCE-IDENTITY.md` step 3.
+    ///
+    /// Severities say exactly what is known:
+    /// - a **duplicate serial** is `problem`. Two registered instances
+    ///   cannot be the same instance, so something was copied. It is
+    ///   self-contradictory rather than merely unproven, which is why it
+    ///   will be the one verdict refused even with no policy.
+    /// - an identity that **does not verify** is `problem`: somebody
+    ///   edited it.
+    /// - **no identity** is not a finding at all on its own. Every
+    ///   instance in existence today is in that state, and warning about
+    ///   all of them would teach people to ignore the section.
+    static func identityFindings(_ environment: Environment) -> [Finding] {
+        let identities = InstanceIdentityStore.all(appSupport: environment.appSupport)
+        guard !identities.isEmpty else { return [] }
+        var findings: [Finding] = []
+
+        for (name, verdict) in identities.sorted(by: { $0.key < $1.key }) {
+            guard case .invalid(let why) = verdict else { continue }
+            findings.append(Finding(
+                severity: .problem,
+                title: "\(name)'s identity does not verify",
+                detail: "\(why) Somebody edited it, or it was signed by a key this Mac does "
+                      + "not accept. `msl identity \(name)` says more."))
+        }
+
+        for (serial, names) in InstanceIdentityStore
+            .duplicateSerials(appSupport: environment.appSupport)
+            .sorted(by: { $0.key < $1.key }) {
+            findings.append(Finding(
+                severity: .problem,
+                title: "\(names.joined(separator: " and ")) claim to be the same instance",
+                detail: "They share identity serial \(serial), and two registered instances "
+                      + "cannot both be the same instance - one of them is a copy that did not "
+                      + "come through MSL."))
+        }
+
+        // State left by instances that no longer exist, the same class of
+        // finding already reported for app lists and disks.
+        let orphans = identities.keys
+            .filter { environment.instances[$0] == nil }.sorted()
+        if !orphans.isEmpty {
+            findings.append(Finding(
+                severity: .warning,
+                title: "Identities left by \(orphans.count) removed instance(s)",
+                detail: orphans.joined(separator: ", "),
+                removable: orphans.map {
+                    InstanceIdentityStore.file(for: $0, appSupport: environment.appSupport)
+                }))
+        }
+
+        let valid = identities.values.filter { $0.identity != nil }.count
+        let clones = identities.values.filter { $0.identity?.isClone == true }.count
+        if findings.isEmpty, valid > 0 {
+            findings.append(Finding(
+                severity: .ok,
+                title: "\(valid) instance(s) have a verified identity",
+                detail: clones == 0
+                    ? "None of them is a copy of another."
+                    : "\(clones) of them \(clones == 1 ? "is a copy" : "are copies") of another instance - `msl identity` says which."))
+        }
+        return findings
+    }
+
+    /// Whether an instance the policy means to keep uncopyable actually is.
+    ///
+    /// **Reported here because the answer is usually no, for a reason
+    /// nobody would guess.** `mac_home` shares the Mac's whole home folder
+    /// into every guest, writable, and instance disks live inside it - so
+    /// denying `instance.clone` while leaving `sharing.macHome` open closes
+    /// the button and leaves a one-line `cp` wide open. An administrator
+    /// who has denied cloning believes they are done, and nothing told them
+    /// otherwise until now.
+    ///
+    /// `problem`, not `warning`: the policy states an intention that is not
+    /// being met, which is the same class of thing as a missing disk image.
+    static func protectionFindings(_ environment: Environment) -> [Finding] {
+        let policy = environment.policy
+        guard policy != nil else { return [] }
+        var findings: [Finding] = []
+        for name in environment.instances.keys.sorted() {
+            let reasons = ProtectedInstance.reasons(for: name, policy: policy)
+            guard !reasons.isEmpty else { continue }
+            let gaps = ProtectedInstance.gaps(for: name, policy: policy)
+            guard let worst = gaps.first else {
+                findings.append(Finding(
+                    severity: .ok,
+                    title: "\(name) is protected from being copied",
+                    detail: "\(reasons.map(\.intent).joined(separator: ", ")), and no route is "
+                          + "left for its disk image. What is inside it is still readable by "
+                          + "anyone who can open a shell in it."))
+                continue
+            }
+            findings.append(Finding(
+                severity: .problem,
+                title: "\(name) is meant to be protected, but \(worst.title)",
+                detail: worst.detail
+                      + (gaps.count > 1
+                         ? " Also still open: "
+                           + gaps.dropFirst().map(\.capability).joined(separator: ", ") + "."
+                         : "")))
+        }
+        return findings
+    }
 
     private static func toolFindings(_ environment: Environment) -> [Finding] {
         let missing = environment.expectedTools.filter {
@@ -123,11 +277,21 @@ public enum Diagnostics {
                 }
                 continue
             }
-            let image = distro.bootFiles(appSupport: environment.appSupport).disk
-            if !FileManager.default.fileExists(atPath: image.path) {
-                findings.append(Finding(
-                    severity: .problem, title: "\(name): \(distro.rawValue) image not installed",
-                    detail: "\(distro.diskImageFilename) is missing - run `msl install \(distro.rawValue)`."))
+            // Two different "missing"s, and they want different advice: an
+            // instance without its own disk has never been started (or its
+            // disk was deleted), and it can be given one from the base
+            // without downloading anything. A distro without a base needs
+            // the download.
+            if !InstanceDisk.exists(instance: name, appSupport: environment.appSupport) {
+                if distro.baseIsInstalled(appSupport: environment.appSupport) {
+                    findings.append(Finding(
+                        severity: .ok, title: "\(name): disk is made on first start",
+                        detail: "Its own copy of \(distro.rawValue) is cloned from the downloaded image the first time it starts."))
+                } else {
+                    findings.append(Finding(
+                        severity: .problem, title: "\(name): \(distro.rawValue) isn't downloaded",
+                        detail: "\(distro.diskImageFilename) is missing, so \(name) has nothing to clone - run `msl install \(distro.rawValue)`."))
+                }
             }
         }
         if findings.isEmpty {
@@ -159,6 +323,15 @@ public enum Diagnostics {
                 severity: .warning, title: "State left by \(orphanNames.count) removed instance(s)",
                 detail: "\(orphanNames.sorted().joined(separator: ", ")) - \(orphanFiles.count) file(s). Nothing reads these.",
                 removable: orphanFiles))
+        }
+
+        // An MSL.app older than the tools it ships with.
+        for bundle in [URL(fileURLWithPath: "/Applications/MSL.app"),
+                       FileManager.default.homeDirectoryForCurrentUser
+                           .appendingPathComponent("Applications/MSL.app")] {
+            if let finding = staleAppFinding(bundle: bundle, toolsDirectory: environment.binDirectory) {
+                findings.append(finding)
+            }
         }
 
         // Cached app catalogs.
@@ -239,14 +412,27 @@ public enum Diagnostics {
     private static func diskFindings(_ environment: Environment) -> [Finding] {
         var total: Int64 = 0
         var lines: [String] = []
+        // Bases first - the downloaded images new instances are cloned from.
         for distro in GuestDistro.allCases {
-            let url = environment.appSupport.appendingPathComponent(distro.diskImageFilename)
+            let url = distro.baseImageURL(appSupport: environment.appSupport)
             guard let values = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileSizeKey]),
                   let allocated = values.totalFileAllocatedSize else { continue }
             total += Int64(allocated)
             let apparent = values.fileSize ?? allocated
-            let inUse = environment.instances.values.contains(distro)
-            lines.append("\(distro.rawValue): \(bytes(Int64(allocated))) on disk of \(bytes(Int64(apparent)))\(inUse ? "" : " - no instance uses this")")
+            lines.append("\(distro.rawValue) (downloaded): \(bytes(Int64(allocated))) on disk of \(bytes(Int64(apparent)))")
+        }
+        // Then each instance's own disk. These are APFS clones, so the sizes
+        // overlap: an instance that has written nothing shares every block
+        // with its base and the two are not additive. Said plainly rather
+        // than left to look like double counting.
+        for instance in InstanceDisk.all(appSupport: environment.appSupport) {
+            let url = InstanceDisk.url(instance: instance, appSupport: environment.appSupport)
+            guard let values = try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey, .fileSizeKey]),
+                  let allocated = values.totalFileAllocatedSize else { continue }
+            total += Int64(allocated)
+            let apparent = values.fileSize ?? allocated
+            let orphaned = environment.instances[instance] == nil
+            lines.append("\(instance): \(bytes(Int64(allocated))) on disk of \(bytes(Int64(apparent)))\(orphaned ? " - no such instance" : "")")
         }
         guard !lines.isEmpty else { return [] }
         return [Finding(

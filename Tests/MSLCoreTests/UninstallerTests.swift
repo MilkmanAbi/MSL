@@ -228,6 +228,55 @@ final class UninstallerTests: XCTestCase {
         XCTAssertGreaterThan(images, 0)
         XCTAssertEqual(Uninstaller.size(of: locations.appSupport.appendingPathComponent("nothing-here")), 0)
     }
+
+    /// Builds `/Users/Shared/MSL` with the given entries.
+    private func makeShared(_ names: [String]) throws -> Uninstaller.Locations {
+        let shared = root.appendingPathComponent("Shared/MSL")
+        for name in names {
+            if name == "vaults" {
+                try write(shared.appendingPathComponent("vaults/Milk.sparsebundle/token"))
+            } else {
+                try write(shared.appendingPathComponent(name))
+            }
+        }
+        return Uninstaller.Locations(home: locations.home,
+                                     appSupport: locations.appSupport,
+                                     appBundles: locations.appBundles,
+                                     sharedSupport: shared)
+    }
+
+    private func names(_ items: [Uninstaller.Item]) -> [String] {
+        items.map { ($0.path as NSString).lastPathComponent }
+    }
+
+    /// **Keeping the Linux means keeping what proves it is yours.**
+    /// `machine-key` signs instance identities. Removing it while keeping the
+    /// instances leaves every one of them unverifiable - `msl doctor` reports
+    /// "issued by key …, which this Mac does not accept" - and there is no
+    /// way back, because refusing to re-sign an identity is the entire point
+    /// of the scheme. Observed for real after an uninstall and reinstall.
+    func testKeepingLinuxKeepsTheKeysThatValidateIt() throws {
+        let where_ = try makeShared(["machine-key", "identity-signers.json",
+                                     "admin.json", "signing-key"])
+        let plan = Uninstaller.plan(mode: .keepLinux, locations: where_)
+
+        XCTAssertFalse(names(plan.removing).contains("machine-key"),
+                       "removing the key that signs identities orphans every kept instance")
+        XCTAssertFalse(names(plan.removing).contains("identity-signers.json"))
+        XCTAssertTrue(names(plan.keeping).contains("machine-key"))
+        // The administrator's own material still goes: uninstalling means
+        // this Mac is no longer administered.
+        XCTAssertTrue(names(plan.removing).contains("admin.json"))
+        XCTAssertTrue(names(plan.removing).contains("signing-key"))
+    }
+
+    /// Removing everything removes everything, keys included.
+    func testRemovingEverythingTakesTheKeysToo() throws {
+        let where_ = try makeShared(["machine-key", "admin.json"])
+        let plan = Uninstaller.plan(mode: .everything, locations: where_)
+        XCTAssertTrue(names(plan.removing).contains("MSL"),
+                      "everything means the whole shared directory")
+    }
 }
 
 /// Records what `perform` asked the system to do, without doing any of it.
@@ -251,4 +300,5 @@ private final class ActionRecorder: @unchecked Sendable {
             bootout: { [self] label in record("bootout(\(label))") },
             forgetSSH: { [self] instance in record("forgetSSH(\(instance))") })
     }
+
 }

@@ -106,6 +106,14 @@ public enum DesktopEntryParser {
         // Both are honoured.
         if isTrue(unlocalized("NoDisplay")) || isTrue(unlocalized("Hidden")) { return nil }
 
+        // MSL's own entries in the guest kit. Most are `NoDisplay` handlers,
+        // but MSL Files is a real entry in the Linux applications menu - it
+        // is the file manager on that side - and `NoDisplay` would hide it
+        // there as well as here. It still must not be listed as a Linux app
+        // to launch: it is already a Mac app with its own Dock tile, and the
+        // scan would generate a second bundle shadowing the real one.
+        if isTrue(unlocalized("X-MSL-Internal")) { return nil }
+
         // `OnlyShowIn`/`NotShowIn` are deliberately NOT honoured. They gate
         // on `XDG_CURRENT_DESKTOP`, and MSL is not GNOME, KDE or any other
         // value they name - obeying them would hide every "GNOME only" app
@@ -155,7 +163,7 @@ public enum DesktopEntryParser {
             let line = String(rawLine)
             if line.hasPrefix(marker), line.hasSuffix("===") {
                 flush()
-                currentPath = String(line.dropFirst(marker.count).dropLast(3))
+                currentPath = normalizePath(String(line.dropFirst(marker.count).dropLast(3)))
                 continue
             }
             guard currentPath != nil else { continue }
@@ -163,6 +171,30 @@ public enum DesktopEntryParser {
         }
         flush()
         return entries
+    }
+
+    /// Collapses repeated slashes and drops a trailing one.
+    ///
+    /// The path is an entry's identity - it is what deduplicates the list,
+    /// names the generated app and keys the icon cache. A guest session's
+    /// `XDG_DATA_DIRS` ends its entries with a slash, so the same file
+    /// arrived as both `/usr/share/applications/x.desktop` and
+    /// `/usr/share//applications/x.desktop`, and every system application
+    /// was listed twice.
+    static func normalizePath(_ path: String) -> String {
+        var result = ""
+        var lastWasSlash = false
+        for character in path {
+            if character == "/" {
+                if lastWasSlash { continue }
+                lastWasSlash = true
+            } else {
+                lastWasSlash = false
+            }
+            result.append(character)
+        }
+        if result.count > 1, result.hasSuffix("/") { result.removeLast() }
+        return result
     }
 
     static let marker = "===MSL_DESKTOP_ENTRY:"
@@ -363,10 +395,31 @@ public enum DesktopEntryParser {
     static func execArgv(_ exec: String, name: String, path: String, icon: String?) -> [String] {
         var argv: [String] = []
         for token in tokenize(exec) {
+            // Flatpak's file-forwarding markers, which are not in the
+            // Desktop Entry spec at all:
+            //
+            //   Exec=/usr/bin/flatpak run --file-forwarding org.app @@u %U @@
+            //
+            // `@@` opens a list of file arguments, `@@u` a list of URIs,
+            // and a closing `@@` ends it. MSL launches applications with no
+            // document, so the whole list is empty - but the markers
+            // themselves were being passed through as literal arguments,
+            // and `flatpak run` refuses them. Every Flatpak app exported
+            // with file forwarding (which is most of them) failed to start
+            // because of it.
+            if isFlatpakForwardingMarker(token) { continue }
             guard let resolved = resolveFieldCodes(token, name: name, path: path) else { continue }
             argv.append(resolved)
         }
         return argv
+    }
+
+    /// `@@`, `@@u`, `@@U`, `@@f`, `@@F` - and nothing else, so a real
+    /// argument that happens to start with `@@` is left alone.
+    static func isFlatpakForwardingMarker(_ token: String) -> Bool {
+        guard token.hasPrefix("@@") else { return false }
+        let rest = token.dropFirst(2)
+        return rest.isEmpty || (rest.count == 1 && "uUfF".contains(rest.first!))
     }
 
     /// Splits on unquoted whitespace, honouring double quotes and the

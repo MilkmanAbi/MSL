@@ -27,6 +27,18 @@ public enum DesktopEntryScanner {
     static let homeApplicationSubpaths = [
         ".local/share/applications",
         ".local/share/flatpak/exports/share/applications",
+        // Nix and Home Manager put a profile here, and a user-installed
+        // AppImage tool sometimes exports here rather than to
+        // `.local/share/applications`.
+        ".nix-profile/share/applications",
+    ]
+
+    /// Globs, expanded in the guest. `/opt` is where anything that predates
+    /// or ignores packaging lands - hand-unpacked IDEs, vendor bundles -
+    /// and none of it is reachable by a fixed path.
+    static let applicationGlobs = [
+        "/opt/*/share/applications",
+        "/usr/share/*/applications",
     ]
 
     /// Where icon *themes* live. `Icon=` is usually a bare name, not a
@@ -44,21 +56,74 @@ public enum DesktopEntryScanner {
         ".local/share/icons",
         ".icons",
         ".local/share/flatpak/exports/share/icons",
+        ".local/share/pixmaps",
+        ".nix-profile/share/icons",
+    ]
+
+    static let iconGlobs = [
+        "/opt/*/share/icons",
+        "/opt/*/share/pixmaps",
     ]
 
     /// Shell that expands the home globs and leaves the full directory list
     /// in `$MSL_DIRS`. Missing directories are dropped here so `find`
     /// doesn't spend its time complaining about them.
-    private static func directoryScript(fixed: [String], homeSubpaths: [String]) -> String {
-        """
-        MSL_DIRS=""
-        for d in \(fixed.joined(separator: " ")); do
-            [ -d "$d" ] && MSL_DIRS="$MSL_DIRS $d"
+    private static func directoryScript(fixed: [String], homeSubpaths: [String],
+                                        globs: [String] = [], leaf: String? = nil) -> String {
+        // A glob that matches nothing is left as the literal pattern by the
+        // shell, so every candidate is `-d` tested before it is used.
+        let globLoop = globs.isEmpty ? "" : """
+        for d in \(globs.joined(separator: " ")); do
+            msl_add_dir "$d"
         done
+        """
+        // `XDG_DATA_DIRS` is how a distro or a package manager says "look
+        // here too" - Nix, Guix, and anything installed under its own
+        // prefix rely on it. Empty in a plain `sh -c`, which is why it is
+        // an addition to the fixed list rather than a replacement for it.
+        let xdgLoop = leaf.map { leaf in """
+        if [ -n "${XDG_DATA_DIRS-}" ]; then
+            MSL_OLD_IFS="$IFS"
+            IFS=":"
+            for d in $XDG_DATA_DIRS; do
+                msl_add_dir "$d/\(leaf)"
+            done
+            IFS="$MSL_OLD_IFS"
+        fi
+        """ } ?? ""
+        return """
+        MSL_DIRS=""
+        # Adds a directory once, by its cleaned-up path.
+        #
+        # `XDG_DATA_DIRS` in a real session is `/usr/local/share/:/usr/share/`
+        # - with trailing slashes - so `$d/applications` produced
+        # `/usr/share//applications`, a different string for the same
+        # directory as the one in the fixed list. `find` walked it twice and
+        # every system application appeared twice in the app list.
+        msl_add_dir() {
+            msl_d=$1
+            while :; do
+                case "$msl_d" in
+                    *//*) msl_d=$(printf '%s' "$msl_d" | sed 's|//*|/|g') ;;
+                    */) msl_d=${msl_d%/} ;;
+                    *) break ;;
+                esac
+            done
+            [ -d "$msl_d" ] || return 0
+            for msl_seen in $MSL_DIRS; do
+                [ "$msl_seen" = "$msl_d" ] && return 0
+            done
+            MSL_DIRS="$MSL_DIRS $msl_d"
+        }
+        for d in \(fixed.joined(separator: " ")); do
+            msl_add_dir "$d"
+        done
+        \(globLoop)
+        \(xdgLoop)
         for h in /root /home/*; do
             [ -d "$h" ] || continue
             for s in \(homeSubpaths.joined(separator: " ")); do
-                [ -d "$h/$s" ] && MSL_DIRS="$MSL_DIRS $h/$s"
+                msl_add_dir "$h/$s"
             done
         done
         """
@@ -67,18 +132,27 @@ public enum DesktopEntryScanner {
     // MARK: - Scanning
 
     /// Reads every `.desktop` file in `instance` and parses it. Blocking.
+    /// Scanned as the user's own account (`GuestUser`): a scan as root reads
+    /// root's `~/.local/share/applications` and root's Flatpak installs, so
+    /// anything the user installed for themselves was invisible.
     public static func scan(instance: String, distro: GuestDistro) throws -> [DesktopEntry] {
         let script = """
-        \(directoryScript(fixed: applicationDirectories, homeSubpaths: homeApplicationSubpaths))
+        \(directoryScript(fixed: applicationDirectories, homeSubpaths: homeApplicationSubpaths,
+                          globs: applicationGlobs, leaf: "applications"))
         [ -n "$MSL_DIRS" ] || exit 0
-        find $MSL_DIRS -name '*.desktop' -type f 2>/dev/null | while read -r f; do
+        # `-type l` is not a nicety: EVERY file Flatpak exports is a symlink
+        # into `/var/lib/flatpak/app/...`, so `-type f` alone found no
+        # Flatpak application at all. Confirmed in a real instance
+        # (2026-09-21) - a Flatpak entry was invisible until this changed.
+        find $MSL_DIRS -name '*.desktop' \\( -type f -o -type l \\) 2>/dev/null | while read -r f; do
             echo "\(DesktopEntryParser.marker)$f==="
             cat "$f" 2>/dev/null
             echo ""
         done
         """
         let (_, output) = try ShellClient().runOneShotCommand(
-            instance: instance, distro: distro, command: script)
+            instance: instance, distro: distro, command: script,
+            user: GuestUser.shellUser(instance: instance, distro: distro))
         return DesktopEntryParser.parseStream(output)
     }
 
@@ -141,13 +215,14 @@ public enum DesktopEntryScanner {
         let encoded = Data(patterns.utf8).base64EncodedString()
         let directories = roots.map { roots in
             "MSL_DIRS=\"\(roots.joined(separator: " "))\""
-        } ?? directoryScript(fixed: iconDirectories, homeSubpaths: homeIconSubpaths)
+        } ?? directoryScript(fixed: iconDirectories, homeSubpaths: homeIconSubpaths,
+                             globs: iconGlobs, leaf: "icons")
         return """
         \(directories)
         [ -n "$MSL_DIRS" ] || exit 0
         MSL_PAT=$(mktemp) || exit 0
         printf '%s' '\(encoded)' | base64 -d > "$MSL_PAT" 2>/dev/null
-        find $MSL_DIRS \\( -name '*.png' -o -name '*.svg' -o -name '*.xpm' \\) -type f 2>/dev/null \\
+        find $MSL_DIRS \\( -name '*.png' -o -name '*.svg' -o -name '*.xpm' \\) \\( -type f -o -type l \\) 2>/dev/null \\
             | grep -F -f "$MSL_PAT" 2>/dev/null
         rm -f "$MSL_PAT"
         """
@@ -202,7 +277,8 @@ public enum DesktopEntryScanner {
         // match `gimp-tool.png`.
         let script = iconCandidateScript(names: themeNames)
         let (_, output) = try ShellClient().runOneShotCommand(
-            instance: instance, distro: distro, command: script)
+            instance: instance, distro: distro, command: script,
+            user: GuestUser.shellUser(instance: instance, distro: distro))
 
         var candidates: [IconCandidate] = []
         // CRLF from the PTY - see `DesktopEntryParser.parseStream`.
@@ -241,7 +317,8 @@ public enum DesktopEntryScanner {
         guard !paths.isEmpty else { return [:] }
         let script = fetchFilesScript(paths: paths, maxBytes: maxBytes)
         let (_, output) = try ShellClient().runOneShotCommand(
-            instance: instance, distro: distro, command: script)
+            instance: instance, distro: distro, command: script,
+            user: GuestUser.shellUser(instance: instance, distro: distro))
         return parseFiles(output)
     }
 

@@ -158,6 +158,8 @@ final class X11GlobalMenu: NSObject, NSMenuDelegate {
     private var entries: [UInt32: Entry] = [:]
     private var shownWindow: UInt32?
     private var installedItems: [NSMenuItem] = []
+    /// MSL's own Window menu, while an app's exported menus have one too.
+    private var hiddenWindowItem: NSMenuItem?
     private var installedSignature: [String] = []
     private var openNodes: [X11GlobalMenuNode] = []
     private var needsReinstall = false
@@ -232,6 +234,8 @@ final class X11GlobalMenu: NSObject, NSMenuDelegate {
         for item in installedItems where mainMenu.index(of: item) >= 0 {
             mainMenu.removeItem(item)
         }
+        hiddenWindowItem?.isHidden = false
+        hiddenWindowItem = nil
         installedItems = []
         installedSignature = []
         guard let windowID = shownWindow, let entry = entries[windowID] else { return }
@@ -241,19 +245,90 @@ final class X11GlobalMenu: NSObject, NSMenuDelegate {
            let windowItem = mainMenu.items.firstIndex(where: { $0.submenu === windowsMenu }) {
             index = windowItem
         }
-        for top in entry.root.children where top.visible && !top.isSeparator {
-            let item = NSMenuItem(title: top.label, action: nil, keyEquivalent: "")
+        // An application with a dozen menus does not get a dozen menus in
+        // the bar: on a MacBook the notch cuts the bar in half, and macOS
+        // silently drops whatever does not fit. Everything past what fits
+        // goes into one final menu instead, so nothing is unreachable and
+        // the titles never run into the notch. See `MenuBarFitting`.
+        let tops = entry.root.children.filter { $0.visible && !$0.isSeparator }
+
+        // Krita, GIMP and most of KDE export a Window menu of their own, and
+        // MSL puts one in the bar as well - so the bar read
+        // "... Settings Window Help Window". The app's own wins: it lists
+        // that application's windows, which is what someone reaching for
+        // "Window" in a Linux app is after. MSL's comes back the moment the
+        // app's menus leave the bar.
+        if let windowsMenu = NSApplication.shared.windowsMenu,
+           let ours = mainMenu.items.first(where: { $0.submenu === windowsMenu }),
+           tops.contains(where: { Self.plainTitle($0.label) == Self.plainTitle(Self.barTitle(of: ours)) }) {
+            ours.isHidden = true
+            hiddenWindowItem = ours
+        }
+
+        let reserved = mainMenu.items.prefix(index).reduce(CGFloat(0)) { total, item in
+            item.isHidden ? total : total + MenuBarFitting.width(ofTitle: Self.barTitle(of: item))
+        }
+        let split = MenuBarFitting.split(titles: tops.map(\.label),
+                                         // The primary screen, not the key window's: the menu
+                                         // bar is always on the primary, and on a multi-display
+                                         // Mac this was measuring the notch of a screen that has
+                                         // no menu bar at all.
+                                         available: MenuBarFitting.availableWidth(for: X11Connection.primaryScreen),
+                                         reserved: reserved)
+
+        func makeNode(_ top: X11GlobalMenuItem) -> X11GlobalMenuNode {
             let node = X11GlobalMenuNode(title: top.label)
             node.itemID = top.id
             node.windowID = windowID
             node.delegate = self
             node.autoenablesItems = false
-            item.submenu = node
+            return node
+        }
+
+        for top in tops.prefix(split.visible.count) {
+            let item = NSMenuItem(title: top.label, action: nil, keyEquivalent: "")
+            item.submenu = makeNode(top)
             mainMenu.insertItem(item, at: index)
             index += 1
             installedItems.append(item)
         }
+
+        if !split.overflow.isEmpty {
+            let more = NSMenuItem(title: MenuBarFitting.overflowTitle, action: nil, keyEquivalent: "")
+            more.toolTip = "\(split.overflow.count) more menus"
+            let container = NSMenu(title: MenuBarFitting.overflowTitle)
+            container.autoenablesItems = false
+            for top in tops.suffix(split.overflow.count) {
+                let entryItem = NSMenuItem(title: top.label, action: nil, keyEquivalent: "")
+                entryItem.submenu = makeNode(top)
+                container.addItem(entryItem)
+            }
+            more.submenu = container
+            mainMenu.insertItem(more, at: index)
+            index += 1
+            installedItems.append(more)
+        }
         installedSignature = entry.root.topLevelSignature
+    }
+
+    /// What the menu bar actually draws for an item: for a top-level item
+    /// that is the SUBMENU's title, not the item's own.
+    ///
+    /// MSL's Window menu is an `NSMenuItem()` whose submenu is titled
+    /// "Window"; the item's own title is AppKit's placeholder. Reading the
+    /// item's title compared that placeholder against the app's "Window",
+    /// never matched, and the bar read "... Help Window" twice.
+    static func barTitle(of item: NSMenuItem) -> String {
+        item.submenu?.title ?? item.title
+    }
+
+    /// A menu title as the person reads it: without the underline marker
+    /// GTK and Qt carry around ("_Window", "&Window"), and without case.
+    static func plainTitle(_ title: String) -> String {
+        title.replacingOccurrences(of: "_", with: "")
+             .replacingOccurrences(of: "&", with: "")
+             .trimmingCharacters(in: .whitespaces)
+             .lowercased()
     }
 
     private func populate(_ node: X11GlobalMenuNode) {

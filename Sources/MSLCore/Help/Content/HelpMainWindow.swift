@@ -6,7 +6,7 @@ extension HelpChapter {
     static let mainWindow = HelpChapter(
         id: "main-window", title: "The Main Window", symbol: "macwindow", tint: .blue,
         blurb: "The sidebar, the header, the tabs, and the banners that come and go.",
-        articles: [.mainWindow, .sidebar, .instanceHeader, .banners])
+        articles: [.mainWindow, .sidebar, .instanceHeader, .instanceLogos, .banners])
 }
 
 extension HelpArticle {
@@ -59,7 +59,8 @@ extension HelpArticle {
 
         Each row shows:
 
-        - **The distro badge** — a rounded square in the distro's colour with its symbol.
+        - **The distro badge** — a rounded square in the distro's colour with its symbol. Click it to
+          [give the instance its own logo](help:instance-logos).
         - **The name**, and the distro under it.
         - **A status dot** on the right: green running, orange suspended, yellow starting, grey stopped. While the
           instance is busy — starting, suspending, restoring a snapshot — a small spinner replaces the dot.
@@ -85,6 +86,7 @@ extension HelpArticle {
         | **Shut Down** | Stops it straight away. Only shown while running — read [the note on Shut Down](help:stopping-instances#shut-down) first. |
         | **Open in Terminal.app** | Opens a shell on it in a Terminal.app window. |
         | **Show Apps in Finder** | Opens the folder of Mac apps MSL has made for it. |
+        | **Change Logo…** | Pick its badge. Same as clicking the badge — see [Instance logos](help:instance-logos). |
         | **Remove…** | Removes the instance. See the warning below. |
 
         > [!DANGER] Remove happens straight away
@@ -102,6 +104,48 @@ extension HelpArticle {
         GitHub. Hover to see their names; click to open the contributors page. If GitHub can't be reached, the strip
         quietly doesn't appear — nothing in the sidebar ever nags about it. The About window's **Contributors** section
         has everyone in full, each with their own colour. ٩(ˊᗜˋ*)و
+        """#)
+
+    static let instanceLogos = HelpArticle(
+        id: "instance-logos", title: "Instance logos", symbol: "paintpalette",
+        summary: "Give an instance its own badge — a symbol and colour, or a picture of your own.",
+        keywords: ["logo", "icon", "badge", "symbol", "colour", "color", "faction", "personality",
+                   "custom icon", "picture", "appearance", "reset to default"],
+        related: ["sidebar", "instance-header"],
+        body: #"""
+        MSL draws every instance as its distro's symbol in its distro's colour. That is right until you have four
+        Debians — then the sidebar is four identical rows and the name is the only thing telling them apart.
+
+        **Click an instance's badge** — in the sidebar, or the big one in the instance header — and pick something
+        else. **Change Logo…** in the right-click menu opens the same panel.
+
+        ## What you can pick {#picking}
+
+        | | |
+        |---|---|
+        | **Faction** | Sixty symbols in five groups — Creatures, Banners, Work, Places and Marks. Click the one you've already chosen to clear it. |
+        | **Colour** | Twelve colours. With none chosen, the badge keeps the distro's own. |
+        | **Open…** | A picture of your own, from anywhere on your Mac. |
+
+        ## Pictures {#pictures}
+
+        **Open…** takes any image your Mac can read. MSL **copies it in** rather than remembering where it was, so
+        moving, renaming or deleting the original later doesn't leave you with a blank badge. The copy is squared off
+        from the middle and stored small — a badge is 44 points at most, so there's no point keeping a twelve-megapixel
+        photo for it.
+
+        A picture covers the symbol, so the faction grid dims while one is showing. **Remove Picture** brings the
+        symbol back without losing the faction and colour you chose.
+
+        ## Reset to Default {#reset}
+
+        At the top, beside **Open…**. It drops everything — symbol, colour and picture — and the instance goes back to
+        looking like its distro.
+
+        > [!NOTE] It's only on your Mac
+        > The logo is MSL's own note about the instance, not something inside Linux. It isn't in snapshots, it doesn't
+        > travel in a [shipment](help:shipments), and removing the instance forgets it — so a new instance that reuses
+        > the name starts plain rather than inheriting a badge.
         """#)
 
     static let instanceHeader = HelpArticle(

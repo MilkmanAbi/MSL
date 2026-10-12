@@ -12,9 +12,24 @@ final class LoginItemsTests: XCTestCase {
         XCTAssertEqual(Set(LoginItem.allCases.map(\.label)).count, LoginItem.allCases.count)
     }
 
-    func testTheTerminalItemOpensMSLInTerminal() {
+    /// A script, not the `msl` tool itself. `open -a Terminal <file>` takes a
+    /// file and no arguments, and plain `msl` prints an overview now rather
+    /// than opening a shell (`CLIOverview`) - so the script is what supplies
+    /// the `run`.
+    func testTheTerminalItemOpensAScriptInTerminal() {
         XCTAssertEqual(LoginItem.terminal.programArguments,
-                       ["/usr/bin/open", "-a", "Terminal", MSLPaths.tool("msl").path])
+                       ["/usr/bin/open", "-a", "Terminal", LoginItem.terminal.loginScriptURL.path])
+        XCTAssertEqual(LoginItem.terminal.loginScriptURL.lastPathComponent,
+                       "open-at-login.command")
+    }
+
+    /// The script has to actually open a shell, which is the whole point of
+    /// this login item.
+    func testTheLoginScriptRunsAShell() {
+        let script = LoginItem.terminal.loginScript
+        XCTAssertTrue(script.hasPrefix("#!/bin/sh"))
+        XCTAssertTrue(script.contains("' run"), "should run `msl run`, got: \(script)")
+        XCTAssertTrue(script.contains(MSLPaths.tool("msl").path))
     }
 
     func testTheAppItemFindsMSLByBundleIdentifier() {

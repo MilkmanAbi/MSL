@@ -23,6 +23,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$PWD"
 APP="$ROOT/dist/MSL.app"
+FILES_APP="$ROOT/dist/MSL Files.app"
 STAGE="$ROOT/dist/pkgroot"
 SCRIPTS="$ROOT/dist/pkgscripts"
 RESOURCES="$ROOT/dist/pkgresources"
@@ -57,16 +58,68 @@ rm -rf "$STAGE" "$SCRIPTS" "$RESOURCES" "$COMPONENT" "$PKG"
 mkdir -p "$STAGE" "$SCRIPTS" "$RESOURCES"
 # -R (not -a): copy the bundle, resolving nothing, preserving the signature.
 cp -R "$APP" "$STAGE/MSL.app"
+# MSL Files ships with MSL, as its own app beside it in /Applications.
+if [ ! -d "$FILES_APP" ]; then
+    echo "build-installer: no $FILES_APP - build-app.sh should have made it" >&2
+    exit 1
+fi
+cp -R "$FILES_APP" "$STAGE/MSL Files.app"
+
+# Runs as root, BEFORE anything is replaced. This is where an upgrade saves
+# the user's work: MSL's own app used to try to do it from a script in
+# Terminal, which was a lot of machinery to duplicate what the installer is
+# already allowed to do at exactly the right moment.
+cat > "$SCRIPTS/preinstall" <<'PREINSTALL'
+#!/bin/sh
+# Save and stop everything MSL is running, so the files about to be replaced
+# are not in use and nobody loses a session.
+#
+# Never fails the install. A fresh install has nothing to stop, and an upgrade
+# whose daemon is wedged still deserves to get the new MSL - the worst case is
+# an instance that comes back from its last saved state instead of this one.
+set -u
+
+CONSOLE_UID=$(stat -f %u /dev/console 2>/dev/null || echo 0)
+[ "$CONSOLE_UID" -gt 0 ] || exit 0
+CONSOLE_USER=$(id -un "$CONSOLE_UID" 2>/dev/null) || exit 0
+SUPPORT="$(eval echo ~"$CONSOLE_USER")/Library/Application Support/MSL"
+MSL="$SUPPORT/bin/msl"
+
+# Hibernate rather than power off: the same instances are coming back in a
+# minute, and hibernate brings them back where they were. As the console
+# user, because that is who owns the daemon and the instances.
+if [ -x "$MSL" ]; then
+    for name in $(su - "$CONSOLE_USER" -c "'$MSL' list" 2>/dev/null \
+                  | sed -n 's/^OK //p' | tr ',' '\n' \
+                  | sed -n 's/^ *\([^ (]*\).*(.*running.*/\1/p'); do
+        echo "MSL preinstall: saving $name"
+        su - "$CONSOLE_USER" -c "'$MSL' hibernate '$name'" >/dev/null 2>&1 || true
+    done
+fi
+
+# Then the daemon itself. The old one must not still be serving when the new
+# `msl` starts talking: an old daemon answers a command it doesn't know by
+# closing the connection without a word, which looks like MSL is broken
+# rather than out of date.
+launchctl bootout "gui/$CONSOLE_UID/com.msl.mslhd" 2>/dev/null || true
+
+# And the apps, so their bundles are not being replaced underneath them.
+su - "$CONSOLE_USER" -c 'osascript -e "quit app id \"com.msl.files\""' >/dev/null 2>&1 || true
+su - "$CONSOLE_USER" -c 'osascript -e "quit app id \"com.msl.app\""'   >/dev/null 2>&1 || true
+
+exit 0
+PREINSTALL
+chmod +x "$SCRIPTS/preinstall"
 
 cat > "$SCRIPTS/postinstall" <<'POSTINSTALL'
 #!/bin/sh
 # Runs as root, after MSL.app is in place.
 #
-# Only job: if this is an upgrade and the previous version's mslhd is still
-# running, stop it. It is started again - from the new binaries - the next
-# time the app or the `msl` command needs it. Without this, the old daemon
-# keeps serving until the next login, and a newer `msl` talking to an older
-# mslhd gets silence rather than an error.
+# The preinstall has already saved the instances and stopped the daemon. This
+# repeats the bootout as a backstop - a preinstall that found no console user
+# (a fresh install from a setup assistant) did nothing, and an old daemon left
+# serving answers a command it doesn't know by closing the connection without
+# a word, which looks like MSL is broken rather than out of date.
 #
 # Everything else MSL needs belongs to the user, not to root, and the app
 # installs it on first launch.
@@ -121,7 +174,7 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 <h2>MSL $VERSION</h2>
 <p><b>Mac Subsystem for Linux.</b> Real Linux distributions on your Mac: in a
 window, in Terminal, and as ordinary Mac apps.</p>
-<p>This installs <b>MSL.app</b> and the <code>msl</code> command. Everything
+<p>This installs <b>MSL</b>, <b>MSL Files</b> and the <code>msl</code> command. Everything
 else - your instances, disk images and settings - lives in your home folder.</p>
 <p><b>Already have MSL?</b> This replaces the app and touches nothing else, so
 your Linux carries on exactly as it is.</p>
@@ -176,8 +229,20 @@ echo "==> component package"
 # copy of MSL in Downloads would get the same. MSL goes in /Applications.
 COMPONENT_PLIST="$ROOT/dist/pkgcomponents.plist"
 pkgbuild --analyze --root "$STAGE" "$COMPONENT_PLIST" >/dev/null
-/usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$COMPONENT_PLIST"
-/usr/libexec/PlistBuddy -c "Set :0:BundleOverwriteAction upgrade" "$COMPONENT_PLIST" 2>/dev/null || true
+# Every bundle, not just the first: the package now carries MSL Files as well,
+# and one relocatable app is enough to repeat the 2026-09-16 misinstall.
+python3 - "$COMPONENT_PLIST" <<'PY'
+import plistlib, sys
+path = sys.argv[1]
+with open(path, "rb") as f:
+    components = plistlib.load(f)
+for component in components:
+    component["BundleIsRelocatable"] = False
+    component["BundleOverwriteAction"] = "upgrade"
+with open(path, "wb") as f:
+    plistlib.dump(components, f)
+print("    %d bundle(s) pinned to /Applications" % len(components))
+PY
 pkgbuild \
     --root "$STAGE" \
     --component-plist "$COMPONENT_PLIST" \
@@ -254,10 +319,20 @@ rm -rf "$STAGE" "$SCRIPTS" "$RESOURCES" "$COMPONENT" "$ROOT/dist/distribution.xm
 # with the same bundle id: Spotlight, Launchpad and the Dock's recent apps
 # then show MSL twice once the package is installed (2026-09-16). KEEP_APP=1
 # keeps it, for --skip-build runs.
+# Unregistered **whether or not the bundles are kept**. KEEP_APP=1 keeps the
+# files for a later --skip-build run; it was never meant to keep them in
+# Launchpad, and letting it do so is what put MSL in there twice on
+# 2026-10-04 - the installed copy and the build product, same icon, same
+# name, one of them stale.
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+if [ -x "$LSREGISTER" ]; then
+    "$LSREGISTER" -u "$APP" 2>/dev/null || true
+    "$LSREGISTER" -u "$STAGE/MSL.app" 2>/dev/null || true
+    "$LSREGISTER" -u "$FILES_APP" 2>/dev/null || true
+fi
+
 if [ "${KEEP_APP:-0}" != "1" ]; then
-    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$APP" 2>/dev/null || true
-    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -u "$STAGE/MSL.app" 2>/dev/null || true
-    rm -rf "$APP"
+    rm -rf "$APP" "$FILES_APP"
 fi
 
 SIZE=$(du -h "$PKG" | cut -f1)

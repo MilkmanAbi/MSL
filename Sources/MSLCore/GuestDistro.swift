@@ -150,17 +150,69 @@ public enum GuestDistro: Hashable, Sendable {
         }
     }
 
-    /// The three files this distro boots from, and how to boot them.
-    public func bootFiles(appSupport: URL = MSLPaths.appSupport) -> GuestBootFiles {
+    /// The distro's downloaded image - the **base** every instance of it is
+    /// cloned from.
+    ///
+    /// Never booted. `msl install` writes it, `InstanceDisk.ensure` clones
+    /// it, and nothing else touches it; that is what keeps it pristine, so
+    /// that a new instance really is a new installation rather than a copy
+    /// of whatever the last one did. See `InstanceDisk`.
+    public func baseImageURL(appSupport: URL = MSLPaths.appSupport) -> URL {
         switch self {
         case .custom(let slug):
-            return CustomImage.bootFiles(slug: slug, appSupport: appSupport)
+            return CustomImage.bootFiles(slug: slug, appSupport: appSupport).disk
         default:
+            return appSupport.appendingPathComponent(diskImageFilename)
+        }
+    }
+
+    /// Whether this distro's base has been downloaded, so a new instance of
+    /// it can be made without fetching anything.
+    ///
+    /// Not the same question as "can this instance start?" - that one is
+    /// about the instance's own disk (`InstanceDisk.exists`). They came
+    /// apart when instances stopped sharing one image.
+    public func baseIsInstalled(appSupport: URL = MSLPaths.appSupport) -> Bool {
+        FileManager.default.fileExists(atPath: baseImageURL(appSupport: appSupport).path)
+    }
+
+    /// The three files `instance` boots from, and how to boot them.
+    ///
+    /// **The disk is the instance's own, never the base.** A path that
+    /// booted the base would write to it, and every instance made afterwards
+    /// would inherit those writes - which is the whole thing this layout
+    /// exists to stop. The kernel and initramfs are shared and read-only, so
+    /// they stay where they are.
+    public func bootFiles(instance: String, appSupport: URL = MSLPaths.appSupport) -> GuestBootFiles {
+        let disk = InstanceDisk.url(instance: instance, appSupport: appSupport)
+        let key = InstanceDisk.storageKey(instance: instance)
+        switch self {
+        case .custom(let slug):
+            // A custom image brings its own kernel, initramfs and command
+            // line; only the disk becomes per-instance.
+            var files = CustomImage.bootFiles(slug: slug, appSupport: appSupport)
+            files.disk = disk
+            files.storageKey = key
+            return files
+        default:
+            // An instance's own kernel wins over the shared one. Only a
+            // shipment puts one there, and when it does it is the kernel
+            // that filesystem was built against - a different MSL build
+            // ships a different kernel, so restoring against whatever this
+            // Mac happens to have is not the machine that was shipped.
+            if InstanceDisk.hasOwnKernel(instance: instance, appSupport: appSupport) {
+                return GuestBootFiles(
+                    kernel: InstanceDisk.kernelURL(instance: instance, appSupport: appSupport),
+                    initramfs: InstanceDisk.initramfsURL(instance: instance, appSupport: appSupport),
+                    disk: disk,
+                    storageKey: key,
+                    kernelCommandLine: nil)
+            }
             return GuestBootFiles(
                 kernel: appSupport.appendingPathComponent("disk-Image"),
                 initramfs: appSupport.appendingPathComponent("disk-initramfs-virt"),
-                disk: appSupport.appendingPathComponent(diskImageFilename),
-                storageKey: diskImageFilename,
+                disk: disk,
+                storageKey: key,
                 kernelCommandLine: nil)
         }
     }
@@ -186,6 +238,41 @@ public struct GuestBootFiles: Equatable, Sendable {
         self.disk = disk
         self.storageKey = storageKey
         self.kernelCommandLine = kernelCommandLine
+    }
+
+    /// Which of the three files an instance needs are not on this Mac.
+    ///
+    /// The kernel and initramfs are **shared by every non-custom distro**
+    /// and arrive with whichever distro was downloaded first - so an
+    /// instance can have a perfectly good disk of its own and still have
+    /// nothing to boot. A shipment is exactly that case: it carries the
+    /// filesystem and nothing else, so installing one onto a Mac that has
+    /// never downloaded a distro produces an instance that looks complete
+    /// and fails at start with a raw `VZErrorDomain` dump about a kernel
+    /// file (2026-10-02).
+    public var missing: [URL] {
+        [kernel, initramfs, disk].filter { !FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    /// What to tell someone, when something is missing.
+    public func missingDescription(distro: GuestDistro) -> String? {
+        let absent = missing
+        guard !absent.isEmpty else { return nil }
+        let needsImage = absent.contains(kernel) || absent.contains(initramfs)
+        if absent.contains(disk), !needsImage {
+            return "its disk is missing - the instance's filesystem isn't on this Mac any more"
+        }
+        let what = absent.contains(disk) ? "its disk and the Linux kernel are" : "the Linux kernel is"
+        let image = distro.isCustom ? "alpine" : distro.rawValue
+        // Joined rather than a multiline literal with `\` continuations:
+        // those keep the leading indentation of every continued line, which
+        // put long runs of spaces in the middle of the sentence.
+        return [
+            "\(what) missing.",
+            "MSL's kernel is shared by every distro and arrives with the first one you download,",
+            "and this Mac hasn't downloaded one yet.",
+            "Run `msl install \(image)` and it will start.",
+        ].joined(separator: " ")
     }
 }
 

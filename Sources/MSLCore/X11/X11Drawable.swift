@@ -10,6 +10,12 @@ import CoreText
 /// `X11Connection` resolves "the drawable for this ID" to one shared
 /// `X11Drawable` rather than duplicating every handler for windows vs.
 /// pixmaps.
+extension X11Drawable {
+    /// A depth-1 pixmap: a bitmap, whose single bit per pixel lives in the
+    /// alpha channel. See `x11PixelColor`.
+    var isBitmap: Bool { (self as? X11Pixmap)?.depth == 1 }
+}
+
 protocol X11Drawable: AnyObject {
     var bitmapContext: CGContext { get }
     var pixelWidth: Int { get }
@@ -18,7 +24,22 @@ protocol X11Drawable: AnyObject {
     /// no-op for `X11Pixmap` (nothing to redisplay until it's later
     /// `CopyArea`'d onto a window), `setNeedsDisplayFromAnyThread` for
     /// `X11CanvasView`.
-    func notifyChanged()
+    ///
+    /// `damage` is the area that actually changed, in X11 coordinates.
+    /// `nil` means "assume everything", which is what this did
+    /// unconditionally: partial-update cost scaled with the window's AREA
+    /// rather than with the damage, so a client repainting one menu label
+    /// in a 1140x740 window re-composited the whole thing.
+    ///
+    /// Passing a rect is an optimisation and passing `nil` is always
+    /// correct, so handlers that cannot cheaply say what they touched
+    /// simply do not - and behave exactly as before.
+    func notifyChanged(damage: CGRect?)
+}
+
+extension X11Drawable {
+    /// "Something changed, I am not going to say what."
+    func notifyChanged() { notifyChanged(damage: nil) }
 }
 
 /// Applies the standard top-left-origin flip (translate by the height,
@@ -224,13 +245,50 @@ func x11Color(red: CGFloat, green: CGFloat, blue: CGFloat, alpha: CGFloat = 1) -
     CGColor(colorSpace: x11DeviceRGB, components: [red, green, blue, alpha])!
 }
 
+/// The colour an X pixel value paints with on `target`.
+///
+/// Everything but a depth-1 bitmap is the obvious RGB. **A depth-1 bitmap is
+/// not**: its one bit lives in the ALPHA channel, because that is where every
+/// reader of a bitmap looks - `CopyPlane`, the A1/A8 mask formats, and
+/// `CGContextClipToMask`, which uses alpha and not luminance. Painting with a
+/// flat `alpha: 1` wrote a SET bit for a foreground of 0, so clearing part of
+/// a mask did nothing and every stipple, icon mask and shape came out solid
+/// (measured against Xvfb, xdiff `draw.copy_plane` 2026-09-28).
+func x11PixelColor(_ pixel: UInt32, isBitmap: Bool) -> CGColor {
+    if isBitmap {
+        let bit: CGFloat = (pixel & 1) != 0 ? 1 : 0
+        return x11Color(red: bit, green: bit, blue: bit, alpha: bit)
+    }
+    return x11Color(red: CGFloat((pixel >> 16) & 0xFF) / 255,
+                    green: CGFloat((pixel >> 8) & 0xFF) / 255,
+                    blue: CGFloat(pixel & 0xFF) / 255)
+}
+
+/// The largest side this will allocate before giving up rather than
+/// trapping. Mirrors `X11Connection.maxDrawableSide`; callers that can
+/// report an error to the client should check there first, so that a
+/// client gets `BadAlloc` rather than silently getting a 1x1 drawable.
+let maxBitmapSide = 16384
+
 func makeFlippedBitmapContext(width: Int, height: Int) -> CGContext {
+    // Clamped, and then still not force-unwrapped. `CGContext` returns nil
+    // when it cannot allocate - on a 20000x20000 request (1.6 GB, and an
+    // ordinary thing for a paint program to ask) the `!` here trapped and
+    // killed the whole host process. A 1x1 fallback loses that drawable's
+    // contents, which is bad; losing every window the app has open is
+    // worse, and is what used to happen.
+    let w = min(max(1, width), maxBitmapSide)
+    let h = min(max(1, height), maxBitmapSide)
     let context = CGContext(
-        data: nil, width: max(1, width), height: max(1, height),
+        data: nil, width: w, height: h,
+        bitsPerComponent: 8, bytesPerRow: 0, space: x11DeviceRGB,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) ?? CGContext(
+        data: nil, width: 1, height: 1,
         bitsPerComponent: 8, bytesPerRow: 0, space: x11DeviceRGB,
         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
     )!
-    flipContextToTopLeftOrigin(context, height: max(1, height))
+    flipContextToTopLeftOrigin(context, height: context.height)
     return context
 }
 
@@ -277,15 +335,26 @@ extension X11Drawable {
     /// see `withClip(_:on:_:)`'s own doc comment for why this needs to
     /// be threaded through explicitly to every drawing entry point, not
     /// just `CopyArea` (the one place it was originally applied).
-    func fillWithColor(_ rgb: UInt32, rect: CGRect? = nil, clip: [CGRect]? = nil) {
-        let red = CGFloat((rgb >> 16) & 0xFF) / 255
-        let green = CGFloat((rgb >> 8) & 0xFF) / 255
-        let blue = CGFloat(rgb & 0xFF) / 255
+    /// `blend` carries the GC's `function`: `.difference` for `GXxor`,
+    /// where drawing the same fill twice must restore what was underneath
+    /// (selection highlighting in Xt/Motif/Tk). Defaults to `.normal`,
+    /// which is `GXcopy` and what every caller that has no GC wants.
+    func fillWithColor(_ rgb: UInt32, rect: CGRect? = nil, clip: [CGRect]? = nil,
+                       blend: CGBlendMode = .normal) {
+        // On a depth-1 bitmap the pixel is one bit, and it lives in the alpha
+        // channel (see `x11PixelColor`). Clearing a bit therefore means
+        // painting alpha 0, and source-over with alpha 0 changes nothing at
+        // all - so a bitmap fill has to REPLACE. Without `.copy`, clearing
+        // part of a mask silently did nothing and every stipple, icon mask
+        // and shape came out solid (xdiff `draw.copy_plane`, 2026-09-28).
+        let effectiveBlend = blend == .normal && isBitmap ? .copy : blend
         withClip(clip, on: bitmapContext) {
-            bitmapContext.setFillColor(x11Color(red: red, green: green, blue: blue))
+            if effectiveBlend != .normal { bitmapContext.setBlendMode(effectiveBlend) }
+            bitmapContext.setFillColor(x11PixelColor(rgb, isBitmap: isBitmap))
             bitmapContext.fill(rect ?? CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
+            if effectiveBlend != .normal { bitmapContext.setBlendMode(.normal) }
         }
-        notifyChanged()
+        notifyChanged(damage: rect)
     }
 
     /// Draws `text` with its baseline at X11's `(x,y)` - top-left origin,
@@ -307,14 +376,18 @@ extension X11Drawable {
     }
 
     private func drawTextUnclipped(_ text: String, x: Int16, y: Int16, foreground: UInt32, background: UInt32?) {
+        let cell = X11FakeFont.cellWidth
         if let background {
             let red = CGFloat((background >> 16) & 0xFF) / 255
             let green = CGFloat((background >> 8) & 0xFF) / 255
             let blue = CGFloat(background & 0xFF) / 255
+            // Whole pixels, the size QueryFont reported: an ImageText box is
+            // how xterm paints cell backgrounds, and a fractional edge
+            // blends with whatever was there before.
             let bgRect = CGRect(
-                x: CGFloat(x), y: CGFloat(y) - X11FakeFont.ascent,
-                width: X11FakeFont.charWidth * CGFloat(text.count),
-                height: X11FakeFont.ascent + X11FakeFont.descent
+                x: Int(x), y: Int(y) - X11FakeFont.cellAscent,
+                width: cell * text.count,
+                height: X11FakeFont.cellAscent + X11FakeFont.cellDescent
             )
             bitmapContext.setFillColor(x11Color(red: red, green: green, blue: blue))
             bitmapContext.fill(bgRect)
@@ -324,7 +397,10 @@ extension X11Drawable {
         let fgBlue = CGFloat(foreground & 0xFF) / 255
         let color = x11Color(red: fgRed, green: fgGreen, blue: fgBlue)
         let attrs: [NSAttributedString.Key: Any] = [.font: X11FakeFont.ctFont, .foregroundColor: color]
-        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attrs))
+        // One line per character, each at its own cell: the client placed
+        // the text on a grid of `cellWidth`, and CoreText's own advance
+        // (7.83 for Menlo 13) would walk off it.
+        let lines = text.map { CTLineCreateWithAttributedString(NSAttributedString(string: String($0), attributes: attrs)) }
 
         bitmapContext.saveGState()
         // Off-screen `CGBitmapContext`s default several of these to
@@ -340,7 +416,10 @@ extension X11Drawable {
         bitmapContext.textMatrix = .identity
         bitmapContext.translateBy(x: CGFloat(x), y: CGFloat(y))
         bitmapContext.scaleBy(x: 1, y: -1)
-        CTLineDraw(line, bitmapContext)
+        for (i, line) in lines.enumerated() {
+            bitmapContext.textPosition = CGPoint(x: CGFloat(i * cell), y: 0)
+            CTLineDraw(line, bitmapContext)
+        }
         bitmapContext.restoreGState()
     }
 }

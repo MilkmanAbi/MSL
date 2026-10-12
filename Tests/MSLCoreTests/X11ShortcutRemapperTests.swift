@@ -11,10 +11,102 @@ final class X11ShortcutRemapperTests: XCTestCase {
          m.leftOption: X11ModMask.mod1, m.leftCommand: X11ModMask.mod4, m.rightCommand: X11ModMask.mod4]
     }
 
-    func testEverythingIsOffByDefault() {
+    /// The Mac keyboard reaches Linux apps out of the box now. It is only
+    /// safe to ship that way because macOS keeps its own shortcuts
+    /// (`isReservedForMac`) and terminals get Ctrl+Shift, both covered below.
+    func testKeyboardMappingIsOnByDefault() {
         let remapper = X11ShortcutRemapper(MSLExperimentalSettings())
+        XCTAssertTrue(remapper.isActive)
+        XCTAssertTrue(remapper.shortcuts)
+        XCTAssertTrue(remapper.textNavigation)
+        XCTAssertEqual(remapper.remap(macKeyCode: 0x08, flags: [.command]),
+                       [X11KeyChord(keycode: 54, modifiers: [m.leftControl])])
+    }
+
+    /// Turning every part off must still mean "deliver the key as it is".
+    func testNothingIsRemappedWhenEveryPartIsOff() {
+        let remapper = X11ShortcutRemapper()
         XCTAssertFalse(remapper.isActive)
         XCTAssertNil(remapper.remap(macKeyCode: 0x08, flags: [.command]))
+    }
+
+    /// **⌘C in a terminal must copy, not kill the running command.**
+    /// Ctrl+C at a shell is SIGINT, so the plain ⌘→Ctrl mapping would make
+    /// "copy" interrupt whatever is running - the one thing that would make
+    /// this feature unshippable as a default.
+    func testTerminalsGetControlShiftInsteadOfControl() {
+        let remapper = X11ShortcutRemapper(shortcuts: true)
+        let cmdC: NSEvent.ModifierFlags = [.command]
+        // Ordinary app: Ctrl+C.
+        XCTAssertEqual(remapper.remap(macKeyCode: 0x08, flags: cmdC, appClass: "Mousepad"),
+                       [X11KeyChord(keycode: 54, modifiers: [m.leftControl])])
+        // Terminal that binds Ctrl+Shift: Ctrl+Shift+C. (xterm and the other
+        // classic X terminals are the exception - see
+        // `testClassicTerminalsGetNoCommandTranslationAtAll`.)
+        for terminal in ["gnome-terminal-server", "Konsole", "org.kde.konsole", "kitty"] {
+            XCTAssertEqual(remapper.remap(macKeyCode: 0x08, flags: cmdC, appClass: terminal),
+                           [X11KeyChord(keycode: 54, modifiers: [m.leftControl, m.leftShift])],
+                           terminal)
+        }
+        // An unknown app is not a terminal: a wrong guess the other way
+        // would send Ctrl+Shift+C to an app where it means nothing.
+        XCTAssertFalse(X11TerminalApps.isTerminal("SomeEditor"))
+        XCTAssertFalse(X11TerminalApps.isTerminal(nil))
+        // Versioned class names still match.
+        XCTAssertTrue(X11TerminalApps.isTerminal("com.mitchellh.ghostty"))
+    }
+
+    /// **⌘C must never reach a classic X terminal.** Ctrl+Shift+C is a
+    /// VTE/Konsole/kitty convention; xterm, urxvt and st bind neither, and
+    /// Shift does not change the control character - so Ctrl+Shift+C arrives
+    /// at the pty as a plain Ctrl+C and interrupts the running command.
+    /// Measured in xterm: `sleep 300` died and `^C` appeared.
+    func testClassicTerminalsGetNoCommandTranslationAtAll() {
+        let remapper = X11ShortcutRemapper(shortcuts: true)
+        for terminal in ["xterm", "urxvt", "st", "eterm"] {
+            XCTAssertFalse(X11TerminalApps.bindsControlShift(terminal), terminal)
+            // An EMPTY chord list, not nil: nil would deliver the key bare,
+            // and with Command hidden ⌘C would type a stray "c" at the shell.
+            XCTAssertEqual(remapper.remap(macKeyCode: 0x08, flags: [.command], appClass: terminal),
+                           [], terminal)
+        }
+        // The terminals that do bind it still get Ctrl+Shift.
+        for terminal in ["gnome-terminal-server", "konsole", "kitty", "alacritty"] {
+            XCTAssertTrue(X11TerminalApps.bindsControlShift(terminal), terminal)
+        }
+        // An ordinary app is unaffected either way.
+        XCTAssertFalse(X11TerminalApps.bindsControlShift("Mousepad"))
+        XCTAssertEqual(remapper.remap(macKeyCode: 0x08, flags: [.command], appClass: "Mousepad"),
+                       [X11KeyChord(keycode: 54, modifiers: [m.leftControl])])
+    }
+
+    /// A terminal has no "select to the line start"; it has Ctrl+U and
+    /// Ctrl+W, and Shift+Home would scroll the scrollback instead.
+    func testTerminalLineAndWordDeletionUseShellKeys() {
+        let remapper = X11ShortcutRemapper(textNavigation: true)
+        // Cmd+Delete -> Ctrl+U in a terminal, Shift+Home then BackSpace elsewhere.
+        XCTAssertEqual(remapper.remap(macKeyCode: 0x33, flags: [.command], appClass: "xterm"),
+                       [X11KeyChord(keycode: 30, modifiers: [m.leftControl])])
+        XCTAssertEqual(remapper.remap(macKeyCode: 0x33, flags: [.command], appClass: "Mousepad")?.count, 2)
+        // Option+Delete -> Ctrl+W in a terminal.
+        XCTAssertEqual(remapper.remap(macKeyCode: 0x33, flags: [.option], appClass: "xterm"),
+                       [X11KeyChord(keycode: 25, modifiers: [m.leftControl])])
+    }
+
+    /// Control+Command is macOS's, whatever the key: ⌃⌘F is full screen and
+    /// ⌃⌘Q locks the screen. Without this the remapper turned ⌃⌘F into a
+    /// plain Ctrl+F and full screen stopped working in Linux windows.
+    func testControlCommandStaysWithMacOS() {
+        XCTAssertTrue(X11KeyboardRouter.isReservedForMac(keyCode: 0x03, flags: [.command, .control]))
+        XCTAssertTrue(X11KeyboardRouter.isReservedForMac(keyCode: 0x0C, flags: [.command, .control]))
+        XCTAssertTrue(X11KeyboardRouter.isReservedForMac(keyCode: 0x31, flags: [.command, .control]))
+        // The window and session commands keep their own entries.
+        XCTAssertTrue(X11KeyboardRouter.isReservedForMac(keyCode: 0x0C, flags: [.command]))   // Cmd+Q
+        XCTAssertTrue(X11KeyboardRouter.isReservedForMac(keyCode: 0x04, flags: [.command]))   // Cmd+H
+        XCTAssertTrue(X11KeyboardRouter.isReservedForMac(keyCode: 0x2E, flags: [.command]))   // Cmd+M
+        // Ordinary Command shortcuts go to the Linux app.
+        XCTAssertFalse(X11KeyboardRouter.isReservedForMac(keyCode: 0x08, flags: [.command]))  // Cmd+C
+        XCTAssertFalse(X11KeyboardRouter.isReservedForMac(keyCode: 0x0D, flags: [.command]))  // Cmd+W
     }
 
     func testCommandShortcutsBecomeControl() {
@@ -76,7 +168,10 @@ final class X11ShortcutRemapperTests: XCTestCase {
     func testSettingsDecodeWithMissingAndUnknownKeys() throws {
         let partial = try JSONDecoder().decode(MSLExperimentalSettings.self, from: Data(#"{"linuxShortcuts": true, "someFutureFlag": 3}"#.utf8))
         XCTAssertTrue(partial.linuxShortcuts)
-        XCTAssertFalse(partial.macTextNavigation)
+        // A flag this build knows and the file doesn't gets the shipped
+        // default; this file has no generation, so it is also migrated to
+        // the current one (see `MSLExperimentalSettingsTests`).
+        XCTAssertTrue(partial.macTextNavigation)
         XCTAssertEqual(partial.optionKeyMode, .leftAltRightAltGr)
 
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("msl-experimental-\(UUID().uuidString).json")

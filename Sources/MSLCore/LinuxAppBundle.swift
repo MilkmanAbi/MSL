@@ -24,17 +24,30 @@ public enum LinuxAppBundle {
     public struct Descriptor {
         public let instance: String
         public let distro: GuestDistro
-        /// The `.desktop` `Name=` - what the user sees.
+        /// Distinguishes this bundle on disk: `Calculator (Flatpak)` when
+        /// an instance has the same application from two packaging systems,
+        /// plain `Calculator` when it does not. Two bundles cannot share a
+        /// filename, and the one written second would replace the first.
         public let displayName: String
+        /// What the Dock, Launchpad and the menu bar show.
+        ///
+        /// The plain `Name=`, without the packaging in brackets. The
+        /// distinction matters to MSL, which has to keep two apps apart;
+        /// it does not matter to someone looking at their Dock, where
+        /// "Calculator (Flatpak)" is just clutter. MSL's own list still
+        /// shows the tag, so it is always one glance away.
+        public let menuName: String
         /// The `.desktop` `Exec=`, field codes already stripped.
         public let command: String
         /// Icon pixels pulled out of the guest, if any were found.
         public let icon: NSImage?
 
-        public init(instance: String, distro: GuestDistro, displayName: String, command: String, icon: NSImage?) {
+        public init(instance: String, distro: GuestDistro, displayName: String,
+                    menuName: String? = nil, command: String, icon: NSImage?) {
             self.instance = instance
             self.distro = distro
             self.displayName = displayName
+            self.menuName = menuName ?? displayName
             self.command = command
             self.icon = icon
         }
@@ -102,10 +115,16 @@ public enum LinuxAppBundle {
             // Dock to say than the blank generic page macOS falls back to.
             let iconDestination = stagedResources.appendingPathComponent("icon.icns")
             var hasIcon = false
-            if let icon = descriptor.icon, writeICNS(icon, to: iconDestination) {
+            // Framed in a squircle on Apple's grid (`SquircleIcon`): macOS 26
+            // otherwise jails a free-form Linux icon in a grey tile of its own.
+            if let icon = descriptor.icon, writeICNS(SquircleIcon.framed(icon), to: iconDestination) {
                 hasIcon = true
-            } else if let melon = melonIcon, writeICNS(melon, to: iconDestination) {
+            } else if let melon = melonIcon, writeICNS(SquircleIcon.framed(melon), to: iconDestination) {
                 hasIcon = true
+            }
+            if hasIcon {
+                FileManager.default.createFile(
+                    atPath: stagedResources.appendingPathComponent(squircleMarker).path, contents: Data())
             }
 
             let plist = infoPlist(for: descriptor, executableName: executableName, hasIcon: hasIcon)
@@ -143,6 +162,13 @@ public enum LinuxAppBundle {
     public static func removeAll(instance: String) throws {
         let directory = MSLPaths.generatedAppsDirectory(instance: instance)
         guard FileManager.default.fileExists(atPath: directory.path) else { return }
+        // **Unpinned before deleted.** A Dock pin is a path, so a pin left
+        // behind by a deleted bundle shows as a "?" tile the person has to
+        // drag off by hand - and `msl rename` was already telling them the
+        // pins had been removed, which was not true until now. One batched
+        // write, so one Dock restart, because every restart blinks the
+        // wallpaper too (see `DockPinner.apply`).
+        DockPinner.unpinAll(under: directory)
         try FileManager.default.removeItem(at: directory)
     }
 
@@ -190,12 +216,16 @@ public enum LinuxAppBundle {
                       let executableName = plist["CFBundleExecutable"] as? String
                 else { continue }
                 let executable = bundle.appendingPathComponent("Contents/MacOS").appendingPathComponent(executableName)
-                if fileManager.contentsEqual(atPath: executable.path, andPath: launcher.path) { continue }
-                do {
-                    try? fileManager.removeItem(at: executable)
-                    try fileManager.copyItem(at: launcher, to: executable)
-                } catch {
-                    continue
+                let launcherStale = !fileManager.contentsEqual(atPath: executable.path, andPath: launcher.path)
+                let iconUpgraded = upgradeIconToSquircle(in: bundle)
+                guard launcherStale || iconUpgraded else { continue }
+                if launcherStale {
+                    do {
+                        try? fileManager.removeItem(at: executable)
+                        try fileManager.copyItem(at: launcher, to: executable)
+                    } catch {
+                        continue
+                    }
                 }
                 if sign(bundle) == nil { refreshed += 1 }
             }
@@ -203,12 +233,38 @@ public enum LinuxAppBundle {
         return refreshed
     }
 
+    /// Marks a bundle whose icon is already framed by `SquircleIcon`.
+    static let squircleMarker = ".msl-icon-squircle"
+
+    /// Apps added before icons were framed keep a free-form Linux icon, which
+    /// macOS 26 jails in a grey tile. Reframed once, in place; the marker
+    /// keeps it from happening again. Returns whether it changed anything.
+    static func upgradeIconToSquircle(in bundle: URL) -> Bool {
+        let resources = bundle.appendingPathComponent("Contents/Resources")
+        let marker = resources.appendingPathComponent(squircleMarker)
+        let icon = resources.appendingPathComponent("icon.icns")
+        guard !FileManager.default.fileExists(atPath: marker.path),
+              let image = NSImage(contentsOf: icon),
+              writeICNS(SquircleIcon.framed(image), to: icon) else { return false }
+        FileManager.default.createFile(atPath: marker.path, contents: Data())
+        // The Dock and Finder cache icons by bundle; nudge them.
+        NSWorkspace.shared.noteFileSystemChanged(bundle.path)
+        return true
+    }
+
     // MARK: - Info.plist
+
+    /// The Info.plist a descriptor would produce, for tests: what the Dock
+    /// shows is not something to find out by installing an app and looking.
+    public static func infoPlistForTesting(_ descriptor: Descriptor) -> [String: Any] {
+        infoPlist(for: descriptor, executableName: fileSafeName(descriptor.displayName), hasIcon: false)
+    }
 
     private static func infoPlist(for descriptor: Descriptor, executableName: String, hasIcon: Bool) -> [String: Any] {
         var plist: [String: Any] = [
-            "CFBundleName": descriptor.displayName,
-            "CFBundleDisplayName": descriptor.displayName,
+            // The clean name, not the disk one - see `Descriptor.menuName`.
+            "CFBundleName": descriptor.menuName,
+            "CFBundleDisplayName": descriptor.menuName,
             "CFBundleExecutable": executableName,
             "CFBundleIdentifier": bundleIdentifier(for: descriptor),
             "CFBundlePackageType": "APPL",

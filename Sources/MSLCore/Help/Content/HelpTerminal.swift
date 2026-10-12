@@ -80,14 +80,18 @@ extension HelpArticle {
         In any terminal app — Terminal, iTerm, whatever you use — this opens a shell on an instance called `work`:
 
         ```shell
-        msl work
+        msl run work
         ```
+
+        `msl work` does the same thing — the instance name alone is the short form, and it is what the app's
+        **Copy Shell Command** used to put on your clipboard. Typing `msl` on its own prints what you have and
+        what to type next, rather than opening anything.
 
         Every new tab can do the same; each is its own shell. And one-off commands work like `ssh`:
 
         ```shell
-        msl work uname -a
-        msl work ls -la /mnt/mac/Desktop
+        msl run work uname -a
+        msl run work ls -la /mnt/mac/Desktop
         ```
 
         The exit code comes back too, so `msl` fits in scripts. Everything else it can do is in
@@ -156,7 +160,7 @@ extension HelpArticle {
         id: "ssh", title: "Connecting over SSH", symbol: "network",
         summary: "One command, nothing to configure — for scp, VS Code Remote-SSH, and anything else that speaks SSH.",
         keywords: ["ssh", "scp", "sftp", "vs code", "vscode", "remote ssh", "key", "fingerprint", "port 22", "~/.ssh/config", "msl-"],
-        related: ["trouble-ssh", "sandbox-gates", "terminal-app"],
+        related: ["trouble-ssh", "sandbox-gates", "terminal-app", "public-what"],
         body: #"""
         The **Connect over SSH** card on the Overview tab gives every instance a ready-made SSH shortcut. MSL does all
         the setup; you get one command:
@@ -222,11 +226,14 @@ extension HelpArticle {
 
         | Command | Does |
         |---|---|
-        | `msl work` | A shell on `work`. |
-        | `msl work <command>` | Runs one command, like `ssh`. Its exit code comes back. |
+        | `msl` | What you have and what to type next. |
+        | `msl run work` | A shell on `work`. `msl work` is the short form. |
+        | `msl run work <command>` | Runs one command, like `ssh`. Its exit code comes back. |
+        | `msl run` | A shell on whichever instance you used last. |
         | `msl fedora` | An instance named after a distro just works — no setup needed. |
-        | `msl work -u root` | A shell as root. |
+        | `msl run work -u root` | A shell as root. |
         | `msl list` | Every instance. |
+        | `msl list online` | Every distro you can install (also `msl distros`). |
         | `msl status work` | Running, suspended or stopped. |
         | `msl suspend work` / `msl resume work` | Freeze and unfreeze. |
         | `msl hibernate work` | Save to disk and stop. |

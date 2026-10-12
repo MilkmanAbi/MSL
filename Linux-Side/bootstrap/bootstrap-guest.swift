@@ -1,1 +1,0 @@
-../../Sources/bootstrap-guest/main.swift

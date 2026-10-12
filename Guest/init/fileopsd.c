@@ -63,6 +63,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <dirent.h>
+#include <libgen.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -344,10 +345,38 @@ static void handle_read(int fd, const char *path, uint64_t offset, uint32_t len)
     free(buf);
 }
 
+/* Give a just-created file or directory the owner of the folder it went
+ * into.
+ *
+ * This daemon runs as root, so everything it created belonged to root - and
+ * that is everything MSL Files writes, because the Mac side mounts the guest
+ * over WebDAV and every write lands here. Extracting an archive into your own
+ * home directory produced files your own Linux account could not edit or even
+ * delete (found 2026-09-28: `rm -rf` on a freshly extracted folder answered
+ * "Permission denied"). Inheriting from the parent is the rule that needs no
+ * knowledge of who "the user" is, and it stays right outside home too - a
+ * file put in a root-owned directory is still root's.
+ *
+ * Best effort by design: if the daemon is not privileged the chown simply
+ * fails, and a file with the wrong owner is better than a failed write. */
+static void inherit_parent_owner(const char *path) {
+    char *copy = strdup(path); /* dirname may modify what it is given */
+    if (copy == NULL) return;
+    struct stat parent;
+    if (stat(dirname(copy), &parent) == 0) {
+        (void)chown(path, parent.st_uid, parent.st_gid);
+    }
+    free(copy);
+}
+
 static void handle_write(int fd, const char *path, uint64_t offset, const unsigned char *data, uint32_t datalen) {
     int flags = O_WRONLY | O_CREAT | (offset == 0 ? O_TRUNC : 0);
+    /* Only a file this call brings into existence is re-owned; writing to one
+     * that is already there must never change who owns it. */
+    int created = access(path, F_OK) != 0;
     int f = open(path, flags, 0644);
     if (f < 0) { send_err(fd, errno); return; }
+    if (created) inherit_parent_owner(path);
 
     size_t total = 0;
     while (total < datalen) {
@@ -361,11 +390,28 @@ static void handle_write(int fd, const char *path, uint64_t offset, const unsign
 
 static void handle_mkdir(int fd, const char *path) {
     if (mkdir(path, 0755) != 0) { send_err(fd, errno); return; }
+    inherit_parent_owner(path); /* new by definition - see the function */
     send_ok(fd, NULL, 0);
 }
 
 static void handle_rename(int fd, const char *src, const char *dst) {
+    /* An overwrite arrives as an upload temp plus a rename, and a rename
+     * replaces the inode - so the saved file would end up owned by whoever
+     * the temp belonged to, changing hands on every save. See the CHMOD note
+     * in the header for the identical problem with the mode, which the host
+     * already works around; this is carried here instead because the host has
+     * no chown operation to call.
+     *
+     * Only for MSL's own upload temps. A rename the person actually asked
+     * for - moving a file over another in MSL Files - is a real `mv`, and
+     * `mv` keeps the moved file's owner rather than the replaced one's. */
+    char *srccopy = strdup(src);
+    int is_upload = srccopy != NULL && is_put_temp_name(basename(srccopy));
+    free(srccopy);
+    struct stat existing;
+    int had_owner = is_upload && lstat(dst, &existing) == 0 && !S_ISLNK(existing.st_mode);
     if (rename(src, dst) != 0) { send_err(fd, errno); return; }
+    if (had_owner) (void)chown(dst, existing.st_uid, existing.st_gid);
     send_ok(fd, NULL, 0);
 }
 

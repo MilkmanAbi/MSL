@@ -1,0 +1,5227 @@
+{
+ "probes": {
+  "access.control": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "change_hosts_bad_mode": "BadValue",
+     "count_present": true,
+     "enabled_is_bool": true,
+     "set_access0": "Ok",
+     "set_access1": "Ok",
+     "set_access_bad": "BadValue"
+    }
+   },
+   "status": "SAME",
+   "strict": false,
+   "target": {
+    "ok": true,
+    "value": {
+     "change_hosts_bad_mode": "BadValue",
+     "count_present": true,
+     "enabled_is_bool": true,
+     "set_access0": "Ok",
+     "set_access1": "Ok",
+     "set_access_bad": "BadValue"
+    }
+   }
+  },
+  "atoms.errors": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "create_returns_nonzero": true,
+     "get_name_huge": "BadAtom",
+     "get_name_of_zero": "BadAtom",
+     "only_if_exists_returns_none": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "create_returns_nonzero": true,
+     "get_name_huge": "BadAtom",
+     "get_name_of_zero": "BadAtom",
+     "only_if_exists_returns_none": true
+    }
+   }
+  },
+  "atoms.intern": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "created_nonzero": true,
+     "only_if_exists_is_zero": true,
+     "round_trip": "XDIFF_PROBE_ATOM"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "created_nonzero": true,
+     "only_if_exists_is_zero": true,
+     "round_trip": "XDIFF_PROBE_ATOM"
+    }
+   }
+  },
+  "atoms.predefined": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "1": "PRIMARY",
+     "10": "CUT_BUFFER1",
+     "11": "CUT_BUFFER2",
+     "12": "CUT_BUFFER3",
+     "13": "CUT_BUFFER4",
+     "14": "CUT_BUFFER5",
+     "15": "CUT_BUFFER6",
+     "16": "CUT_BUFFER7",
+     "17": "DRAWABLE",
+     "18": "FONT",
+     "19": "INTEGER",
+     "2": "SECONDARY",
+     "20": "PIXMAP",
+     "21": "POINT",
+     "22": "RECTANGLE",
+     "23": "RESOURCE_MANAGER",
+     "24": "RGB_COLOR_MAP",
+     "25": "RGB_BEST_MAP",
+     "26": "RGB_BLUE_MAP",
+     "27": "RGB_DEFAULT_MAP",
+     "28": "RGB_GRAY_MAP",
+     "29": "RGB_GREEN_MAP",
+     "3": "ARC",
+     "30": "RGB_RED_MAP",
+     "31": "STRING",
+     "32": "VISUALID",
+     "33": "WINDOW",
+     "34": "WM_COMMAND",
+     "35": "WM_HINTS",
+     "36": "WM_CLIENT_MACHINE",
+     "37": "WM_ICON_NAME",
+     "38": "WM_ICON_SIZE",
+     "39": "WM_NAME",
+     "4": "ATOM",
+     "40": "WM_NORMAL_HINTS",
+     "41": "WM_SIZE_HINTS",
+     "42": "WM_ZOOM_HINTS",
+     "43": "MIN_SPACE",
+     "44": "NORM_SPACE",
+     "45": "MAX_SPACE",
+     "46": "END_SPACE",
+     "47": "SUPERSCRIPT_X",
+     "48": "SUPERSCRIPT_Y",
+     "49": "SUBSCRIPT_X",
+     "5": "BITMAP",
+     "50": "SUBSCRIPT_Y",
+     "51": "UNDERLINE_POSITION",
+     "52": "UNDERLINE_THICKNESS",
+     "53": "STRIKEOUT_ASCENT",
+     "54": "STRIKEOUT_DESCENT",
+     "55": "ITALIC_ANGLE",
+     "56": "X_HEIGHT",
+     "57": "QUAD_WIDTH",
+     "58": "WEIGHT",
+     "59": "POINT_SIZE",
+     "6": "CARDINAL",
+     "60": "RESOLUTION",
+     "61": "COPYRIGHT",
+     "62": "NOTICE",
+     "63": "FONT_NAME",
+     "64": "FAMILY_NAME",
+     "65": "FULL_NAME",
+     "66": "CAP_HEIGHT",
+     "67": "WM_CLASS",
+     "68": "WM_TRANSIENT_FOR",
+     "7": "COLORMAP",
+     "8": "CURSOR",
+     "9": "CUT_BUFFER0"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "1": "PRIMARY",
+     "10": "CUT_BUFFER1",
+     "11": "CUT_BUFFER2",
+     "12": "CUT_BUFFER3",
+     "13": "CUT_BUFFER4",
+     "14": "CUT_BUFFER5",
+     "15": "CUT_BUFFER6",
+     "16": "CUT_BUFFER7",
+     "17": "DRAWABLE",
+     "18": "FONT",
+     "19": "INTEGER",
+     "2": "SECONDARY",
+     "20": "PIXMAP",
+     "21": "POINT",
+     "22": "RECTANGLE",
+     "23": "RESOURCE_MANAGER",
+     "24": "RGB_COLOR_MAP",
+     "25": "RGB_BEST_MAP",
+     "26": "RGB_BLUE_MAP",
+     "27": "RGB_DEFAULT_MAP",
+     "28": "RGB_GRAY_MAP",
+     "29": "RGB_GREEN_MAP",
+     "3": "ARC",
+     "30": "RGB_RED_MAP",
+     "31": "STRING",
+     "32": "VISUALID",
+     "33": "WINDOW",
+     "34": "WM_COMMAND",
+     "35": "WM_HINTS",
+     "36": "WM_CLIENT_MACHINE",
+     "37": "WM_ICON_NAME",
+     "38": "WM_ICON_SIZE",
+     "39": "WM_NAME",
+     "4": "ATOM",
+     "40": "WM_NORMAL_HINTS",
+     "41": "WM_SIZE_HINTS",
+     "42": "WM_ZOOM_HINTS",
+     "43": "MIN_SPACE",
+     "44": "NORM_SPACE",
+     "45": "MAX_SPACE",
+     "46": "END_SPACE",
+     "47": "SUPERSCRIPT_X",
+     "48": "SUPERSCRIPT_Y",
+     "49": "SUBSCRIPT_X",
+     "5": "BITMAP",
+     "50": "SUBSCRIPT_Y",
+     "51": "UNDERLINE_POSITION",
+     "52": "UNDERLINE_THICKNESS",
+     "53": "STRIKEOUT_ASCENT",
+     "54": "STRIKEOUT_DESCENT",
+     "55": "ITALIC_ANGLE",
+     "56": "X_HEIGHT",
+     "57": "QUAD_WIDTH",
+     "58": "WEIGHT",
+     "59": "POINT_SIZE",
+     "6": "CARDINAL",
+     "60": "RESOLUTION",
+     "61": "COPYRIGHT",
+     "62": "NOTICE",
+     "63": "FONT_NAME",
+     "64": "FAMILY_NAME",
+     "65": "FULL_NAME",
+     "66": "CAP_HEIGHT",
+     "67": "WM_CLASS",
+     "68": "WM_TRANSIENT_FOR",
+     "7": "COLORMAP",
+     "8": "CURSOR",
+     "9": "CUT_BUFFER0"
+    }
+   }
+  },
+  "bigreq": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "larger_than_setup": true,
+     "present": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "larger_than_setup": true,
+     "present": true
+    }
+   }
+  },
+  "closedown.mode": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bad_mode": "BadValue",
+     "kill_all_temporary": "Ok",
+     "kill_unknown_resource": "BadValue",
+     "mode0": "Ok",
+     "mode1": "Ok",
+     "mode2": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bad_mode": "BadValue",
+     "kill_all_temporary": "Ok",
+     "kill_unknown_resource": "BadValue",
+     "mode0": "Ok",
+     "mode1": "Ok",
+     "mode2": "Ok"
+    }
+   }
+  },
+  "color.alloc": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "lookup_white": "Reply",
+     "mid": {
+      "b": 8224,
+      "g": 16448,
+      "r": 32896
+     },
+     "red": {
+      "b": 0,
+      "g": 0,
+      "r": 65535
+     }
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "lookup_white": "Reply",
+     "mid": {
+      "b": 8224,
+      "g": 16448,
+      "r": 32896
+     },
+     "red": {
+      "b": 0,
+      "g": 0,
+      "r": 65535
+     }
+    }
+   }
+  },
+  "colormap.alloc_query": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "blue_is_zero": true,
+     "green_is_mid": true,
+     "red_is_max": true,
+     "roundtrips": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "blue_is_zero": true,
+     "green_is_mid": true,
+     "red_is_max": true,
+     "roundtrips": true
+    }
+   }
+  },
+  "colormap.lifecycle": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bad_alloc_enum": "BadValue",
+     "create": "Ok",
+     "create_unknown_window": "BadWindow",
+     "free": "Ok",
+     "free_unknown": "BadColor"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bad_alloc_enum": "BadValue",
+     "create": "Ok",
+     "create_unknown_window": "BadWindow",
+     "free": "Ok",
+     "free_unknown": "BadColor"
+    }
+   }
+  },
+  "colormap.named": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "green_and_blue_zero": true,
+     "lookup": "Reply",
+     "lookup_unknown_name": "BadName",
+     "red_exact_is_max": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "green_and_blue_zero": true,
+     "lookup": "Reply",
+     "lookup_unknown_name": "BadName",
+     "red_exact_is_max": true
+    }
+   }
+  },
+  "cursor.glyph": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "create": "Ok",
+     "cursor_font_opens": true,
+     "free": "Ok",
+     "free_unknown": "BadCursor",
+     "window_takes_cursor": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "create": "Ok",
+     "cursor_font_opens": true,
+     "free": "Ok",
+     "free_unknown": "BadCursor",
+     "window_takes_cursor": "Ok"
+    }
+   }
+  },
+  "cursor.pixmap": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "create": "Ok",
+     "depth24_source": "BadMatch",
+     "unknown_source": "BadPixmap"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "create": "Ok",
+     "depth24_source": "BadMatch",
+     "unknown_source": "BadPixmap"
+    }
+   }
+  },
+  "draw.clip_rectangles": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       960
+      ],
+      [
+       "#ff00ff",
+       64
+      ]
+     ],
+     "samples": {
+      "0,0": "#000000",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#000000",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#000000"
+     }
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       960
+      ],
+      [
+       "#ff00ff",
+       64
+      ]
+     ],
+     "samples": {
+      "0,0": "#000000",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#000000",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#000000"
+     }
+    }
+   }
+  },
+  "draw.copy_area": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       880
+      ],
+      [
+       "#00ff00",
+       144
+      ]
+     ],
+     "samples": {
+      "0,0": "#00ff00",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#00ff00",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#00ff00"
+     }
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       880
+      ],
+      [
+       "#00ff00",
+       144
+      ]
+     ],
+     "samples": {
+      "0,0": "#00ff00",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#00ff00",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#00ff00"
+     }
+    }
+   }
+  },
+  "draw.copy_plane": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       768
+      ],
+      [
+       "#ff0000",
+       192
+      ],
+      [
+       "#0000ff",
+       64
+      ]
+     ],
+     "samples": {
+      "0,0": "#ff0000",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#000000",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#000000"
+     }
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       768
+      ],
+      [
+       "#ff0000",
+       192
+      ],
+      [
+       "#0000ff",
+       64
+      ]
+     ],
+     "samples": {
+      "0,0": "#ff0000",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#000000",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#000000"
+     }
+    }
+   }
+  },
+  "draw.fill_rect": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       964
+      ],
+      [
+       "#ff0000",
+       60
+      ]
+     ],
+     "samples": {
+      "0,0": "#000000",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#000000",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#000000"
+     }
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       964
+      ],
+      [
+       "#ff0000",
+       60
+      ]
+     ],
+     "samples": {
+      "0,0": "#000000",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#000000",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#000000"
+     }
+    }
+   }
+  },
+  "draw.function_xor": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "after_one_xor": {
+      "colours": [
+       [
+        "#0000ff",
+        960
+       ],
+       [
+        "#00ff00",
+        64
+       ]
+      ],
+      "samples": {
+       "0,0": "#0000ff",
+       "0,16": "#0000ff",
+       "0,31": "#0000ff",
+       "16,0": "#0000ff",
+       "16,16": "#0000ff",
+       "16,31": "#0000ff",
+       "31,0": "#0000ff",
+       "31,16": "#0000ff",
+       "31,31": "#0000ff"
+      }
+     },
+     "restored_by_second": {
+      "colours": [
+       [
+        "#0000ff",
+        1024
+       ]
+      ],
+      "samples": {
+       "0,0": "#0000ff",
+       "0,16": "#0000ff",
+       "0,31": "#0000ff",
+       "16,0": "#0000ff",
+       "16,16": "#0000ff",
+       "16,31": "#0000ff",
+       "31,0": "#0000ff",
+       "31,16": "#0000ff",
+       "31,31": "#0000ff"
+      }
+     }
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "after_one_xor": {
+      "colours": [
+       [
+        "#0000ff",
+        960
+       ],
+       [
+        "#00ff00",
+        64
+       ]
+      ],
+      "samples": {
+       "0,0": "#0000ff",
+       "0,16": "#0000ff",
+       "0,31": "#0000ff",
+       "16,0": "#0000ff",
+       "16,16": "#0000ff",
+       "16,31": "#0000ff",
+       "31,0": "#0000ff",
+       "31,16": "#0000ff",
+       "31,31": "#0000ff"
+      }
+     },
+     "restored_by_second": {
+      "colours": [
+       [
+        "#0000ff",
+        1024
+       ]
+      ],
+      "samples": {
+       "0,0": "#0000ff",
+       "0,16": "#0000ff",
+       "0,31": "#0000ff",
+       "16,0": "#0000ff",
+       "16,16": "#0000ff",
+       "16,31": "#0000ff",
+       "31,0": "#0000ff",
+       "31,16": "#0000ff",
+       "31,31": "#0000ff"
+      }
+     }
+    }
+   }
+  },
+  "draw.plane_mask": {
+   "delta": [
+    [
+     "colours",
+     "[[\"#000000\", 768], [\"#ffffff\", 256]]",
+     "[[\"#000000\", 768], [\"#00ff00\", 256]]"
+    ],
+    [
+     "samples.0,0",
+     "#ffffff",
+     "#00ff00"
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       768
+      ],
+      [
+       "#00ff00",
+       256
+      ]
+     ],
+     "samples": {
+      "0,0": "#00ff00",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#000000",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#000000"
+     }
+    }
+   },
+   "status": "KNOWN",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       768
+      ],
+      [
+       "#ffffff",
+       256
+      ]
+     ],
+     "samples": {
+      "0,0": "#ffffff",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#000000",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#000000"
+     }
+    }
+   }
+  },
+  "draw.poly_shapes": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       952
+      ],
+      [
+       "#ffff00",
+       72
+      ]
+     ],
+     "samples": {
+      "0,0": "#000000",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#000000",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#000000"
+     }
+    }
+   },
+   "status": "SAME",
+   "strict": false,
+   "target": {
+    "ok": true,
+    "value": {
+     "colours": [
+      [
+       "#000000",
+       952
+      ],
+      [
+       "#ffff00",
+       72
+      ]
+     ],
+     "samples": {
+      "0,0": "#000000",
+      "0,16": "#000000",
+      "0,31": "#000000",
+      "16,0": "#000000",
+      "16,16": "#000000",
+      "16,31": "#000000",
+      "31,0": "#000000",
+      "31,16": "#000000",
+      "31,31": "#000000"
+     }
+    }
+   }
+  },
+  "draw.put_get_image": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "depth": 24,
+     "first_row": [
+      "#000040",
+      "#100040",
+      "#200040",
+      "#300040"
+     ],
+     "round_trips": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "depth": 24,
+     "first_row": [
+      "#000040",
+      "#100040",
+      "#200040",
+      "#300040"
+     ],
+     "round_trips": true
+    }
+   }
+  },
+  "errors.match": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "CopyArea(24->1)": "BadMatch",
+     "CopyArea(24->24)": "Ok",
+     "CreateGC(depth1)": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "CopyArea(24->1)": "BadMatch",
+     "CopyArea(24->24)": "Ok",
+     "CreateGC(depth1)": "Ok"
+    }
+   }
+  },
+  "errors.requests": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "RENDER.minor200": "BadRequest",
+     "SHAPE.minor200": "BadRequest",
+     "XKEYBOARD.minor200": "BadRequest",
+     "core0": "BadRequest",
+     "core126": "BadRequest",
+     "core200": "BadRequest",
+     "core255": "BadRequest"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "RENDER.minor200": "BadRequest",
+     "SHAPE.minor200": "BadRequest",
+     "XKEYBOARD.minor200": "BadRequest",
+     "core0": "BadRequest",
+     "core126": "BadRequest",
+     "core200": "BadRequest",
+     "core255": "BadRequest"
+    }
+   }
+  },
+  "errors.resources": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "DestroyWindow": "BadWindow",
+     "FreeGC": "BadGC",
+     "FreePixmap": "BadPixmap",
+     "GetGeometry": "BadDrawable",
+     "GetWindowAttributes": "BadWindow",
+     "ListProperties": "BadWindow",
+     "QueryTree": "BadWindow"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "DestroyWindow": "BadWindow",
+     "FreeGC": "BadGC",
+     "FreePixmap": "BadPixmap",
+     "GetGeometry": "BadDrawable",
+     "GetWindowAttributes": "BadWindow",
+     "ListProperties": "BadWindow",
+     "QueryTree": "BadWindow"
+    }
+   }
+  },
+  "errors.values": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "Bell(200)": "Ok",
+     "ChangeProperty(format=7)": "BadValue",
+     "ChangeProperty(mode=9)": "BadValue",
+     "CreatePixmap(w=0)": "BadValue",
+     "CreateWindow(class=7)": "BadValue",
+     "GetAtomName(0)": "BadAtom",
+     "GetAtomName(100000)": "BadAtom",
+     "SetInputFocus(revert=9)": "BadValue"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "Bell(200)": "Ok",
+     "ChangeProperty(format=7)": "BadValue",
+     "ChangeProperty(mode=9)": "BadValue",
+     "CreatePixmap(w=0)": "BadValue",
+     "CreateWindow(class=7)": "BadValue",
+     "GetAtomName(0)": "BadAtom",
+     "GetAtomName(100000)": "BadAtom",
+     "SetInputFocus(revert=9)": "BadValue"
+    }
+   }
+  },
+  "errors.window_vs_pixmap": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "GetGeometry(pixmap)": "Reply",
+     "GetGeometry(window)": "Reply",
+     "GetWindowAttributes(pixmap)": "BadWindow",
+     "MapWindow(pixmap)": "BadWindow",
+     "QueryTree(pixmap)": "BadWindow"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "GetGeometry(pixmap)": "Reply",
+     "GetGeometry(window)": "Reply",
+     "GetWindowAttributes(pixmap)": "BadWindow",
+     "MapWindow(pixmap)": "BadWindow",
+     "QueryTree(pixmap)": "BadWindow"
+    }
+   }
+  },
+  "events.configure": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": [
+     {
+      "above": "None",
+      "border": 0,
+      "event": "ConfigureNotify",
+      "h": 70,
+      "on": "child",
+      "override_redirect": 0,
+      "sent_by_client": false,
+      "w": 60,
+      "window": "child",
+      "x": 11,
+      "y": 12
+     }
+    ]
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": [
+     {
+      "above": "None",
+      "border": 0,
+      "event": "ConfigureNotify",
+      "h": 70,
+      "on": "child",
+      "override_redirect": 0,
+      "sent_by_client": false,
+      "w": 60,
+      "window": "child",
+      "x": 11,
+      "y": 12
+     }
+    ]
+   }
+  },
+  "events.map_unmap": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": [
+     {
+      "event": "DestroyNotify",
+      "on": "child",
+      "sent_by_client": false,
+      "window": "child"
+     },
+     {
+      "event": "MapNotify",
+      "on": "child",
+      "override_redirect": 0,
+      "sent_by_client": false,
+      "window": "child"
+     },
+     {
+      "event": "UnmapNotify",
+      "from_configure": 0,
+      "on": "child",
+      "sent_by_client": false,
+      "window": "child"
+     }
+    ]
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": [
+     {
+      "event": "DestroyNotify",
+      "on": "child",
+      "sent_by_client": false,
+      "window": "child"
+     },
+     {
+      "event": "MapNotify",
+      "on": "child",
+      "override_redirect": 0,
+      "sent_by_client": false,
+      "window": "child"
+     },
+     {
+      "event": "UnmapNotify",
+      "from_configure": 0,
+      "on": "child",
+      "sent_by_client": false,
+      "window": "child"
+     }
+    ]
+   }
+  },
+  "events.mask_is_honoured": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "events": [],
+     "none_delivered": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "events": [],
+     "none_delivered": true
+    }
+   }
+  },
+  "events.no_expose": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": [
+     {
+      "drawable": "pixmap",
+      "event": "NoExpose",
+      "major": 62,
+      "sent_by_client": false
+     }
+    ]
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": [
+     {
+      "drawable": "pixmap",
+      "event": "NoExpose",
+      "major": 62,
+      "sent_by_client": false
+     }
+    ]
+   }
+  },
+  "events.property": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": [
+     {
+      "event": "PropertyNotify",
+      "sent_by_client": false,
+      "state": "Deleted",
+      "window": "window"
+     },
+     {
+      "event": "PropertyNotify",
+      "sent_by_client": false,
+      "state": "NewValue",
+      "window": "window"
+     }
+    ]
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": [
+     {
+      "event": "PropertyNotify",
+      "sent_by_client": false,
+      "state": "Deleted",
+      "window": "window"
+     },
+     {
+      "event": "PropertyNotify",
+      "sent_by_client": false,
+      "state": "NewValue",
+      "window": "window"
+     }
+    ]
+   }
+  },
+  "events.reparent": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": [
+     {
+      "event": "ReparentNotify",
+      "on": "child",
+      "parent": "parentB",
+      "sent_by_client": false,
+      "window": "child",
+      "x": 9,
+      "y": 10
+     }
+    ]
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": [
+     {
+      "event": "ReparentNotify",
+      "on": "child",
+      "parent": "parentB",
+      "sent_by_client": false,
+      "window": "child",
+      "x": 9,
+      "y": 10
+     }
+    ]
+   }
+  },
+  "events.selection_clear": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": []
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": []
+   }
+  },
+  "events.substructure": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": [
+     {
+      "above": "None",
+      "border": 0,
+      "event": "ConfigureNotify",
+      "h": 70,
+      "on": "parent",
+      "override_redirect": 0,
+      "sent_by_client": false,
+      "w": 60,
+      "window": "child",
+      "x": 0,
+      "y": 0
+     },
+     {
+      "event": "CreateNotify",
+      "sent_by_client": false
+     },
+     {
+      "event": "DestroyNotify",
+      "on": "parent",
+      "sent_by_client": false,
+      "window": "child"
+     },
+     {
+      "event": "MapNotify",
+      "on": "parent",
+      "override_redirect": 0,
+      "sent_by_client": false,
+      "window": "child"
+     },
+     {
+      "event": "UnmapNotify",
+      "from_configure": 0,
+      "on": "parent",
+      "sent_by_client": false,
+      "window": "child"
+     }
+    ]
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": [
+     {
+      "above": "None",
+      "border": 0,
+      "event": "ConfigureNotify",
+      "h": 70,
+      "on": "parent",
+      "override_redirect": 0,
+      "sent_by_client": false,
+      "w": 60,
+      "window": "child",
+      "x": 0,
+      "y": 0
+     },
+     {
+      "event": "CreateNotify",
+      "sent_by_client": false
+     },
+     {
+      "event": "DestroyNotify",
+      "on": "parent",
+      "sent_by_client": false,
+      "window": "child"
+     },
+     {
+      "event": "MapNotify",
+      "on": "parent",
+      "override_redirect": 0,
+      "sent_by_client": false,
+      "window": "child"
+     },
+     {
+      "event": "UnmapNotify",
+      "from_configure": 0,
+      "on": "parent",
+      "sent_by_client": false,
+      "window": "child"
+     }
+    ]
+   }
+  },
+  "events.toplevel_map": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "kinds": [
+      "MapNotify"
+     ],
+     "map_notify_arrived": true
+    }
+   },
+   "status": "SAME",
+   "strict": false,
+   "target": {
+    "ok": true,
+    "value": {
+     "kinds": [
+      "MapNotify"
+     ],
+     "map_notify_arrived": true
+    }
+   }
+  },
+  "ext.list": {
+   "delta": [
+    [
+     "count",
+     11,
+     23
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "agrees_with_query_extension": true,
+     "count": 23,
+     "listed_but_not_queryable": []
+    }
+   },
+   "status": "KNOWN",
+   "strict": false,
+   "target": {
+    "ok": true,
+    "value": {
+     "agrees_with_query_extension": true,
+     "count": 11,
+     "listed_but_not_queryable": []
+    }
+   }
+  },
+  "ext.minor_sweep": {
+   "delta": [
+    [
+     "GLX.0",
+     "Ok",
+     "BadRequest"
+    ],
+    [
+     "GLX.1",
+     "code140",
+     "BadLength"
+    ],
+    [
+     "GLX.10",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.11",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.12",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.13",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.14",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.15",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.16",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.17",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.18",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.19",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.2",
+     "code140",
+     "BadLength"
+    ],
+    [
+     "GLX.20",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.21",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.22",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.23",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.24",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.25",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.26",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.27",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.28",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.29",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.3",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.30",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.31",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.32",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.33",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.34",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.35",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.4",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.5",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.6",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.7",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.8",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "GLX.9",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "MIT-SCREEN-SAVER.0",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "MIT-SCREEN-SAVER.1",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "MIT-SCREEN-SAVER.2",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "MIT-SCREEN-SAVER.3",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "MIT-SCREEN-SAVER.4",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "MIT-SCREEN-SAVER.5",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.0",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.1",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "RANDR.10",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.11",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.12",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.13",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.14",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.15",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.16",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.17",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.18",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.19",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.2",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.20",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.21",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.22",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.23",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.24",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.25",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.26",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.27",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.28",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.29",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.3",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "RANDR.30",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.31",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.32",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.33",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.34",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.35",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.36",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.37",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.38",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.39",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.4",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.40",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.41",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.5",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.6",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.7",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RANDR.8",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RANDR.9",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.0",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.10",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.11",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.12",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.13",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.14",
+     "Ok",
+     "BadImplementation"
+    ],
+    [
+     "RENDER.15",
+     "Ok",
+     "BadImplementation"
+    ],
+    [
+     "RENDER.16",
+     "Ok",
+     "BadImplementation"
+    ],
+    [
+     "RENDER.17",
+     "code149",
+     "BadLength"
+    ],
+    [
+     "RENDER.18",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.19",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.2",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "RENDER.20",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.21",
+     "Ok",
+     "BadImplementation"
+    ],
+    [
+     "RENDER.22",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.23",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.24",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.25",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.26",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.27",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.28",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.29",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.3",
+     "Ok",
+     "BadImplementation"
+    ],
+    [
+     "RENDER.30",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.31",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.32",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.33",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.34",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.35",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.36",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.4",
+     "code149",
+     "BadLength"
+    ],
+    [
+     "RENDER.5",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.6",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.7",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.8",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "RENDER.9",
+     "Ok",
+     "BadImplementation"
+    ],
+    [
+     "SHAPE.1",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "SHAPE.2",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "SHAPE.3",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "SHAPE.4",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "SHAPE.5",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "SHAPE.6",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "SHAPE.7",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "SHAPE.8",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.1",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.10",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.11",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.12",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.13",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.14",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.15",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.16",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.17",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.18",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.19",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.20",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.21",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.22",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.23",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.24",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.25",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.26",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.27",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.28",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.29",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.3",
+     "code129",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.30",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.31",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.32",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.33",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.34",
+     "BadMatch",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.35",
+     "BadMatch",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.36",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.37",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.38",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.39",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.4",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.40",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.41",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.5",
+     "code129",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.6",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.7",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.8",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XInputExtension.9",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.0",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.1",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.10",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.11",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.12",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.13",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.14",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.15",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.16",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.17",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.18",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.19",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.2",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.20",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.21",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.22",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.23",
+     "BadImplementation",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.24",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.25",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.26",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.27",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.28",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.29",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.3",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.30",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.31",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.32",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.33",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.34",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.35",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.36",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.37",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.38",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.39",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.4",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.40",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.41",
+     "BadImplementation",
+     "BadRequest"
+    ],
+    [
+     "XKEYBOARD.5",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.6",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.7",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XKEYBOARD.9",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XTEST.0",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XTEST.1",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XTEST.2",
+     "Ok",
+     "BadLength"
+    ],
+    [
+     "XTEST.3",
+     "Ok",
+     "BadLength"
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "BIG-REQUESTS.0": "Ok",
+     "BIG-REQUESTS.1": "BadRequest",
+     "BIG-REQUESTS.10": "BadRequest",
+     "BIG-REQUESTS.11": "BadRequest",
+     "BIG-REQUESTS.12": "BadRequest",
+     "BIG-REQUESTS.13": "BadRequest",
+     "BIG-REQUESTS.14": "BadRequest",
+     "BIG-REQUESTS.15": "BadRequest",
+     "BIG-REQUESTS.16": "BadRequest",
+     "BIG-REQUESTS.17": "BadRequest",
+     "BIG-REQUESTS.18": "BadRequest",
+     "BIG-REQUESTS.19": "BadRequest",
+     "BIG-REQUESTS.2": "BadRequest",
+     "BIG-REQUESTS.20": "BadRequest",
+     "BIG-REQUESTS.21": "BadRequest",
+     "BIG-REQUESTS.22": "BadRequest",
+     "BIG-REQUESTS.23": "BadRequest",
+     "BIG-REQUESTS.24": "BadRequest",
+     "BIG-REQUESTS.25": "BadRequest",
+     "BIG-REQUESTS.26": "BadRequest",
+     "BIG-REQUESTS.27": "BadRequest",
+     "BIG-REQUESTS.28": "BadRequest",
+     "BIG-REQUESTS.29": "BadRequest",
+     "BIG-REQUESTS.3": "BadRequest",
+     "BIG-REQUESTS.30": "BadRequest",
+     "BIG-REQUESTS.31": "BadRequest",
+     "BIG-REQUESTS.32": "BadRequest",
+     "BIG-REQUESTS.33": "BadRequest",
+     "BIG-REQUESTS.34": "BadRequest",
+     "BIG-REQUESTS.35": "BadRequest",
+     "BIG-REQUESTS.36": "BadRequest",
+     "BIG-REQUESTS.37": "BadRequest",
+     "BIG-REQUESTS.38": "BadRequest",
+     "BIG-REQUESTS.39": "BadRequest",
+     "BIG-REQUESTS.4": "BadRequest",
+     "BIG-REQUESTS.40": "BadRequest",
+     "BIG-REQUESTS.41": "BadRequest",
+     "BIG-REQUESTS.5": "BadRequest",
+     "BIG-REQUESTS.6": "BadRequest",
+     "BIG-REQUESTS.7": "BadRequest",
+     "BIG-REQUESTS.8": "BadRequest",
+     "BIG-REQUESTS.9": "BadRequest",
+     "GLX.0": "BadRequest",
+     "GLX.1": "BadLength",
+     "GLX.10": "BadLength",
+     "GLX.11": "BadLength",
+     "GLX.12": "BadLength",
+     "GLX.13": "BadLength",
+     "GLX.14": "BadLength",
+     "GLX.15": "BadLength",
+     "GLX.16": "BadLength",
+     "GLX.17": "BadLength",
+     "GLX.18": "BadLength",
+     "GLX.19": "BadLength",
+     "GLX.2": "BadLength",
+     "GLX.20": "BadLength",
+     "GLX.21": "BadLength",
+     "GLX.22": "BadLength",
+     "GLX.23": "BadLength",
+     "GLX.24": "BadLength",
+     "GLX.25": "BadLength",
+     "GLX.26": "BadLength",
+     "GLX.27": "BadLength",
+     "GLX.28": "BadLength",
+     "GLX.29": "BadLength",
+     "GLX.3": "BadLength",
+     "GLX.30": "BadLength",
+     "GLX.31": "BadLength",
+     "GLX.32": "BadLength",
+     "GLX.33": "BadLength",
+     "GLX.34": "BadLength",
+     "GLX.35": "BadLength",
+     "GLX.36": "BadRequest",
+     "GLX.37": "BadRequest",
+     "GLX.38": "BadRequest",
+     "GLX.39": "BadRequest",
+     "GLX.4": "BadLength",
+     "GLX.40": "BadRequest",
+     "GLX.41": "BadRequest",
+     "GLX.5": "BadLength",
+     "GLX.6": "BadLength",
+     "GLX.7": "BadLength",
+     "GLX.8": "BadLength",
+     "GLX.9": "BadLength",
+     "MIT-SCREEN-SAVER.0": "BadLength",
+     "MIT-SCREEN-SAVER.1": "BadLength",
+     "MIT-SCREEN-SAVER.10": "BadRequest",
+     "MIT-SCREEN-SAVER.11": "BadRequest",
+     "MIT-SCREEN-SAVER.12": "BadRequest",
+     "MIT-SCREEN-SAVER.13": "BadRequest",
+     "MIT-SCREEN-SAVER.14": "BadRequest",
+     "MIT-SCREEN-SAVER.15": "BadRequest",
+     "MIT-SCREEN-SAVER.16": "BadRequest",
+     "MIT-SCREEN-SAVER.17": "BadRequest",
+     "MIT-SCREEN-SAVER.18": "BadRequest",
+     "MIT-SCREEN-SAVER.19": "BadRequest",
+     "MIT-SCREEN-SAVER.2": "BadLength",
+     "MIT-SCREEN-SAVER.20": "BadRequest",
+     "MIT-SCREEN-SAVER.21": "BadRequest",
+     "MIT-SCREEN-SAVER.22": "BadRequest",
+     "MIT-SCREEN-SAVER.23": "BadRequest",
+     "MIT-SCREEN-SAVER.24": "BadRequest",
+     "MIT-SCREEN-SAVER.25": "BadRequest",
+     "MIT-SCREEN-SAVER.26": "BadRequest",
+     "MIT-SCREEN-SAVER.27": "BadRequest",
+     "MIT-SCREEN-SAVER.28": "BadRequest",
+     "MIT-SCREEN-SAVER.29": "BadRequest",
+     "MIT-SCREEN-SAVER.3": "BadLength",
+     "MIT-SCREEN-SAVER.30": "BadRequest",
+     "MIT-SCREEN-SAVER.31": "BadRequest",
+     "MIT-SCREEN-SAVER.32": "BadRequest",
+     "MIT-SCREEN-SAVER.33": "BadRequest",
+     "MIT-SCREEN-SAVER.34": "BadRequest",
+     "MIT-SCREEN-SAVER.35": "BadRequest",
+     "MIT-SCREEN-SAVER.36": "BadRequest",
+     "MIT-SCREEN-SAVER.37": "BadRequest",
+     "MIT-SCREEN-SAVER.38": "BadRequest",
+     "MIT-SCREEN-SAVER.39": "BadRequest",
+     "MIT-SCREEN-SAVER.4": "BadLength",
+     "MIT-SCREEN-SAVER.40": "BadRequest",
+     "MIT-SCREEN-SAVER.41": "BadRequest",
+     "MIT-SCREEN-SAVER.5": "BadLength",
+     "MIT-SCREEN-SAVER.6": "BadRequest",
+     "MIT-SCREEN-SAVER.7": "BadRequest",
+     "MIT-SCREEN-SAVER.8": "BadRequest",
+     "MIT-SCREEN-SAVER.9": "BadRequest",
+     "RANDR.0": "BadLength",
+     "RANDR.1": "BadRequest",
+     "RANDR.10": "BadLength",
+     "RANDR.11": "BadLength",
+     "RANDR.12": "BadLength",
+     "RANDR.13": "BadLength",
+     "RANDR.14": "BadLength",
+     "RANDR.15": "BadLength",
+     "RANDR.16": "BadLength",
+     "RANDR.17": "BadLength",
+     "RANDR.18": "BadLength",
+     "RANDR.19": "BadLength",
+     "RANDR.2": "BadLength",
+     "RANDR.20": "BadLength",
+     "RANDR.21": "BadLength",
+     "RANDR.22": "BadLength",
+     "RANDR.23": "BadLength",
+     "RANDR.24": "BadLength",
+     "RANDR.25": "BadLength",
+     "RANDR.26": "BadLength",
+     "RANDR.27": "BadLength",
+     "RANDR.28": "BadLength",
+     "RANDR.29": "BadLength",
+     "RANDR.3": "BadRequest",
+     "RANDR.30": "BadLength",
+     "RANDR.31": "BadLength",
+     "RANDR.32": "BadLength",
+     "RANDR.33": "BadLength",
+     "RANDR.34": "BadLength",
+     "RANDR.35": "BadLength",
+     "RANDR.36": "BadLength",
+     "RANDR.37": "BadLength",
+     "RANDR.38": "BadLength",
+     "RANDR.39": "BadLength",
+     "RANDR.4": "BadLength",
+     "RANDR.40": "BadLength",
+     "RANDR.41": "BadLength",
+     "RANDR.5": "BadLength",
+     "RANDR.6": "BadLength",
+     "RANDR.7": "BadLength",
+     "RANDR.8": "BadLength",
+     "RANDR.9": "BadLength",
+     "RENDER.0": "BadLength",
+     "RENDER.1": "Ok",
+     "RENDER.10": "BadLength",
+     "RENDER.11": "BadLength",
+     "RENDER.12": "BadLength",
+     "RENDER.13": "BadLength",
+     "RENDER.14": "BadImplementation",
+     "RENDER.15": "BadImplementation",
+     "RENDER.16": "BadImplementation",
+     "RENDER.17": "BadLength",
+     "RENDER.18": "BadLength",
+     "RENDER.19": "BadLength",
+     "RENDER.2": "BadLength",
+     "RENDER.20": "BadLength",
+     "RENDER.21": "BadImplementation",
+     "RENDER.22": "BadLength",
+     "RENDER.23": "BadLength",
+     "RENDER.24": "BadLength",
+     "RENDER.25": "BadLength",
+     "RENDER.26": "BadLength",
+     "RENDER.27": "BadLength",
+     "RENDER.28": "BadLength",
+     "RENDER.29": "BadLength",
+     "RENDER.3": "BadImplementation",
+     "RENDER.30": "BadLength",
+     "RENDER.31": "BadLength",
+     "RENDER.32": "BadLength",
+     "RENDER.33": "BadLength",
+     "RENDER.34": "BadLength",
+     "RENDER.35": "BadLength",
+     "RENDER.36": "BadLength",
+     "RENDER.37": "BadRequest",
+     "RENDER.38": "BadRequest",
+     "RENDER.39": "BadRequest",
+     "RENDER.4": "BadLength",
+     "RENDER.40": "BadRequest",
+     "RENDER.41": "BadRequest",
+     "RENDER.5": "BadLength",
+     "RENDER.6": "BadLength",
+     "RENDER.7": "BadLength",
+     "RENDER.8": "BadLength",
+     "RENDER.9": "BadImplementation",
+     "SHAPE.0": "Ok",
+     "SHAPE.1": "BadLength",
+     "SHAPE.10": "BadRequest",
+     "SHAPE.11": "BadRequest",
+     "SHAPE.12": "BadRequest",
+     "SHAPE.13": "BadRequest",
+     "SHAPE.14": "BadRequest",
+     "SHAPE.15": "BadRequest",
+     "SHAPE.16": "BadRequest",
+     "SHAPE.17": "BadRequest",
+     "SHAPE.18": "BadRequest",
+     "SHAPE.19": "BadRequest",
+     "SHAPE.2": "BadLength",
+     "SHAPE.20": "BadRequest",
+     "SHAPE.21": "BadRequest",
+     "SHAPE.22": "BadRequest",
+     "SHAPE.23": "BadRequest",
+     "SHAPE.24": "BadRequest",
+     "SHAPE.25": "BadRequest",
+     "SHAPE.26": "BadRequest",
+     "SHAPE.27": "BadRequest",
+     "SHAPE.28": "BadRequest",
+     "SHAPE.29": "BadRequest",
+     "SHAPE.3": "BadLength",
+     "SHAPE.30": "BadRequest",
+     "SHAPE.31": "BadRequest",
+     "SHAPE.32": "BadRequest",
+     "SHAPE.33": "BadRequest",
+     "SHAPE.34": "BadRequest",
+     "SHAPE.35": "BadRequest",
+     "SHAPE.36": "BadRequest",
+     "SHAPE.37": "BadRequest",
+     "SHAPE.38": "BadRequest",
+     "SHAPE.39": "BadRequest",
+     "SHAPE.4": "BadLength",
+     "SHAPE.40": "BadRequest",
+     "SHAPE.41": "BadRequest",
+     "SHAPE.5": "BadLength",
+     "SHAPE.6": "BadLength",
+     "SHAPE.7": "BadLength",
+     "SHAPE.8": "BadLength",
+     "SHAPE.9": "BadRequest",
+     "XInputExtension.0": "BadRequest",
+     "XInputExtension.1": "BadLength",
+     "XInputExtension.10": "BadLength",
+     "XInputExtension.11": "BadLength",
+     "XInputExtension.12": "BadLength",
+     "XInputExtension.13": "BadLength",
+     "XInputExtension.14": "BadLength",
+     "XInputExtension.15": "BadLength",
+     "XInputExtension.16": "BadLength",
+     "XInputExtension.17": "BadLength",
+     "XInputExtension.18": "BadLength",
+     "XInputExtension.19": "BadLength",
+     "XInputExtension.2": "Ok",
+     "XInputExtension.20": "BadLength",
+     "XInputExtension.21": "BadLength",
+     "XInputExtension.22": "BadLength",
+     "XInputExtension.23": "BadLength",
+     "XInputExtension.24": "BadLength",
+     "XInputExtension.25": "BadLength",
+     "XInputExtension.26": "BadLength",
+     "XInputExtension.27": "BadLength",
+     "XInputExtension.28": "BadLength",
+     "XInputExtension.29": "BadLength",
+     "XInputExtension.3": "BadLength",
+     "XInputExtension.30": "BadLength",
+     "XInputExtension.31": "BadLength",
+     "XInputExtension.32": "BadLength",
+     "XInputExtension.33": "BadLength",
+     "XInputExtension.34": "BadLength",
+     "XInputExtension.35": "BadLength",
+     "XInputExtension.36": "BadLength",
+     "XInputExtension.37": "BadLength",
+     "XInputExtension.38": "BadLength",
+     "XInputExtension.39": "BadLength",
+     "XInputExtension.4": "BadLength",
+     "XInputExtension.40": "BadLength",
+     "XInputExtension.41": "BadLength",
+     "XInputExtension.5": "BadLength",
+     "XInputExtension.6": "BadLength",
+     "XInputExtension.7": "BadLength",
+     "XInputExtension.8": "BadLength",
+     "XInputExtension.9": "BadLength",
+     "XKEYBOARD.0": "BadLength",
+     "XKEYBOARD.1": "BadLength",
+     "XKEYBOARD.10": "BadLength",
+     "XKEYBOARD.11": "BadLength",
+     "XKEYBOARD.12": "BadLength",
+     "XKEYBOARD.13": "BadLength",
+     "XKEYBOARD.14": "BadLength",
+     "XKEYBOARD.15": "BadLength",
+     "XKEYBOARD.16": "BadLength",
+     "XKEYBOARD.17": "BadLength",
+     "XKEYBOARD.18": "BadLength",
+     "XKEYBOARD.19": "BadLength",
+     "XKEYBOARD.2": "BadRequest",
+     "XKEYBOARD.20": "BadLength",
+     "XKEYBOARD.21": "BadLength",
+     "XKEYBOARD.22": "BadLength",
+     "XKEYBOARD.23": "BadLength",
+     "XKEYBOARD.24": "BadLength",
+     "XKEYBOARD.25": "BadLength",
+     "XKEYBOARD.26": "BadRequest",
+     "XKEYBOARD.27": "BadRequest",
+     "XKEYBOARD.28": "BadRequest",
+     "XKEYBOARD.29": "BadRequest",
+     "XKEYBOARD.3": "BadLength",
+     "XKEYBOARD.30": "BadRequest",
+     "XKEYBOARD.31": "BadRequest",
+     "XKEYBOARD.32": "BadRequest",
+     "XKEYBOARD.33": "BadRequest",
+     "XKEYBOARD.34": "BadRequest",
+     "XKEYBOARD.35": "BadRequest",
+     "XKEYBOARD.36": "BadRequest",
+     "XKEYBOARD.37": "BadRequest",
+     "XKEYBOARD.38": "BadRequest",
+     "XKEYBOARD.39": "BadRequest",
+     "XKEYBOARD.4": "BadLength",
+     "XKEYBOARD.40": "BadRequest",
+     "XKEYBOARD.41": "BadRequest",
+     "XKEYBOARD.5": "BadLength",
+     "XKEYBOARD.6": "BadLength",
+     "XKEYBOARD.7": "BadLength",
+     "XKEYBOARD.8": "BadLength",
+     "XKEYBOARD.9": "BadLength",
+     "XTEST.0": "BadLength",
+     "XTEST.1": "BadLength",
+     "XTEST.10": "BadRequest",
+     "XTEST.11": "BadRequest",
+     "XTEST.12": "BadRequest",
+     "XTEST.13": "BadRequest",
+     "XTEST.14": "BadRequest",
+     "XTEST.15": "BadRequest",
+     "XTEST.16": "BadRequest",
+     "XTEST.17": "BadRequest",
+     "XTEST.18": "BadRequest",
+     "XTEST.19": "BadRequest",
+     "XTEST.2": "BadLength",
+     "XTEST.20": "BadRequest",
+     "XTEST.21": "BadRequest",
+     "XTEST.22": "BadRequest",
+     "XTEST.23": "BadRequest",
+     "XTEST.24": "BadRequest",
+     "XTEST.25": "BadRequest",
+     "XTEST.26": "BadRequest",
+     "XTEST.27": "BadRequest",
+     "XTEST.28": "BadRequest",
+     "XTEST.29": "BadRequest",
+     "XTEST.3": "BadLength",
+     "XTEST.30": "BadRequest",
+     "XTEST.31": "BadRequest",
+     "XTEST.32": "BadRequest",
+     "XTEST.33": "BadRequest",
+     "XTEST.34": "BadRequest",
+     "XTEST.35": "BadRequest",
+     "XTEST.36": "BadRequest",
+     "XTEST.37": "BadRequest",
+     "XTEST.38": "BadRequest",
+     "XTEST.39": "BadRequest",
+     "XTEST.4": "BadRequest",
+     "XTEST.40": "BadRequest",
+     "XTEST.41": "BadRequest",
+     "XTEST.5": "BadRequest",
+     "XTEST.6": "BadRequest",
+     "XTEST.7": "BadRequest",
+     "XTEST.8": "BadRequest",
+     "XTEST.9": "BadRequest"
+    }
+   },
+   "status": "KNOWN",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "BIG-REQUESTS.0": "Ok",
+     "BIG-REQUESTS.1": "BadRequest",
+     "BIG-REQUESTS.10": "BadRequest",
+     "BIG-REQUESTS.11": "BadRequest",
+     "BIG-REQUESTS.12": "BadRequest",
+     "BIG-REQUESTS.13": "BadRequest",
+     "BIG-REQUESTS.14": "BadRequest",
+     "BIG-REQUESTS.15": "BadRequest",
+     "BIG-REQUESTS.16": "BadRequest",
+     "BIG-REQUESTS.17": "BadRequest",
+     "BIG-REQUESTS.18": "BadRequest",
+     "BIG-REQUESTS.19": "BadRequest",
+     "BIG-REQUESTS.2": "BadRequest",
+     "BIG-REQUESTS.20": "BadRequest",
+     "BIG-REQUESTS.21": "BadRequest",
+     "BIG-REQUESTS.22": "BadRequest",
+     "BIG-REQUESTS.23": "BadRequest",
+     "BIG-REQUESTS.24": "BadRequest",
+     "BIG-REQUESTS.25": "BadRequest",
+     "BIG-REQUESTS.26": "BadRequest",
+     "BIG-REQUESTS.27": "BadRequest",
+     "BIG-REQUESTS.28": "BadRequest",
+     "BIG-REQUESTS.29": "BadRequest",
+     "BIG-REQUESTS.3": "BadRequest",
+     "BIG-REQUESTS.30": "BadRequest",
+     "BIG-REQUESTS.31": "BadRequest",
+     "BIG-REQUESTS.32": "BadRequest",
+     "BIG-REQUESTS.33": "BadRequest",
+     "BIG-REQUESTS.34": "BadRequest",
+     "BIG-REQUESTS.35": "BadRequest",
+     "BIG-REQUESTS.36": "BadRequest",
+     "BIG-REQUESTS.37": "BadRequest",
+     "BIG-REQUESTS.38": "BadRequest",
+     "BIG-REQUESTS.39": "BadRequest",
+     "BIG-REQUESTS.4": "BadRequest",
+     "BIG-REQUESTS.40": "BadRequest",
+     "BIG-REQUESTS.41": "BadRequest",
+     "BIG-REQUESTS.5": "BadRequest",
+     "BIG-REQUESTS.6": "BadRequest",
+     "BIG-REQUESTS.7": "BadRequest",
+     "BIG-REQUESTS.8": "BadRequest",
+     "BIG-REQUESTS.9": "BadRequest",
+     "GLX.0": "Ok",
+     "GLX.1": "code140",
+     "GLX.10": "Ok",
+     "GLX.11": "Ok",
+     "GLX.12": "Ok",
+     "GLX.13": "Ok",
+     "GLX.14": "Ok",
+     "GLX.15": "Ok",
+     "GLX.16": "Ok",
+     "GLX.17": "Ok",
+     "GLX.18": "Ok",
+     "GLX.19": "Ok",
+     "GLX.2": "code140",
+     "GLX.20": "Ok",
+     "GLX.21": "Ok",
+     "GLX.22": "Ok",
+     "GLX.23": "Ok",
+     "GLX.24": "Ok",
+     "GLX.25": "Ok",
+     "GLX.26": "Ok",
+     "GLX.27": "Ok",
+     "GLX.28": "Ok",
+     "GLX.29": "Ok",
+     "GLX.3": "Ok",
+     "GLX.30": "Ok",
+     "GLX.31": "Ok",
+     "GLX.32": "Ok",
+     "GLX.33": "Ok",
+     "GLX.34": "Ok",
+     "GLX.35": "Ok",
+     "GLX.36": "BadRequest",
+     "GLX.37": "BadRequest",
+     "GLX.38": "BadRequest",
+     "GLX.39": "BadRequest",
+     "GLX.4": "Ok",
+     "GLX.40": "BadRequest",
+     "GLX.41": "BadRequest",
+     "GLX.5": "Ok",
+     "GLX.6": "Ok",
+     "GLX.7": "Ok",
+     "GLX.8": "Ok",
+     "GLX.9": "Ok",
+     "MIT-SCREEN-SAVER.0": "Ok",
+     "MIT-SCREEN-SAVER.1": "Ok",
+     "MIT-SCREEN-SAVER.10": "BadRequest",
+     "MIT-SCREEN-SAVER.11": "BadRequest",
+     "MIT-SCREEN-SAVER.12": "BadRequest",
+     "MIT-SCREEN-SAVER.13": "BadRequest",
+     "MIT-SCREEN-SAVER.14": "BadRequest",
+     "MIT-SCREEN-SAVER.15": "BadRequest",
+     "MIT-SCREEN-SAVER.16": "BadRequest",
+     "MIT-SCREEN-SAVER.17": "BadRequest",
+     "MIT-SCREEN-SAVER.18": "BadRequest",
+     "MIT-SCREEN-SAVER.19": "BadRequest",
+     "MIT-SCREEN-SAVER.2": "Ok",
+     "MIT-SCREEN-SAVER.20": "BadRequest",
+     "MIT-SCREEN-SAVER.21": "BadRequest",
+     "MIT-SCREEN-SAVER.22": "BadRequest",
+     "MIT-SCREEN-SAVER.23": "BadRequest",
+     "MIT-SCREEN-SAVER.24": "BadRequest",
+     "MIT-SCREEN-SAVER.25": "BadRequest",
+     "MIT-SCREEN-SAVER.26": "BadRequest",
+     "MIT-SCREEN-SAVER.27": "BadRequest",
+     "MIT-SCREEN-SAVER.28": "BadRequest",
+     "MIT-SCREEN-SAVER.29": "BadRequest",
+     "MIT-SCREEN-SAVER.3": "Ok",
+     "MIT-SCREEN-SAVER.30": "BadRequest",
+     "MIT-SCREEN-SAVER.31": "BadRequest",
+     "MIT-SCREEN-SAVER.32": "BadRequest",
+     "MIT-SCREEN-SAVER.33": "BadRequest",
+     "MIT-SCREEN-SAVER.34": "BadRequest",
+     "MIT-SCREEN-SAVER.35": "BadRequest",
+     "MIT-SCREEN-SAVER.36": "BadRequest",
+     "MIT-SCREEN-SAVER.37": "BadRequest",
+     "MIT-SCREEN-SAVER.38": "BadRequest",
+     "MIT-SCREEN-SAVER.39": "BadRequest",
+     "MIT-SCREEN-SAVER.4": "Ok",
+     "MIT-SCREEN-SAVER.40": "BadRequest",
+     "MIT-SCREEN-SAVER.41": "BadRequest",
+     "MIT-SCREEN-SAVER.5": "Ok",
+     "MIT-SCREEN-SAVER.6": "BadRequest",
+     "MIT-SCREEN-SAVER.7": "BadRequest",
+     "MIT-SCREEN-SAVER.8": "BadRequest",
+     "MIT-SCREEN-SAVER.9": "BadRequest",
+     "RANDR.0": "Ok",
+     "RANDR.1": "BadImplementation",
+     "RANDR.10": "Ok",
+     "RANDR.11": "BadImplementation",
+     "RANDR.12": "BadImplementation",
+     "RANDR.13": "Ok",
+     "RANDR.14": "Ok",
+     "RANDR.15": "Ok",
+     "RANDR.16": "BadImplementation",
+     "RANDR.17": "BadImplementation",
+     "RANDR.18": "BadImplementation",
+     "RANDR.19": "BadImplementation",
+     "RANDR.2": "Ok",
+     "RANDR.20": "Ok",
+     "RANDR.21": "BadImplementation",
+     "RANDR.22": "Ok",
+     "RANDR.23": "Ok",
+     "RANDR.24": "Ok",
+     "RANDR.25": "Ok",
+     "RANDR.26": "BadImplementation",
+     "RANDR.27": "Ok",
+     "RANDR.28": "Ok",
+     "RANDR.29": "BadImplementation",
+     "RANDR.3": "BadImplementation",
+     "RANDR.30": "BadImplementation",
+     "RANDR.31": "Ok",
+     "RANDR.32": "Ok",
+     "RANDR.33": "BadImplementation",
+     "RANDR.34": "BadImplementation",
+     "RANDR.35": "BadImplementation",
+     "RANDR.36": "BadImplementation",
+     "RANDR.37": "BadImplementation",
+     "RANDR.38": "BadImplementation",
+     "RANDR.39": "BadImplementation",
+     "RANDR.4": "Ok",
+     "RANDR.40": "BadImplementation",
+     "RANDR.41": "BadImplementation",
+     "RANDR.5": "Ok",
+     "RANDR.6": "Ok",
+     "RANDR.7": "BadImplementation",
+     "RANDR.8": "Ok",
+     "RANDR.9": "Ok",
+     "RENDER.0": "Ok",
+     "RENDER.1": "Ok",
+     "RENDER.10": "Ok",
+     "RENDER.11": "Ok",
+     "RENDER.12": "Ok",
+     "RENDER.13": "Ok",
+     "RENDER.14": "Ok",
+     "RENDER.15": "Ok",
+     "RENDER.16": "Ok",
+     "RENDER.17": "code149",
+     "RENDER.18": "Ok",
+     "RENDER.19": "Ok",
+     "RENDER.2": "BadImplementation",
+     "RENDER.20": "Ok",
+     "RENDER.21": "Ok",
+     "RENDER.22": "Ok",
+     "RENDER.23": "Ok",
+     "RENDER.24": "Ok",
+     "RENDER.25": "Ok",
+     "RENDER.26": "Ok",
+     "RENDER.27": "Ok",
+     "RENDER.28": "Ok",
+     "RENDER.29": "Ok",
+     "RENDER.3": "Ok",
+     "RENDER.30": "Ok",
+     "RENDER.31": "Ok",
+     "RENDER.32": "Ok",
+     "RENDER.33": "Ok",
+     "RENDER.34": "Ok",
+     "RENDER.35": "Ok",
+     "RENDER.36": "Ok",
+     "RENDER.37": "BadRequest",
+     "RENDER.38": "BadRequest",
+     "RENDER.39": "BadRequest",
+     "RENDER.4": "code149",
+     "RENDER.40": "BadRequest",
+     "RENDER.41": "BadRequest",
+     "RENDER.5": "Ok",
+     "RENDER.6": "Ok",
+     "RENDER.7": "Ok",
+     "RENDER.8": "Ok",
+     "RENDER.9": "Ok",
+     "SHAPE.0": "Ok",
+     "SHAPE.1": "Ok",
+     "SHAPE.10": "BadRequest",
+     "SHAPE.11": "BadRequest",
+     "SHAPE.12": "BadRequest",
+     "SHAPE.13": "BadRequest",
+     "SHAPE.14": "BadRequest",
+     "SHAPE.15": "BadRequest",
+     "SHAPE.16": "BadRequest",
+     "SHAPE.17": "BadRequest",
+     "SHAPE.18": "BadRequest",
+     "SHAPE.19": "BadRequest",
+     "SHAPE.2": "Ok",
+     "SHAPE.20": "BadRequest",
+     "SHAPE.21": "BadRequest",
+     "SHAPE.22": "BadRequest",
+     "SHAPE.23": "BadRequest",
+     "SHAPE.24": "BadRequest",
+     "SHAPE.25": "BadRequest",
+     "SHAPE.26": "BadRequest",
+     "SHAPE.27": "BadRequest",
+     "SHAPE.28": "BadRequest",
+     "SHAPE.29": "BadRequest",
+     "SHAPE.3": "Ok",
+     "SHAPE.30": "BadRequest",
+     "SHAPE.31": "BadRequest",
+     "SHAPE.32": "BadRequest",
+     "SHAPE.33": "BadRequest",
+     "SHAPE.34": "BadRequest",
+     "SHAPE.35": "BadRequest",
+     "SHAPE.36": "BadRequest",
+     "SHAPE.37": "BadRequest",
+     "SHAPE.38": "BadRequest",
+     "SHAPE.39": "BadRequest",
+     "SHAPE.4": "Ok",
+     "SHAPE.40": "BadRequest",
+     "SHAPE.41": "BadRequest",
+     "SHAPE.5": "Ok",
+     "SHAPE.6": "Ok",
+     "SHAPE.7": "Ok",
+     "SHAPE.8": "Ok",
+     "SHAPE.9": "BadRequest",
+     "XInputExtension.0": "BadRequest",
+     "XInputExtension.1": "Ok",
+     "XInputExtension.10": "Ok",
+     "XInputExtension.11": "Ok",
+     "XInputExtension.12": "Ok",
+     "XInputExtension.13": "Ok",
+     "XInputExtension.14": "Ok",
+     "XInputExtension.15": "Ok",
+     "XInputExtension.16": "Ok",
+     "XInputExtension.17": "Ok",
+     "XInputExtension.18": "Ok",
+     "XInputExtension.19": "Ok",
+     "XInputExtension.2": "Ok",
+     "XInputExtension.20": "Ok",
+     "XInputExtension.21": "Ok",
+     "XInputExtension.22": "Ok",
+     "XInputExtension.23": "Ok",
+     "XInputExtension.24": "Ok",
+     "XInputExtension.25": "Ok",
+     "XInputExtension.26": "Ok",
+     "XInputExtension.27": "Ok",
+     "XInputExtension.28": "Ok",
+     "XInputExtension.29": "Ok",
+     "XInputExtension.3": "code129",
+     "XInputExtension.30": "Ok",
+     "XInputExtension.31": "Ok",
+     "XInputExtension.32": "Ok",
+     "XInputExtension.33": "Ok",
+     "XInputExtension.34": "BadMatch",
+     "XInputExtension.35": "BadMatch",
+     "XInputExtension.36": "Ok",
+     "XInputExtension.37": "Ok",
+     "XInputExtension.38": "Ok",
+     "XInputExtension.39": "Ok",
+     "XInputExtension.4": "Ok",
+     "XInputExtension.40": "Ok",
+     "XInputExtension.41": "Ok",
+     "XInputExtension.5": "code129",
+     "XInputExtension.6": "Ok",
+     "XInputExtension.7": "Ok",
+     "XInputExtension.8": "Ok",
+     "XInputExtension.9": "Ok",
+     "XKEYBOARD.0": "Ok",
+     "XKEYBOARD.1": "Ok",
+     "XKEYBOARD.10": "Ok",
+     "XKEYBOARD.11": "Ok",
+     "XKEYBOARD.12": "Ok",
+     "XKEYBOARD.13": "Ok",
+     "XKEYBOARD.14": "Ok",
+     "XKEYBOARD.15": "BadImplementation",
+     "XKEYBOARD.16": "Ok",
+     "XKEYBOARD.17": "Ok",
+     "XKEYBOARD.18": "Ok",
+     "XKEYBOARD.19": "BadImplementation",
+     "XKEYBOARD.2": "BadImplementation",
+     "XKEYBOARD.20": "BadImplementation",
+     "XKEYBOARD.21": "Ok",
+     "XKEYBOARD.22": "BadImplementation",
+     "XKEYBOARD.23": "BadImplementation",
+     "XKEYBOARD.24": "Ok",
+     "XKEYBOARD.25": "Ok",
+     "XKEYBOARD.26": "BadImplementation",
+     "XKEYBOARD.27": "BadImplementation",
+     "XKEYBOARD.28": "BadImplementation",
+     "XKEYBOARD.29": "BadImplementation",
+     "XKEYBOARD.3": "Ok",
+     "XKEYBOARD.30": "BadImplementation",
+     "XKEYBOARD.31": "BadImplementation",
+     "XKEYBOARD.32": "BadImplementation",
+     "XKEYBOARD.33": "BadImplementation",
+     "XKEYBOARD.34": "BadImplementation",
+     "XKEYBOARD.35": "BadImplementation",
+     "XKEYBOARD.36": "BadImplementation",
+     "XKEYBOARD.37": "BadImplementation",
+     "XKEYBOARD.38": "BadImplementation",
+     "XKEYBOARD.39": "BadImplementation",
+     "XKEYBOARD.4": "Ok",
+     "XKEYBOARD.40": "BadImplementation",
+     "XKEYBOARD.41": "BadImplementation",
+     "XKEYBOARD.5": "Ok",
+     "XKEYBOARD.6": "Ok",
+     "XKEYBOARD.7": "Ok",
+     "XKEYBOARD.8": "BadLength",
+     "XKEYBOARD.9": "Ok",
+     "XTEST.0": "Ok",
+     "XTEST.1": "Ok",
+     "XTEST.10": "BadRequest",
+     "XTEST.11": "BadRequest",
+     "XTEST.12": "BadRequest",
+     "XTEST.13": "BadRequest",
+     "XTEST.14": "BadRequest",
+     "XTEST.15": "BadRequest",
+     "XTEST.16": "BadRequest",
+     "XTEST.17": "BadRequest",
+     "XTEST.18": "BadRequest",
+     "XTEST.19": "BadRequest",
+     "XTEST.2": "Ok",
+     "XTEST.20": "BadRequest",
+     "XTEST.21": "BadRequest",
+     "XTEST.22": "BadRequest",
+     "XTEST.23": "BadRequest",
+     "XTEST.24": "BadRequest",
+     "XTEST.25": "BadRequest",
+     "XTEST.26": "BadRequest",
+     "XTEST.27": "BadRequest",
+     "XTEST.28": "BadRequest",
+     "XTEST.29": "BadRequest",
+     "XTEST.3": "Ok",
+     "XTEST.30": "BadRequest",
+     "XTEST.31": "BadRequest",
+     "XTEST.32": "BadRequest",
+     "XTEST.33": "BadRequest",
+     "XTEST.34": "BadRequest",
+     "XTEST.35": "BadRequest",
+     "XTEST.36": "BadRequest",
+     "XTEST.37": "BadRequest",
+     "XTEST.38": "BadRequest",
+     "XTEST.39": "BadRequest",
+     "XTEST.4": "BadRequest",
+     "XTEST.40": "BadRequest",
+     "XTEST.41": "BadRequest",
+     "XTEST.5": "BadRequest",
+     "XTEST.6": "BadRequest",
+     "XTEST.7": "BadRequest",
+     "XTEST.8": "BadRequest",
+     "XTEST.9": "BadRequest"
+    }
+   }
+  },
+  "ext.present": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "BIG-REQUESTS": true,
+     "DOUBLE-BUFFER": true,
+     "DRI2": true,
+     "DRI3": true,
+     "GLX": true,
+     "Generic Event Extension": true,
+     "MIT-SCREEN-SAVER": true,
+     "MIT-SHM": true,
+     "Present": true,
+     "RANDR": true,
+     "RENDER": true,
+     "SHAPE": true,
+     "SYNC": true,
+     "XFIXES": true,
+     "XINERAMA": true,
+     "XInputExtension": true,
+     "XKEYBOARD": true,
+     "XTEST": true
+    }
+   },
+   "status": "SAME",
+   "strict": false,
+   "target": {
+    "ok": true,
+    "value": {
+     "BIG-REQUESTS": true,
+     "DOUBLE-BUFFER": true,
+     "DRI2": true,
+     "DRI3": true,
+     "GLX": true,
+     "Generic Event Extension": true,
+     "MIT-SCREEN-SAVER": true,
+     "MIT-SHM": true,
+     "Present": true,
+     "RANDR": true,
+     "RENDER": true,
+     "SHAPE": true,
+     "SYNC": true,
+     "XFIXES": true,
+     "XINERAMA": true,
+     "XInputExtension": true,
+     "XKEYBOARD": true,
+     "XTEST": true
+    }
+   }
+  },
+  "focus.roundtrip": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bad_revert_to": "BadValue",
+     "reply_len_words": 0,
+     "revert_to_is_enum": true,
+     "set_none": "Ok",
+     "set_pointer_root": "Ok",
+     "set_to_window": "Ok",
+     "unknown_window": "BadWindow"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bad_revert_to": "BadValue",
+     "reply_len_words": 0,
+     "revert_to_is_enum": true,
+     "set_none": "Ok",
+     "set_pointer_root": "Ok",
+     "set_to_window": "Ok",
+     "unknown_window": "BadWindow"
+    }
+   }
+  },
+  "font.errors": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "close_unknown": "BadFont",
+     "extents_unknown": "BadFont",
+     "query_unknown": "BadFont"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "close_unknown": "BadFont",
+     "extents_unknown": "BadFont",
+     "query_unknown": "BadFont"
+    }
+   }
+  },
+  "font.list": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "count_is_nonnegative": true,
+     "parses": true
+    }
+   },
+   "status": "SAME",
+   "strict": false,
+   "target": {
+    "ok": true,
+    "value": {
+     "count_is_nonnegative": true,
+     "parses": true
+    }
+   }
+  },
+  "font.open_query": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "ascent_plus_descent_positive": true,
+     "byte_range_sane": true,
+     "close": "Ok",
+     "opens": true,
+     "reply_len_words_positive": true
+    }
+   },
+   "status": "SAME",
+   "strict": false,
+   "target": {
+    "ok": true,
+    "value": {
+     "ascent_plus_descent_positive": true,
+     "byte_range_sane": true,
+     "close": "Ok",
+     "opens": true,
+     "reply_len_words_positive": true
+    }
+   }
+  },
+  "font.text_extents": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "ascent_or_descent_set": true,
+     "font_opens": true,
+     "width_grows_with_text": true,
+     "width_positive": false
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "ascent_or_descent_set": true,
+     "font_opens": true,
+     "width_grows_with_text": true,
+     "width_positive": false
+    }
+   }
+  },
+  "fontpath": {
+   "delta": [
+    [
+     "count",
+     0,
+     3
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "count": 3
+    }
+   },
+   "status": "KNOWN",
+   "strict": false,
+   "target": {
+    "ok": true,
+    "value": {
+     "count": 0
+    }
+   }
+  },
+  "gc.attributes": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "arc_mode_illegal": "BadValue",
+     "arc_mode_legal": "Ok",
+     "cap_style_illegal": "BadValue",
+     "cap_style_legal": "Ok",
+     "fill_rule_illegal": "BadValue",
+     "fill_rule_legal": "Ok",
+     "fill_style_illegal": "BadValue",
+     "fill_style_legal": "Ok",
+     "function_illegal": "BadValue",
+     "function_legal": "Ok",
+     "join_style_illegal": "BadValue",
+     "join_style_legal": "Ok",
+     "line_style_illegal": "BadValue",
+     "line_style_legal": "Ok",
+     "subwindow_mode_illegal": "BadValue",
+     "subwindow_mode_legal": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "arc_mode_illegal": "BadValue",
+     "arc_mode_legal": "Ok",
+     "cap_style_illegal": "BadValue",
+     "cap_style_legal": "Ok",
+     "fill_rule_illegal": "BadValue",
+     "fill_rule_legal": "Ok",
+     "fill_style_illegal": "BadValue",
+     "fill_style_legal": "Ok",
+     "function_illegal": "BadValue",
+     "function_legal": "Ok",
+     "join_style_illegal": "BadValue",
+     "join_style_legal": "Ok",
+     "line_style_illegal": "BadValue",
+     "line_style_legal": "Ok",
+     "subwindow_mode_illegal": "BadValue",
+     "subwindow_mode_legal": "Ok"
+    }
+   }
+  },
+  "gc.clip_ordering": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "ordering0": "Ok",
+     "ordering1": "Ok",
+     "ordering2": "Ok",
+     "ordering3": "Ok",
+     "ordering_bad": "BadValue"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "ordering0": "Ok",
+     "ordering1": "Ok",
+     "ordering2": "Ok",
+     "ordering3": "Ok",
+     "ordering_bad": "BadValue"
+    }
+   }
+  },
+  "gc.copy_and_dashes": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "copy": "Ok",
+     "copy_unknown_src": "BadGC",
+     "dashes": "Ok",
+     "dashes_empty": "BadValue",
+     "dashes_zero_length": "BadValue",
+     "free_unknown": "BadGC"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "copy": "Ok",
+     "copy_unknown_src": "BadGC",
+     "dashes": "Ok",
+     "dashes_empty": "BadValue",
+     "dashes_zero_length": "BadValue",
+     "free_unknown": "BadGC"
+    }
+   }
+  },
+  "geometry.root": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "border": 0,
+     "depth": 24,
+     "matches_setup_size": true,
+     "nonzero_size": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "border": 0,
+     "depth": 24,
+     "matches_setup_size": true,
+     "nonzero_size": true
+    }
+   }
+  },
+  "glx.configs": {
+   "delta": [
+    [
+     "count",
+     24,
+     380
+    ],
+    [
+     "tags",
+     "[\"0x1\", \"0x10\", \"0x11\", \"0x186a0\", \"0x186a1\", \"0x2\", \"0x20\", \"0x20d0\", \"0x20d1\", \"0x20d2\", \"0x20d3\", \"0x20d4\", \"0x22\", \"0x23\", \"0x24\", \"0x25\", \"0x26\", \"0x27\", \"0x28\", \"0x3\", \"0x4\", \"0x5\", \"0x6\", \"0x7\", \"0x8\", \"0x800b\", \"0x8010\", \"0x8011\", \"0x8012\", \"0x8013\", \"0x8016\", \"0x8017\", \"0x8018\", \"0x8019\", \"0x801a\", \"0x8028\", \"0x8060\", \"0x9\", \"0xa\", \"0xb\", \"0xc\", \"0xd\", \"0xe\", \"0xf\"]",
+     "[\"0x0\", \"0x10\", \"0x11\", \"0x186a0\", \"0x186a1\", \"0x2\", \"0x20\", \"0x20d0\", \"0x20d1\", \"0x20d2\", \"0x20d3\", \"0x20d4\", \"0x22\", \"0x23\", \"0x24\", \"0x25\", \"0x26\", \"0x27\", \"0x28\", \"0x3\", \"0x4\", \"0x5\", \"0x6\", \"0x7\", \"0x8\", \"0x800b\", \"0x8010\", \"0x8011\", \"0x8012\", \"0x8013\", \"0x8016\", \"0x8017\", \"0x8018\", \"0x8019\", \"0x801a\", \"0x8028\", \"0x8060\", \"0x9\", \"0xa\", \"0xb\", \"0xc\", \"0xd\", \"0xe\", \"0xf\"]"
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "count": 380,
+     "present": true,
+     "tags": [
+      "0x0",
+      "0x10",
+      "0x11",
+      "0x186a0",
+      "0x186a1",
+      "0x2",
+      "0x20",
+      "0x20d0",
+      "0x20d1",
+      "0x20d2",
+      "0x20d3",
+      "0x20d4",
+      "0x22",
+      "0x23",
+      "0x24",
+      "0x25",
+      "0x26",
+      "0x27",
+      "0x28",
+      "0x3",
+      "0x4",
+      "0x5",
+      "0x6",
+      "0x7",
+      "0x8",
+      "0x800b",
+      "0x8010",
+      "0x8011",
+      "0x8012",
+      "0x8013",
+      "0x8016",
+      "0x8017",
+      "0x8018",
+      "0x8019",
+      "0x801a",
+      "0x8028",
+      "0x8060",
+      "0x9",
+      "0xa",
+      "0xb",
+      "0xc",
+      "0xd",
+      "0xe",
+      "0xf"
+     ]
+    }
+   },
+   "status": "KNOWN",
+   "strict": false,
+   "target": {
+    "ok": true,
+    "value": {
+     "count": 24,
+     "present": true,
+     "tags": [
+      "0x1",
+      "0x10",
+      "0x11",
+      "0x186a0",
+      "0x186a1",
+      "0x2",
+      "0x20",
+      "0x20d0",
+      "0x20d1",
+      "0x20d2",
+      "0x20d3",
+      "0x20d4",
+      "0x22",
+      "0x23",
+      "0x24",
+      "0x25",
+      "0x26",
+      "0x27",
+      "0x28",
+      "0x3",
+      "0x4",
+      "0x5",
+      "0x6",
+      "0x7",
+      "0x8",
+      "0x800b",
+      "0x8010",
+      "0x8011",
+      "0x8012",
+      "0x8013",
+      "0x8016",
+      "0x8017",
+      "0x8018",
+      "0x8019",
+      "0x801a",
+      "0x8028",
+      "0x8060",
+      "0x9",
+      "0xa",
+      "0xb",
+      "0xc",
+      "0xd",
+      "0xe",
+      "0xf"
+     ]
+    }
+   }
+  },
+  "glx.visuals": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "all_name_real_visuals": true,
+     "present": true,
+     "window_configs_have_unique_visuals": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "all_name_real_visuals": true,
+     "present": true,
+     "window_configs_have_unique_visuals": true
+    }
+   }
+  },
+  "grab.freeze_thaw": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "allow0": "Ok",
+     "allow1": "Ok",
+     "allow2": "Ok",
+     "allow3": "Ok",
+     "allow4": "Ok",
+     "allow5": "Ok",
+     "allow6": "Ok",
+     "allow7": "Ok",
+     "geometry_after_all_of_it": [
+      100,
+      100
+     ],
+     "grab_server": "Ok",
+     "keyboard_grab_status": 0,
+     "pointer_grab_status": 0,
+     "still_responsive": "Reply",
+     "thaw_keyboard": "Ok",
+     "ungrab_keyboard": "Ok",
+     "ungrab_pointer": "Ok",
+     "ungrab_server": "Ok",
+     "ungrab_while_frozen": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "allow0": "Ok",
+     "allow1": "Ok",
+     "allow2": "Ok",
+     "allow3": "Ok",
+     "allow4": "Ok",
+     "allow5": "Ok",
+     "allow6": "Ok",
+     "allow7": "Ok",
+     "geometry_after_all_of_it": [
+      100,
+      100
+     ],
+     "grab_server": "Ok",
+     "keyboard_grab_status": 0,
+     "pointer_grab_status": 0,
+     "still_responsive": "Reply",
+     "thaw_keyboard": "Ok",
+     "ungrab_keyboard": "Ok",
+     "ungrab_pointer": "Ok",
+     "ungrab_server": "Ok",
+     "ungrab_while_frozen": "Ok"
+    }
+   }
+  },
+  "grab.keyboard": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bad_keyboard_mode": "BadValue",
+     "grab_unknown_window": "BadWindow",
+     "status_is_enum": true,
+     "ungrab": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bad_keyboard_mode": "BadValue",
+     "grab_unknown_window": "BadWindow",
+     "status_is_enum": true,
+     "ungrab": "Ok"
+    }
+   }
+  },
+  "grab.passive": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "allow_events": "Ok",
+     "allow_events_bad_mode": "BadValue",
+     "grab_button": "Ok",
+     "grab_button_unknown_window": "BadWindow",
+     "grab_key": "Ok",
+     "ungrab_button": "Ok",
+     "ungrab_key": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "allow_events": "Ok",
+     "allow_events_bad_mode": "BadValue",
+     "grab_button": "Ok",
+     "grab_button_unknown_window": "BadWindow",
+     "grab_key": "Ok",
+     "ungrab_button": "Ok",
+     "ungrab_key": "Ok"
+    }
+   }
+  },
+  "grab.pointer": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bad_pointer_mode": "BadValue",
+     "grab_unknown_window": "BadWindow",
+     "reply_len_words": 0,
+     "status_is_enum": true,
+     "ungrab": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bad_pointer_mode": "BadValue",
+     "grab_unknown_window": "BadWindow",
+     "reply_len_words": 0,
+     "status_is_enum": true,
+     "ungrab": "Ok"
+    }
+   }
+  },
+  "grab.server": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "grab": "Ok",
+     "ungrab": "Ok",
+     "ungrab_twice": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "grab": "Ok",
+     "ungrab": "Ok",
+     "ungrab_twice": "Ok"
+    }
+   }
+  },
+  "image.formats": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bad_format": "BadValue",
+     "xybitmap_depth24": "BadMatch",
+     "zpixmap_depth24": "Ok",
+     "zpixmap_depth_mismatch": "BadMatch"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bad_format": "BadValue",
+     "xybitmap_depth24": "BadMatch",
+     "zpixmap_depth24": "Ok",
+     "zpixmap_depth_mismatch": "BadMatch"
+    }
+   }
+  },
+  "image.get_formats": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bad_format": "BadValue",
+     "outside_drawable": "BadMatch",
+     "xypixmap_12_planes_words": 96,
+     "xypixmap_one_plane_words": 8,
+     "xypixmap_words": 192,
+     "zpixmap_words": 64
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bad_format": "BadValue",
+     "outside_drawable": "BadMatch",
+     "xypixmap_12_planes_words": 96,
+     "xypixmap_one_plane_words": 8,
+     "xypixmap_words": 192,
+     "zpixmap_words": 64
+    }
+   }
+  },
+  "keyboard.control": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bell_percent_in_range": false,
+     "global_auto_repeat_is_bool": true,
+     "reply_len_words": 5
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bell_percent_in_range": false,
+     "global_auto_repeat_is_bool": true,
+     "reply_len_words": 5
+    }
+   }
+  },
+  "keyboard.mapping": {
+   "delta": [
+    [
+     "fraction_mapped",
+     0.29,
+     0.39
+    ],
+    [
+     "keysyms_per_keycode",
+     6,
+     7
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "fraction_mapped": 0.39,
+     "keysyms_per_keycode": 7,
+     "max_keycode": 255,
+     "min_keycode": 8,
+     "reply_words_match": true
+    }
+   },
+   "status": "KNOWN",
+   "strict": false,
+   "target": {
+    "ok": true,
+    "value": {
+     "fraction_mapped": 0.29,
+     "keysyms_per_keycode": 6,
+     "max_keycode": 255,
+     "min_keycode": 8,
+     "reply_words_match": true
+    }
+   }
+  },
+  "keyboard.modmap": {
+   "delta": [
+    [
+     "bound.Mod2",
+     false,
+     true
+    ],
+    [
+     "bound.Mod3",
+     false,
+     true
+    ],
+    [
+     "keycodes_per_modifier",
+     2,
+     4
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bound": {
+      "Control": true,
+      "Lock": true,
+      "Mod1": true,
+      "Mod2": true,
+      "Mod3": true,
+      "Mod4": true,
+      "Mod5": true,
+      "Shift": true
+     },
+     "keycodes_per_modifier": 4
+    }
+   },
+   "status": "KNOWN",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bound": {
+      "Control": true,
+      "Lock": true,
+      "Mod1": true,
+      "Mod2": false,
+      "Mod3": false,
+      "Mod4": true,
+      "Mod5": true,
+      "Shift": true
+     },
+     "keycodes_per_modifier": 2
+    }
+   }
+  },
+  "pointer.control": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "denominator_nonzero": true,
+     "fields_present": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "denominator_nonzero": true,
+     "fields_present": true
+    }
+   }
+  },
+  "pointer.mapping": {
+   "delta": [
+    [
+     "count",
+     9,
+     10
+    ],
+    [
+     "values",
+     "[1, 2, 3, 4, 5, 6, 7, 8, 9]",
+     "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]"
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "count": 10,
+     "strictly_positive": true,
+     "values": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10
+     ]
+    }
+   },
+   "status": "KNOWN",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "count": 9,
+     "strictly_positive": true,
+     "values": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9
+     ]
+    }
+   }
+  },
+  "pointer.warp_and_query": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "query_unknown_window": "BadWindow",
+     "reply_len_words": 0,
+     "same_screen_is_bool": true,
+     "warp_none_source": "Ok",
+     "warp_unknown_dest": "BadWindow"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "query_unknown_window": "BadWindow",
+     "reply_len_words": 0,
+     "same_screen_is_bool": true,
+     "warp_none_source": "Ok",
+     "warp_unknown_dest": "BadWindow"
+    }
+   }
+  },
+  "props.absent": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "ListProperties_finds_it": false,
+     "bytes_after": 0,
+     "format": 0,
+     "length": 0,
+     "type_is_none": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "ListProperties_finds_it": false,
+     "bytes_after": 0,
+     "format": 0,
+     "length": 0,
+     "type_is_none": true
+    }
+   }
+  },
+  "props.list": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "count": 2
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "count": 2
+    }
+   }
+  },
+  "props.modes": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "combined": "CCCBBBAAA",
+     "gone_afterwards": true,
+     "read_with_delete": "CCCBBBAAA"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "combined": "CCCBBBAAA",
+     "gone_afterwards": true,
+     "read_with_delete": "CCCBBBAAA"
+    }
+   }
+  },
+  "props.rotate": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "rotate": "Ok",
+     "rotate_missing_property": "BadMatch",
+     "rotate_root_empty_list": "Ok",
+     "rotate_zero_delta": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "rotate": "Ok",
+     "rotate_missing_property": "BadMatch",
+     "rotate_root_empty_list": "Ok",
+     "rotate_zero_delta": "Ok"
+    }
+   }
+  },
+  "props.roundtrip": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "format16": {
+      "bytes_after_first_probe": 8,
+      "data_matches": true,
+      "length_units": 4,
+      "reply_format": 16
+     },
+     "format32": {
+      "bytes_after_first_probe": 12,
+      "data_matches": true,
+      "length_units": 3,
+      "reply_format": 32
+     },
+     "format8": {
+      "bytes_after_first_probe": 11,
+      "data_matches": true,
+      "length_units": 11,
+      "reply_format": 8
+     }
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "format16": {
+      "bytes_after_first_probe": 8,
+      "data_matches": true,
+      "length_units": 4,
+      "reply_format": 16
+     },
+     "format32": {
+      "bytes_after_first_probe": 12,
+      "data_matches": true,
+      "length_units": 3,
+      "reply_format": 32
+     },
+     "format8": {
+      "bytes_after_first_probe": 11,
+      "data_matches": true,
+      "length_units": 11,
+      "reply_format": 8
+     }
+    }
+   }
+  },
+  "querybestsize": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bad_class": "BadValue",
+     "class0": [
+      32,
+      32
+     ],
+     "class1": [
+      32,
+      32
+     ],
+     "class2": [
+      32,
+      32
+     ]
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bad_class": "BadValue",
+     "class0": [
+      32,
+      32
+     ],
+     "class1": [
+      32,
+      32
+     ],
+     "class2": [
+      32,
+      32
+     ]
+    }
+   }
+  },
+  "render.composite_ops": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "illegal_0x0E": "BadValue",
+     "illegal_0x1C": "BadValue",
+     "illegal_0x2C": "BadValue",
+     "illegal_0x3F": "BadValue",
+     "illegal_0xFE": "BadValue",
+     "op_0x00": "Ok",
+     "op_0x0D": "Ok",
+     "op_0x10": "Ok",
+     "op_0x1B": "Ok",
+     "op_0x20": "Ok",
+     "op_0x2B": "Ok",
+     "op_0x30": "Ok",
+     "op_0x3E": "Ok",
+     "present": true,
+     "unknown_src_picture": "ext_err1"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "illegal_0x0E": "BadValue",
+     "illegal_0x1C": "BadValue",
+     "illegal_0x2C": "BadValue",
+     "illegal_0x3F": "BadValue",
+     "illegal_0xFE": "BadValue",
+     "op_0x00": "Ok",
+     "op_0x0D": "Ok",
+     "op_0x10": "Ok",
+     "op_0x1B": "Ok",
+     "op_0x20": "Ok",
+     "op_0x2B": "Ok",
+     "op_0x30": "Ok",
+     "op_0x3E": "Ok",
+     "present": true,
+     "unknown_src_picture": "ext_err1"
+    }
+   }
+  },
+  "render.fill_and_transform": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "fill": "Ok",
+     "fill_bad_op": "BadValue",
+     "fill_unknown_picture": "ext_err1",
+     "present": true,
+     "transform_identity": "Ok",
+     "transform_unknown_picture": "ext_err1"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "fill": "Ok",
+     "fill_bad_op": "BadValue",
+     "fill_unknown_picture": "ext_err1",
+     "present": true,
+     "transform_identity": "Ok",
+     "transform_unknown_picture": "ext_err1"
+    }
+   }
+  },
+  "render.formats": {
+   "delta": [
+    [
+     "depth_type_pairs",
+     "[[1, 1], [8, 1], [24, 1], [32, 1]]",
+     "[[1, 1], [8, 1], [16, 1], [24, 1], [32, 1]]"
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "depth_type_pairs": [
+      [
+       1,
+       1
+      ],
+      [
+       8,
+       1
+      ],
+      [
+       16,
+       1
+      ],
+      [
+       24,
+       1
+      ],
+      [
+       32,
+       1
+      ]
+     ],
+     "has_a1": false,
+     "has_a8": false,
+     "has_argb32": false,
+     "present": true,
+     "screens_reported": 1
+    }
+   },
+   "status": "KNOWN",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "depth_type_pairs": [
+      [
+       1,
+       1
+      ],
+      [
+       8,
+       1
+      ],
+      [
+       24,
+       1
+      ],
+      [
+       32,
+       1
+      ]
+     ],
+     "has_a1": false,
+     "has_a8": false,
+     "has_argb32": false,
+     "present": true,
+     "screens_reported": 1
+    }
+   }
+  },
+  "render.glyphs": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "create": "Ok",
+     "create_bad_format": "ext_err0",
+     "free": "Ok",
+     "free_unknown": "ext_err3",
+     "has_a8": true,
+     "present": true,
+     "reference": "Ok",
+     "reference_unknown": "ext_err3"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "create": "Ok",
+     "create_bad_format": "ext_err0",
+     "free": "Ok",
+     "free_unknown": "ext_err3",
+     "has_a8": true,
+     "present": true,
+     "reference": "Ok",
+     "reference_unknown": "ext_err3"
+    }
+   }
+  },
+  "render.picture_lifecycle": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "create": "Ok",
+     "create_on_root": "ext_err0",
+     "create_unknown_drawable": "BadDrawable",
+     "create_unknown_format": "ext_err0",
+     "format_depth_mismatch": "BadMatch",
+     "free": "Ok",
+     "free_unknown": "ext_err1",
+     "present": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "create": "Ok",
+     "create_on_root": "ext_err0",
+     "create_unknown_drawable": "BadDrawable",
+     "create_unknown_format": "ext_err0",
+     "format_depth_mismatch": "BadMatch",
+     "free": "Ok",
+     "free_unknown": "ext_err1",
+     "present": true
+    }
+   }
+  },
+  "screensaver.get": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "blanking_is_enum": true,
+     "exposures_is_enum": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "blanking_is_enum": true,
+     "exposures_is_enum": true
+    }
+   }
+  },
+  "selection.convert": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "notify_arrived": true,
+     "property_is_none": true,
+     "reports_selection": true,
+     "reports_target": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "notify_arrived": true,
+     "property_is_none": true,
+     "reports_selection": true,
+     "reports_target": true
+    }
+   }
+  },
+  "selection.owner": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "owner_round_trips": true,
+     "released_is_none": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "owner_round_trips": true,
+     "released_is_none": true
+    }
+   }
+  },
+  "setters.bell_and_saver": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bell_max": "Ok",
+     "bell_min": "Ok",
+     "bell_too_loud": "BadValue",
+     "bell_zero": "Ok",
+     "force0": "Ok",
+     "force1": "Ok",
+     "force_bad": "BadValue",
+     "set_screensaver": "Ok",
+     "set_screensaver_bad_blanking": "BadValue"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bell_max": "Ok",
+     "bell_min": "Ok",
+     "bell_too_loud": "BadValue",
+     "bell_zero": "Ok",
+     "force0": "Ok",
+     "force1": "Ok",
+     "force_bad": "BadValue",
+     "set_screensaver": "Ok",
+     "set_screensaver_bad_blanking": "BadValue"
+    }
+   }
+  },
+  "setters.input_devices": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "keyboard_bell_pitch_duration": "Ok",
+     "keyboard_click": "Ok",
+     "keyboard_click_out_of_range": "BadValue",
+     "keyboard_defaults": "Ok",
+     "keyboard_repeat_bad": "BadValue",
+     "keyboard_repeat_mode": "Ok",
+     "pointer_all_defaults": "Ok",
+     "pointer_control": "Ok",
+     "pointer_negative_accel": "BadValue",
+     "pointer_threshold_default": "Ok",
+     "pointer_zero_denominator": "BadValue"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "keyboard_bell_pitch_duration": "Ok",
+     "keyboard_click": "Ok",
+     "keyboard_click_out_of_range": "BadValue",
+     "keyboard_defaults": "Ok",
+     "keyboard_repeat_bad": "BadValue",
+     "keyboard_repeat_mode": "Ok",
+     "pointer_all_defaults": "Ok",
+     "pointer_control": "Ok",
+     "pointer_negative_accel": "BadValue",
+     "pointer_threshold_default": "Ok",
+     "pointer_zero_denominator": "BadValue"
+    }
+   }
+  },
+  "setup.formats": {
+   "delta": [
+    [
+     "16",
+     "<missing>",
+     "[16, 32]"
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "1": [
+      1,
+      32
+     ],
+     "16": [
+      16,
+      32
+     ],
+     "24": [
+      32,
+      32
+     ],
+     "32": [
+      32,
+      32
+     ],
+     "4": [
+      8,
+      32
+     ],
+     "8": [
+      8,
+      32
+     ]
+    }
+   },
+   "status": "KNOWN",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "1": [
+      1,
+      32
+     ],
+     "24": [
+      32,
+      32
+     ],
+     "32": [
+      32,
+      32
+     ],
+     "4": [
+      8,
+      32
+     ],
+     "8": [
+      8,
+      32
+     ]
+    }
+   }
+  },
+  "setup.screen": {
+   "delta": [
+    [
+     "height",
+     999,
+     800
+    ],
+    [
+     "width",
+     1710,
+     1280
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "height": 800,
+     "max_request_words": 65535,
+     "width": 1280
+    }
+   },
+   "status": "KNOWN",
+   "strict": false,
+   "target": {
+    "ok": true,
+    "value": {
+     "height": 999,
+     "max_request_words": 65535,
+     "width": 1710
+    }
+   }
+  },
+  "setup.visual_depths": {
+   "delta": [
+    [
+     "24",
+     16,
+     80
+    ],
+    [
+     "32",
+     8,
+     20
+    ]
+   ],
+   "reference": {
+    "ok": true,
+    "value": {
+     "24": 80,
+     "32": 20
+    }
+   },
+   "status": "KNOWN",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "24": 16,
+     "32": 8
+    }
+   }
+  },
+  "setup.wire": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bitmap_bit_order": 0,
+     "bitmap_pad": 32,
+     "bitmap_unit": 32,
+     "image_byte_order": 0,
+     "root_depth": 24
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bitmap_bit_order": 0,
+     "bitmap_pad": 32,
+     "bitmap_unit": 32,
+     "image_byte_order": 0,
+     "root_depth": 24
+    }
+   }
+  },
+  "shape.mutations": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "mask_none": "Ok",
+     "offset": "Ok",
+     "offset_unknown_window": "BadWindow",
+     "present": true,
+     "rectangles": "Ok",
+     "rectangles_bad_kind": "BadValue",
+     "rectangles_bad_op": "BadValue",
+     "rectangles_unknown_window": "BadWindow"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "mask_none": "Ok",
+     "offset": "Ok",
+     "offset_unknown_window": "BadWindow",
+     "present": true,
+     "rectangles": "Ok",
+     "rectangles_bad_kind": "BadValue",
+     "rectangles_bad_op": "BadValue",
+     "rectangles_unknown_window": "BadWindow"
+    }
+   }
+  },
+  "shape.queries": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bounding_shaped_is_bool": true,
+     "clip_shaped_is_bool": true,
+     "extents_unknown_window": "BadWindow",
+     "extents_words": 0,
+     "present": true,
+     "rectangles_bad_kind": "BadValue",
+     "rectangles_bounding": "Reply",
+     "rectangles_unknown_window": "BadWindow",
+     "version_words": 0
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bounding_shaped_is_bool": true,
+     "clip_shaped_is_bool": true,
+     "extents_unknown_window": "BadWindow",
+     "extents_words": 0,
+     "present": true,
+     "rectangles_bad_kind": "BadValue",
+     "rectangles_bounding": "Reply",
+     "rectangles_unknown_window": "BadWindow",
+     "version_words": 0
+    }
+   }
+  },
+  "text.imagetext": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "imagetext16": "Ok",
+     "imagetext8": "Ok",
+     "imagetext8_unknown_drawable": "BadDrawable",
+     "imagetext8_unknown_gc": "BadGC",
+     "polytext8": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "imagetext16": "Ok",
+     "imagetext8": "Ok",
+     "imagetext8_unknown_drawable": "BadDrawable",
+     "imagetext8_unknown_gc": "BadGC",
+     "polytext8": "Ok"
+    }
+   }
+  },
+  "tree.root": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "parent_is_none": true,
+     "root_is_self": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "parent_is_none": true,
+     "root_is_self": true
+    }
+   }
+  },
+  "window.attribute_enums": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "backing_store_illegal": "BadValue",
+     "backing_store_legal": "Ok",
+     "bit_gravity_illegal": "BadValue",
+     "bit_gravity_legal": "Ok",
+     "win_gravity_illegal": "BadValue",
+     "win_gravity_legal": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "backing_store_illegal": "BadValue",
+     "backing_store_legal": "Ok",
+     "bit_gravity_illegal": "BadValue",
+     "bit_gravity_legal": "Ok",
+     "win_gravity_illegal": "BadValue",
+     "win_gravity_legal": "Ok"
+    }
+   }
+  },
+  "window.attributes": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "backing_store_is_enum": true,
+     "bit_gravity": 1,
+     "class": 1,
+     "map_state_unmapped": true,
+     "override_redirect": 1,
+     "win_gravity": 1,
+     "your_event_mask": 163840
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "backing_store_is_enum": true,
+     "bit_gravity": 1,
+     "class": 1,
+     "map_state_unmapped": true,
+     "override_redirect": 1,
+     "win_gravity": 1,
+     "your_event_mask": 163840
+    }
+   }
+  },
+  "window.configure": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "after": {
+      "border": 5,
+      "depth": 24,
+      "h": 70,
+      "w": 60,
+      "x": 11,
+      "y": 12
+     },
+     "before": {
+      "border": 3,
+      "depth": 24,
+      "h": 40,
+      "w": 30,
+      "x": 1,
+      "y": 2
+     }
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "after": {
+      "border": 5,
+      "depth": 24,
+      "h": 70,
+      "w": 60,
+      "x": 11,
+      "y": 12
+     },
+     "before": {
+      "border": 3,
+      "depth": 24,
+      "h": 40,
+      "w": 30,
+      "x": 1,
+      "y": 2
+     }
+    }
+   }
+  },
+  "window.stacking_modes": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "bad_mode": "BadValue",
+     "circulate": "Ok",
+     "circulate_bad_direction": "BadValue",
+     "mode0": "Ok",
+     "mode1": "Ok",
+     "mode2": "Ok",
+     "mode3": "Ok",
+     "mode4": "Ok",
+     "sibling_not_a_sibling": "BadMatch",
+     "with_sibling": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "bad_mode": "BadValue",
+     "circulate": "Ok",
+     "circulate_bad_direction": "BadValue",
+     "mode0": "Ok",
+     "mode1": "Ok",
+     "mode2": "Ok",
+     "mode3": "Ok",
+     "mode4": "Ok",
+     "sibling_not_a_sibling": "BadMatch",
+     "with_sibling": "Ok"
+    }
+   }
+  },
+  "window.translate": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "same_screen": 1,
+     "x": 8,
+     "y": 11
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "same_screen": 1,
+     "x": 8,
+     "y": 11
+    }
+   }
+  },
+  "window.tree_restack": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "after_lower": [
+      0,
+      1,
+      2
+     ],
+     "after_raise": [
+      1,
+      2,
+      0
+     ],
+     "initial_order": [
+      0,
+      1,
+      2
+     ]
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "after_lower": [
+      0,
+      1,
+      2
+     ],
+     "after_raise": [
+      1,
+      2,
+      0
+     ],
+     "initial_order": [
+      0,
+      1,
+      2
+     ]
+    }
+   }
+  },
+  "xfixes.select_selection_input": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "present": true,
+     "subscribe": "Ok",
+     "subscribe_all_masks": "Ok",
+     "subscribe_on_root": "Ok",
+     "undefined_mask_bit": "BadValue",
+     "unknown_window": "BadWindow",
+     "unsubscribe_zero_mask": "Ok"
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "present": true,
+     "subscribe": "Ok",
+     "subscribe_all_masks": "Ok",
+     "subscribe_on_root": "Ok",
+     "undefined_mask_bit": "BadValue",
+     "unknown_window": "BadWindow",
+     "unsubscribe_zero_mask": "Ok"
+    }
+   }
+  },
+  "xfixes.selection_notify": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "notify_arrived": true,
+     "present": true,
+     "reports_new_owner": true,
+     "reports_selection": true,
+     "reports_watcher_window": true,
+     "subtype_is_set_owner": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "notify_arrived": true,
+     "present": true,
+     "reports_new_owner": true,
+     "reports_selection": true,
+     "reports_watcher_window": true,
+     "subtype_is_set_owner": true
+    }
+   }
+  },
+  "xfixes.version": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "capped_not_raised": true,
+     "major_at_least_1": true,
+     "minor_sane": true,
+     "present": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "capped_not_raised": true,
+     "major_at_least_1": true,
+     "minor_sane": true,
+     "present": true
+    }
+   }
+  },
+  "xinput.version": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "at_least_2_0": true,
+     "major": 2,
+     "present": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "at_least_2_0": true,
+     "major": 2,
+     "present": true
+    }
+   }
+  },
+  "xkb.shape": {
+   "delta": [],
+   "reference": {
+    "ok": true,
+    "value": {
+     "GetMap(truncated)": "BadLength",
+     "GetMap(well-formed)": "Reply",
+     "present": true,
+     "supported": true
+    }
+   },
+   "status": "SAME",
+   "strict": true,
+   "target": {
+    "ok": true,
+    "value": {
+     "GetMap(truncated)": "BadLength",
+     "GetMap(well-formed)": "Reply",
+     "present": true,
+     "supported": true
+    }
+   }
+  }
+ },
+ "reference": ":7",
+ "target": ":1",
+ "when": 1791278299.5672379
+}

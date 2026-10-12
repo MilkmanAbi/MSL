@@ -1,0 +1,1603 @@
+{
+ "when": "2026-09-29 11:30:33",
+ "level": 2,
+ "seed": 1,
+ "results": [
+  {
+   "id": "draw.fill-basic",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "draw.fill-offscreen-edges",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "draw.fill-multi-rect-order",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "draw.clip-rectangles",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "draw.clip-origin-moves",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "draw.xor-involution",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "draw.copyarea-self-overlap",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "draw.putimage-getimage-roundtrip",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "draw.getimage-subrect",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "draw.draw-flood-100k-rects",
+   "status": "PASS",
+   "detail": "",
+   "ms": 38,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "draw.poly-lines-and-points",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "draw.huge-pixmap-fill-readback",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.map-bad-window",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.destroy-bad-window",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.geometry-bad-drawable",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.query-tree-bad-window",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.property-on-bad-window",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.get-property-bad-window",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.atom-name-zero",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.atom-name-huge",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.free-bad-pixmap",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.free-bad-gc",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.draw-with-bad-gc",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.draw-on-bad-drawable",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.close-bad-font",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.free-bad-cursor",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.free-bad-colormap",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.pixmap-depth-7",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.pixmap-zero-size",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.window-zero-size",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.window-bad-class",
+   "status": "PASS",
+   "detail": "",
+   "ms": 0,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.window-bad-parent",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.pixmap-huge",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.id-outside-range",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.id-reused",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.id-reused-across-types",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.destroy-twice",
+   "status": "PASS",
+   "detail": "",
+   "ms": 4,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.copy-area-depth-mismatch",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.reparent-into-own-child",
+   "status": "PASS",
+   "detail": "",
+   "ms": 8,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.reparent-into-self",
+   "status": "PASS",
+   "detail": "",
+   "ms": 6,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.draw-on-input-only",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.get-image-outside",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.property-bad-format",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.property-bad-mode",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.gc-bad-function",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "errors.error-storm-then-reply",
+   "status": "PASS",
+   "detail": "",
+   "ms": 99,
+   "metrics": {
+    "errors_received": [
+     10000,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "errors.foreign-ids-always-answered",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.map-notify-and-expose",
+   "status": "PASS",
+   "detail": "",
+   "ms": 7,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.child-expose-on-map",
+   "status": "PASS",
+   "detail": "",
+   "ms": 29,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.configure-notify-both-masks",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.destroy-notify-inferiors-first",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1006,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.unmap-and-reparent-notify",
+   "status": "PASS",
+   "detail": "",
+   "ms": 14,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.property-notify-new-and-deleted",
+   "status": "PASS",
+   "detail": "",
+   "ms": 510,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.property-notify-zero-length-append",
+   "status": "PASS",
+   "detail": "",
+   "ms": 11,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.get-property-delete-notifies",
+   "status": "PASS",
+   "detail": "",
+   "ms": 5,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.event-sequence-number",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.property-notify-flood-in-order",
+   "status": "PASS",
+   "detail": "",
+   "ms": 63,
+   "metrics": {
+    "events": [
+     5000,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "events.cross-client-property-watch",
+   "status": "PASS",
+   "detail": "",
+   "ms": 508,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.selection-round-trip",
+   "status": "PASS",
+   "detail": "",
+   "ms": 26,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.selection-clear-on-steal",
+   "status": "PASS",
+   "detail": "",
+   "ms": 7,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.selection-owner-gone-on-disconnect",
+   "status": "PASS",
+   "detail": "",
+   "ms": 4,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.convert-unowned-selection",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.sendevent-empty-mask-goes-to-creator",
+   "status": "PASS",
+   "detail": "",
+   "ms": 506,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "events.sendevent-mask-to-selectors",
+   "status": "PASS",
+   "detail": "",
+   "ms": 517,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.list-matches-query",
+   "status": "PASS",
+   "detail": "",
+   "ms": 6,
+   "metrics": {
+    "listed": [
+     11,
+     ""
+    ]
+   },
+   "notes": [
+    "toolkits also probe, not provided: SYNC, Composite, DAMAGE, MIT-SHM, Generic Event Extension, DRI3, Present, XINERAMA, DOUBLE-BUFFER"
+   ]
+  },
+  {
+   "id": "ext.query-unknown-and-case",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.big-requests-maximum",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {
+    "max_words": [
+     4000000,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "ext.xkb-use-extension",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.xkb-detectable-autorepeat",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.xkb-get-map-has-keysyms",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.xkb-get-names-and-state",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.xi1-version-and-devices",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.xi2-version-negotiation",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.xi2-query-device-masters",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.xi2-select-get-roundtrip",
+   "status": "PASS",
+   "detail": "",
+   "ms": 4,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.randr-version-and-resources",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.randr-monitors",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.randr-select-input-notifies",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.shape-version-and-roundtrip",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.shape-query-extents",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.xrender-depth-probe",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.xlib-sees-render",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {
+    "version": [
+     "0.0",
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "ext.render-formats-toolkits-need",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.render-query-filters",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.render-cursor-freed-by-core",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.xtest-get-version",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "ext.every-minor-answers-or-errors",
+   "status": "PASS",
+   "detail": "",
+   "ms": 5,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "fuzz.core-2k",
+   "status": "PASS",
+   "detail": "",
+   "ms": 171,
+   "metrics": {
+    "requests": [
+     2000,
+     ""
+    ],
+    "seed": [
+     1001,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "glx.advertised",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "glx.query-version",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "glx.server-strings",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "glx.visual-configs",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "glx.fbconfigs",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {
+    "fbconfigs": [
+     24,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "glx.context-direct-flag-round-trips",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "glx.create-context-attribs-arb",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "glx.pbuffer-is-a-real-drawable",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "glx.stale-context-errors",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "glx.every-minor-answers",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "replay.featherpad",
+   "status": "PASS",
+   "detail": "",
+   "ms": 583,
+   "metrics": {
+    "requests": [
+     452,
+     ""
+    ],
+    "seconds": [
+     0.56,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.firefox-esr",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1801,
+   "metrics": {
+    "requests": [
+     821,
+     ""
+    ],
+    "seconds": [
+     1.77,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.gimp",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1341,
+   "metrics": {
+    "requests": [
+     410,
+     ""
+    ],
+    "seconds": [
+     1.31,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.glxtest",
+   "status": "PASS",
+   "detail": "",
+   "ms": 130,
+   "metrics": {
+    "requests": [
+     14,
+     ""
+    ],
+    "seconds": [
+     0.1,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.gnome-chess",
+   "status": "PASS",
+   "detail": "",
+   "ms": 719,
+   "metrics": {
+    "requests": [
+     647,
+     ""
+    ],
+    "seconds": [
+     0.7,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.idle-tk",
+   "status": "PASS",
+   "detail": "",
+   "ms": 619,
+   "metrics": {
+    "requests": [
+     1647,
+     ""
+    ],
+    "seconds": [
+     0.59,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.krita",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1121,
+   "metrics": {
+    "requests": [
+     1616,
+     ""
+    ],
+    "seconds": [
+     1.09,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.mousepad",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1407,
+   "metrics": {
+    "requests": [
+     537,
+     ""
+    ],
+    "seconds": [
+     1.38,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.nautilus",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1539,
+   "metrics": {
+    "requests": [
+     1808,
+     ""
+    ],
+    "seconds": [
+     1.51,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.qalculate-qt",
+   "status": "PASS",
+   "detail": "",
+   "ms": 628,
+   "metrics": {
+    "requests": [
+     652,
+     ""
+    ],
+    "seconds": [
+     0.6,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.sylpheed",
+   "status": "PASS",
+   "detail": "",
+   "ms": 808,
+   "metrics": {
+    "requests": [
+     1735,
+     ""
+    ],
+    "seconds": [
+     0.79,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.xcalc",
+   "status": "PASS",
+   "detail": "",
+   "ms": 279,
+   "metrics": {
+    "requests": [
+     550,
+     ""
+    ],
+    "seconds": [
+     0.24,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.xeyes",
+   "status": "PASS",
+   "detail": "",
+   "ms": 570,
+   "metrics": {
+    "requests": [
+     2595,
+     ""
+    ],
+    "seconds": [
+     0.52,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.xlogo",
+   "status": "PASS",
+   "detail": "",
+   "ms": 174,
+   "metrics": {
+    "requests": [
+     59,
+     ""
+    ],
+    "seconds": [
+     0.13,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.xterm",
+   "status": "PASS",
+   "detail": "",
+   "ms": 199,
+   "metrics": {
+    "requests": [
+     566,
+     ""
+    ],
+    "seconds": [
+     0.17,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "replay.xzgv",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1589,
+   "metrics": {
+    "requests": [
+     1472,
+     ""
+    ],
+    "seconds": [
+     1.57,
+     "s"
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "toolkit.font-open-query-fixed",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.font-text-extents",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.font-xlfd-names",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.font-any-name-opens",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.list-fonts-patterns",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {
+    "fonts": [
+     1000,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "toolkit.list-fonts-with-info-terminates",
+   "status": "PASS",
+   "detail": "",
+   "ms": 0,
+   "metrics": {
+    "fonts": [
+     0,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "toolkit.glyph-cursor-from-cursor-font",
+   "status": "PASS",
+   "detail": "",
+   "ms": 0,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.image-text8-box",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.poly-text8-no-background",
+   "status": "PASS",
+   "detail": "",
+   "ms": 4,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.text-clipped-to-gc",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.copy-plane-bitmap",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.bitmap-getimage-roundtrip",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.fill-stippled",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.fill-opaque-stippled",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.fill-tiled",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.thin-line-endpoints",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.poly-rectangle-outline",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.poly-point-and-segment",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.fill-poly-half-open",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.fill-arc-circle",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.named-colors",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.alloc-color-truecolor",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.core-keymap-sanity",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.no-operation-with-length",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.grab-server-pairs",
+   "status": "PASS",
+   "detail": "",
+   "ms": 6,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "toolkit.clear-area-exposes",
+   "status": "PASS",
+   "detail": "",
+   "ms": 6,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "windows.deep-nesting-1000",
+   "status": "PASS",
+   "detail": "",
+   "ms": 70,
+   "metrics": {
+    "destroy_1000_deep_ms": [
+     3.283,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "windows.wide-5000-siblings",
+   "status": "PASS",
+   "detail": "",
+   "ms": 244,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "windows.restack-order",
+   "status": "PASS",
+   "detail": "",
+   "ms": 62,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "windows.reparent-storm",
+   "status": "PASS",
+   "detail": "",
+   "ms": 57,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "windows.map-unmap-storm",
+   "status": "PASS",
+   "detail": "",
+   "ms": 198,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "windows.configure-extremes",
+   "status": "PASS",
+   "detail": "",
+   "ms": 13,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "windows.destroy-subtree-5000",
+   "status": "PASS",
+   "detail": "",
+   "ms": 115,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "windows.toplevel-storm-100",
+   "status": "PASS",
+   "detail": "",
+   "ms": 463,
+   "metrics": {
+    "ms": [
+     461.075,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "windows.toplevel-resize-thrash",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1088,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "windows.properties-flood",
+   "status": "PASS",
+   "detail": "",
+   "ms": 205,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.request-over-maximum",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "windows.property-append-10000",
+   "status": "PASS",
+   "detail": "",
+   "ms": 40,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.setup-lsb",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.setup-msb",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.setup-byte-by-byte",
+   "status": "PASS",
+   "detail": "",
+   "ms": 277,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.setup-bad-byte-order",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.setup-wrong-version",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.setup-with-auth",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.trailing-junk",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.too-short",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.length-one-for-bodied-requests",
+   "status": "PASS",
+   "detail": "",
+   "ms": 6,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.unknown-core-opcodes",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.unknown-extension-majors",
+   "status": "PASS",
+   "detail": "",
+   "ms": 14,
+   "metrics": {
+    "extensions": [
+     11,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "wire.extension-bad-minors",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.sequence-wraparound",
+   "status": "PASS",
+   "detail": "",
+   "ms": 28,
+   "metrics": {
+    "noop_per_s": [
+     2497517.379,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "wire.pipelined-replies",
+   "status": "PASS",
+   "detail": "",
+   "ms": 31,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.slow-loris-request",
+   "status": "PASS",
+   "detail": "",
+   "ms": 88,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.coalesced-writes",
+   "status": "PASS",
+   "detail": "",
+   "ms": 3,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.disconnect-mid-request",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.disconnect-with-pending-replies",
+   "status": "PASS",
+   "detail": "",
+   "ms": 2,
+   "metrics": {},
+   "notes": []
+  },
+  {
+   "id": "wire.big-request-4mb",
+   "status": "PASS",
+   "detail": "",
+   "ms": 12,
+   "metrics": {
+    "MB_per_s": [
+     381.346,
+     ""
+    ]
+   },
+   "notes": []
+  },
+  {
+   "id": "wire.big-request-length-lies",
+   "status": "PASS",
+   "detail": "",
+   "ms": 1,
+   "metrics": {},
+   "notes": []
+  }
+ ]
+}

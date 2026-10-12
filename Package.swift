@@ -11,6 +11,7 @@ let package = Package(
     // with nothing MSL-specific about it.
     products: [
         .library(name: "MSLCore", targets: ["MSLCore"]),
+        .library(name: "PublicMSL", targets: ["PublicMSL"]),
         .executable(name: "msl", targets: ["msl"]),
         .executable(name: "mslhd", targets: ["mslhd"]),
         .executable(name: "bootstrap-guest", targets: ["bootstrap-guest"]),
@@ -20,6 +21,7 @@ let package = Package(
         .executable(name: "provision-disk-image", targets: ["provision-disk-image"]),
         .executable(name: "bootstrap-distro", targets: ["bootstrap-distro"]),
         .executable(name: "MSLApp", targets: ["MSLApp"]),
+        .executable(name: "MSLPeripherals", targets: ["MSLPeripherals"]),
         .executable(name: "mslgui", targets: ["mslgui"]),
         .executable(name: "msl-applauncher", targets: ["msl-applauncher"]),
     ],
@@ -44,12 +46,25 @@ let package = Package(
             ]
         ),
         .testTarget(name: "MSLCoreTests", dependencies: ["MSLCore"]),
-        .executableTarget(name: "msl", dependencies: ["MSLCore"]),
-        .executableTarget(name: "mslhd", dependencies: ["MSLCore"]),
+        .testTarget(name: "PublicMSLTests", dependencies: ["PublicMSL", "MSLCore"]),
+        // Renders the app's own views offscreen, so a card that crashes or
+        // lays out to nothing is caught by `swift test` rather than by
+        // someone opening the panel after it ships.
+        .testTarget(name: "MSLAppTests", dependencies: ["MSLApp", "MSLCore"]),
+        .executableTarget(name: "msl", dependencies: ["MSLCore", "PublicMSL"]),
+        .executableTarget(name: "mslhd", dependencies: ["MSLCore", "PublicMSL"]),
         .executableTarget(name: "bootstrap-guest", dependencies: ["MSLCore"]),
+        // Renders the in-app guide as a static site. Reads the same
+        // `HelpGuide` the app does, so the published site cannot drift.
+        .executableTarget(name: "help-export", dependencies: ["MSLCore"]),
         .executableTarget(name: "extract-guest-modules", dependencies: ["MSLCore"]),
         .executableTarget(name: "build-shellinit", dependencies: ["MSLCore"]),
         .executableTarget(name: "msl-usbd", dependencies: ["MSLCore"], exclude: ["README.md"]),
+        // Reaching an instance from outside this Mac. Its own module rather
+        // than more of MSLCore: it is the one part of MSL that deliberately
+        // opens a machine to the internet, and that deserves a boundary
+        // somebody can read in one sitting.
+        .target(name: "PublicMSL", dependencies: ["MSLCore"]),
         .executableTarget(name: "provision-disk-image", dependencies: ["MSLCore"]),
         .executableTarget(name: "bootstrap-distro", dependencies: ["MSLCore"]),
         // A SwiftUI `App`/`@main` target builds fine as a plain SPM
@@ -62,7 +77,8 @@ let package = Package(
         // MSLApp.entitlements`).
         .executableTarget(
             name: "MSLApp",
-            dependencies: ["MSLCore", .product(name: "SwiftTerm", package: "SwiftTerm")],
+            dependencies: ["MSLCore", "PublicMSL",
+                           .product(name: "SwiftTerm", package: "SwiftTerm")],
             // `.process`, not `.copy`: it flattens the files into the
             // bundle root, so `Bundle.module.url(forResource:)` finds them
             // by bare name with no `subdirectory:`. A `.copy("Resources")`
@@ -74,6 +90,8 @@ let package = Package(
                 .process("Resources/Abi_Logo-Light.png"),
                 .process("Resources/Abi_Logo-Dark.png"),
                 .process("Resources/Mascot.png"),
+                .process("Resources/Welcome_Banner.jpg"),
+                .process("Resources/Crash_Screen.png"),
                 .process("Resources/License.md"),
             ]
         ),
@@ -82,5 +100,11 @@ let package = Package(
         // appear as itself rather than all of them sharing `mslhd`'s.
         .executableTarget(name: "mslgui", dependencies: ["MSLCore"]),
         .executableTarget(name: "msl-applauncher", dependencies: ["MSLCore"]),
+        // MSL Peripherals: the small app that lends the Mac's camera and
+        // microphone to a Linux instance. Separate from MSLApp because
+        // macOS grants those to an *application*, with a bundle and a usage
+        // description - never to `mslhd`, which is a bare daemon and should
+        // not be able to hold a camera even in principle.
+        .executableTarget(name: "MSLPeripherals", dependencies: ["MSLCore"]),
     ]
 )

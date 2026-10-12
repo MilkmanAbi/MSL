@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/MilkmanAbi/MSL/main/Assets/App_Logo.png" width="148" alt="The MSL melon">
+  <img src="https://raw.githubusercontent.com/Pseudonymous-Nano/MSL-Pseudo/main/Assets/App_Logo.png" width="148" alt="The MSL melon">
 </p>
 
 <h1 align="center">MSL</h1>
@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/MilkmanAbi/MSL?label=release&color=e8735a"></a>
+  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Pseudonymous-Nano/MSL-Pseudo?label=release&color=e8735a"></a>
   <img alt="macOS 14 or later" src="https://img.shields.io/badge/macOS-14%2B-555555">
   <img alt="Apple silicon" src="https://img.shields.io/badge/Apple%20silicon-arm64-555555">
   <img alt="12 distributions" src="https://img.shields.io/badge/distros-12-4c9a6a">
@@ -27,10 +27,6 @@
 </p>
 
 <br>
-
-> MSL is completely free software, it has no funding, and the prebuilt images for it are hosted on SourceForge... It is painfully slow. I apologise for that.
-
-> The Ubuntu image has a SLEW of issues, so many deps needed. It's kinda annoying, sorry.
 
 MSL runs real Linux distributions on your Mac: an actual Linux kernel and an actual Linux userland on Apple's own Virtualization framework, with nothing emulated and no virtual machine window to babysit. You type `msl` and you're in. Your home folder is already there. Linux apps show up in the Dock, in Spotlight and in ⌘-Tab like they always lived there. ✨
 
@@ -121,7 +117,7 @@ It has Finder's four views, Finder's sidebar and Finder's keyboard shortcuts, ri
 
 Along the way it turned out that SwiftUI's own table never delivers a double-click, so the list view is laid out by hand. It is a genuinely silly amount of effort to rebuild something every Mac already ships with, and it's one of the parts of MSL I'm fondest of. ( ˶ˆ ᗜ ˆ˵ )
 
-MSL Files is also available as [a standalone app](https://github.com/MilkmanAbi/MSL-Files).
+MSL Files is also available as [a standalone app](https://github.com/Pseudonymous-Nano/MSL-Files-Pseudo).
 
 <a id="mslgd"></a>
 
@@ -150,7 +146,7 @@ A few things it turns out you have to know when you write one of these:
 
 GTK 3 and 4 apps, Qt apps like Krita, GIMP, LibreOffice, galculator and xeyes all run as Mac windows. It's still the most experimental part of MSL: some apps draw imperfectly, there's no OpenGL, and copy and paste doesn't cross between apps yet. mslgd is the part MSL exists to attempt, rather than a finished claim about how well it does it. Would I do it again? Yes, and I think that's the problem. ( ͡° ᴥ ͡°)
 
-mslgd is also available as [a standalone Swift package](https://github.com/MilkmanAbi/mslgd).
+mslgd is also available as [a standalone Swift package](https://github.com/Pseudonymous-Nano/mslgd-Pseudo).
 
 ## Getting started
 
@@ -201,7 +197,7 @@ Installing a newer package over an older one keeps every instance, image and set
 | openSUSE Leap | 16.0 | 124 MB |
 | Nix | on Debian 13 | 203 MB |
 
-Every image ships with MSL's guest services, git, curl, wget, gcc, make, nano, zsh and sudo, and no usable passwords until you create your own account. Arch here is Arch Linux ARM, since Arch itself has no arm64 port, and Nix is the Nix package manager on Debian rather than NixOS. Want something else? The [MSL Image Builder](https://github.com/MilkmanAbi/msl-image-builder) makes custom images from any arm64 container, built to the same standard.
+Every image ships with MSL's guest services, git, curl, wget, gcc, make, nano, zsh and sudo, and no usable passwords until you create your own account. Arch here is Arch Linux ARM, since Arch itself has no arm64 port, and Nix is the Nix package manager on Debian rather than NixOS. Want something else? The [MSL Image Builder](https://github.com/Pseudonymous-Nano/msl-image-builder-Pseudo) makes custom images from any arm64 container, built to the same standard.
 
 ## Where things stand
 
@@ -222,17 +218,17 @@ This is **MSL 1.0.0**.
 | Project | What it is |
 |---|---|
 | **MSL** | This repository: the app, the `msl` command, the background service and the guest services. |
-| [**mslgd**](https://github.com/MilkmanAbi/mslgd) | The X11 server, as a standalone Swift package. |
-| [**MSL Files**](https://github.com/MilkmanAbi/MSL-Files) | The file browser, as a standalone app. |
-| [**MSL Image Builder**](https://github.com/MilkmanAbi/msl-image-builder) | A friendly terminal app for building your own Linux images for MSL. |
-| [**MSL experiments**](https://github.com/MilkmanAbi/msl-experiments) | The code behind Experimental Features, for reference. |
+| [**mslgd**](https://github.com/Pseudonymous-Nano/mslgd-Pseudo) | The X11 server, as a standalone Swift package. |
+| [**MSL Files**](https://github.com/Pseudonymous-Nano/MSL-Files-Pseudo) | The file browser, as a standalone app. |
+| [**MSL Image Builder**](https://github.com/Pseudonymous-Nano/msl-image-builder-Pseudo) | A friendly terminal app for building your own Linux images for MSL. |
+| [**MSL experiments**](https://github.com/Pseudonymous-Nano/msl-experiments-Pseudo) | The code behind Experimental Features, for reference. |
 | [**msl-files on SourceForge**](https://sourceforge.net/projects/msl-files/files/) | Where the distribution images are published. |
 
 ## Contributing
 
 Bug reports, ideas and pull requests are all welcome, and so is simply telling me what you think in the [community feedback form](https://docs.google.com/forms/d/e/1FAIpQLScJm6KavA6mDJE9ntoH2YPvlsSoEJZaissnvr_b4gG68b3ixA/viewform?usp=dialog). A good bug report says which Mac and macOS version you're on, which distro, what you expected and what happened, and includes what `msl doctor` prints. Logs live in `~/Library/Logs/MSL`.
 
-Please read the [Code of Conduct](CODE_OF_CONDUCT.md) before joining in. Everyone who has helped is in [CONTRIBUTORS.md](CONTRIBUTORS.md), and if you're pointing an AI coding agent at the repository, [AGENTS.md](AGENTS.md) is written for it (It's made in case anyone wants to explore this project with Agents, considers how... messy it can get?).
+Please read the [Code of Conduct](CODE_OF_CONDUCT.md) before joining in. Everyone who has helped is in [CONTRIBUTORS.md](CONTRIBUTORS.md), and if you're pointing an AI coding agent at the repository, [AGENTS.md](AGENTS.md) is written for it.
 
 <a id="licence"></a>
 
@@ -240,14 +236,14 @@ Please read the [Code of Conduct](CODE_OF_CONDUCT.md) before joining in. Everyon
 
 MSL uses two licences, on purpose.
 
-- **mslgd**, the X11 server, is under the **GNU General Public License v3**, along with anything derived from it. It lives in `Sources/MSLCore/X11`, `Sources/MSLCore/X11InputGate.swift`, `Sources/mslgui` and `Guest/init/x11tunnel.c`. It's the hard, stubborn part, and I kinda want it to stay free: use it, change it, ship it, and if you ship changes, share their source. mslgd is nothing compared to the likes of Xquartz etc, yes, but it still took a lot of engineering effort.
+- **mslgd**, the X11 server, is under the **GNU General Public License v3**, along with anything derived from it. It lives in `Sources/MSLCore/X11`, `Sources/MSLCore/X11InputGate.swift`, `Sources/mslgui` and `Guest/init/x11tunnel.c`. It's the hard, stubborn part, and it should stay free: use it, change it, ship it, and if you ship changes, share their source.
 - **Everything else** is under the **MIT License**: the app, the `msl` command, the background service, MSL Files, the guest services and all of the virtual machine plumbing. Take it and build whatever you like.
 
 MSL.app and the programs built from this repository include mslgd, so those builds, taken as a whole, are distributed under the GPL v3. The distribution images MSL downloads keep their own upstream licences. The full texts are in [LICENSE](LICENSE) and [LICENSE-MIT](LICENSE-MIT).
 
 ## Thanks
 
-<img src="https://raw.githubusercontent.com/MilkmanAbi/MSL/main/Assets/Mascot.png" width="120" align="right" alt="MSL's mascot, a small knight holding the docs">
+<img src="https://raw.githubusercontent.com/Pseudonymous-Nano/MSL-Pseudo/main/Assets/Mascot.png" width="120" align="right" alt="MSL's mascot, a small knight holding the docs">
 
 - **neekocat_2025**, who drew the little guy on the right. He carries the docs around and looks concerned about the kernel panics. Same. ( ˘•ω•˘ )
 - **[SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)** by Miguel de Icaza, the terminal inside the app.
@@ -259,8 +255,8 @@ MSL.app and the programs built from this repository include mslgd, so those buil
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/MilkmanAbi/MSL/main/Assets/Abi_Logo-Dark.png">
-    <img src="https://raw.githubusercontent.com/MilkmanAbi/MSL/main/Assets/Abi_Logo-Light.png" width="120" alt="Abi">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Pseudonymous-Nano/MSL-Pseudo/main/Assets/Abi_Logo-Dark.png">
+    <img src="https://raw.githubusercontent.com/Pseudonymous-Nano/MSL-Pseudo/main/Assets/Abi_Logo-Light.png" width="120" alt="Abi">
   </picture>
   <br>
   Made with care, stubbornness and a lot of getting it wrong first. ♡

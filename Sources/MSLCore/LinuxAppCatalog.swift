@@ -42,6 +42,35 @@ public struct LinuxApp: Identifiable, Codable, Hashable {
     public var qualifiedName: String {
         source == .system ? name : "\(name) (\(source.label))"
     }
+
+    /// The path that marks MSL's own built-in entry. Not a real file: no
+    /// `.desktop` on any guest has this path, so nothing scanned can collide
+    /// with it and `id` stays stable across instances.
+    public static let mslFilesPath = "msl-builtin:files"
+
+    /// Whether this is MSL Files' own tile rather than something scanned.
+    public var isMSLFiles: Bool { desktopPath == Self.mslFilesPath }
+
+    /// MSL Files, offered in every instance's Applications list.
+    ///
+    /// **It is built in, not scanned.** The kit's `msl-files.desktop` is
+    /// marked `X-MSL-Internal` and skipped by the scan on purpose: letting it
+    /// through would offer "Add to Launchpad", which generates a macOS bundle
+    /// called MSL Files that shadows the real app. This entry is the same
+    /// idea done deliberately - it opens, and that is all it does.
+    ///
+    /// Opening runs the kit's `msl-open dir` with no folder, which means "my
+    /// Linux home" - so the tile lands in *this* instance's home. It is an
+    /// ordinary guest command, so a stopped instance starts first, exactly as
+    /// it would for any other app here.
+    public static func mslFiles() -> LinuxApp {
+        LinuxApp(
+            desktopPath: mslFilesPath,
+            name: "MSL Files",
+            command: "$HOME/\(GuestIntegration.directory)/bin/msl-open dir",
+            comment: "Browse this instance's files, and your Mac's, in MSL Files",
+            source: .system)
+    }
 }
 
 /// Scans an instance for its installed GUI applications, pulls their icons
@@ -52,6 +81,18 @@ public struct LinuxApp: Identifiable, Codable, Hashable {
 /// absurd. So a scan is an explicit, visible action, and its results
 /// persist in `MSLPaths.appCatalogDirectory(instance:)` until the next one.
 public enum LinuxAppCatalog {
+    /// Throws away everything MSL scanned for `instance`: the app list, the
+    /// icons pulled out of the guest, and the generated macOS apps.
+    ///
+    /// Called when an instance is removed. Without it the catalog outlives
+    /// the instance, and the next instance with that name is handed the old
+    /// one's applications - which is how a fresh Debian instance came up
+    /// listing an Alpine instance's Flatpaks.
+    public static func forget(instance: String) {
+        try? FileManager.default.removeItem(at: MSLPaths.appCatalogDirectory(instance: instance))
+        try? LinuxAppBundle.removeAll(instance: instance)
+    }
+
     /// Byte cap while scanning. Small on purpose: this runs for every app
     /// at once, and a vector icon - which is what the scorer prefers
     /// anyway - is usually a few kilobytes.

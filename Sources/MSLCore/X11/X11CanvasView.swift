@@ -32,6 +32,14 @@ final class X11CanvasView: NSView, X11Drawable {
     private(set) var pixelHeight: Int
 
     weak var eventSink: X11EventSink?
+    /// Text-input state (see `X11CanvasView+TextInput.swift`).
+    var markedText: String?
+    /// Keys whose keyDown became text; their keyUp must not reach X either.
+    var textRoutedKeys: Set<UInt16> = []
+    /// The key event being run through the input context, and whether the
+    /// input method handed it back as a plain key.
+    var routingKeyEvent: NSEvent?
+    var routedKeyWentRaw = false
     /// The window ID this view is drawing for - threaded through to
     /// `eventSink` calls so the connection knows which X window a mouse
     /// event actually landed on without a reverse NSView->id lookup.
@@ -65,27 +73,103 @@ final class X11CanvasView: NSView, X11Drawable {
         }
     }
 
-    init(width: Int, height: Int) {
+    /// The window's SHAPE bounding region as rectangles, in this view's
+    /// own X11 pixels (`X11Connection.handleShapeRectangles`). Drawn as a
+    /// mask - through `shapeMask`, the path already measured the right way
+    /// up - so the window, and every child in it, shows only inside the
+    /// region. `nil` removes it. Main thread only.
+    var shapeRects: [CGRect]? {
+        didSet { refreshShapeMaskFromRects() }
+    }
+
+    /// SHAPE's input region (`nil` = same as the bounding shape).
+    var inputShapeRects: [CGRect]?
+
+    private func refreshShapeMaskFromRects() {
+        guard let rects = shapeRects else {
+            shapeMask = nil
+            return
+        }
+        let bytes = X11ShapeRegion.maskRGBA(rects, width: pixelWidth, height: pixelHeight)
+        guard let provider = CGDataProvider(data: Data(bytes) as CFData),
+              let image = CGImage(width: pixelWidth, height: pixelHeight, bitsPerComponent: 8, bitsPerPixel: 32,
+                                  bytesPerRow: pixelWidth * 4, space: x11DeviceRGB,
+                                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                                  provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        else { return }
+        shapeMask = image
+    }
+
+    /// Clicks outside a window's shape belong to whatever is beneath it -
+    /// for a GTK3 popover drawn over a shaped native child, that is the
+    /// parent window the popover lives in. Returning nil here is exactly
+    /// "not me" to AppKit, which then tries the next view down.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if shapeRects != nil || inputShapeRects != nil {
+            let local = convert(point, from: superview)
+            if let rects = shapeRects, !X11ShapeRegion.contains(rects, local) { return nil }
+            if let rects = inputShapeRects, !X11ShapeRegion.contains(rects, local) { return nil }
+        }
+        return super.hitTest(point)
+    }
+
+    /// `context` lets the caller build the backing bitmap **off the main
+    /// thread**, which matters more than it sounds: `handleCreateWindow`
+    /// creates this inside a `DispatchQueue.main.sync` barrier, and an
+    /// Xt/Motif/Tk app makes one X window per *widget* - measured
+    /// 2026-09-23, xcalc issues **69** `CreateWindow` requests against
+    /// Mousepad's **4**. Every allocation left on main is 69 allocations
+    /// behind whatever drawing was already queued there.
+    ///
+    /// `background` is filled ONCE. This used to fill white here and then
+    /// get filled again by the caller with the real background pixel -
+    /// two full passes over the same buffer, per window, inside that same
+    /// barrier.
+    init(width: Int, height: Int, context: CGContext? = nil, background: UInt32? = nil) {
         pixelWidth = max(1, width)
         pixelHeight = max(1, height)
-        bitmapContext = makeFlippedBitmapContext(width: pixelWidth, height: pixelHeight)
+        bitmapContext = context ?? makeFlippedBitmapContext(width: pixelWidth, height: pixelHeight)
         super.init(frame: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
-        // Starts solid white, like a freshly-mapped X window's usual
+        // Solid, not transparent, like a freshly-mapped X window's usual
         // background - a blank/transparent canvas looked broken live (an
         // app that never explicitly clears its window before drawing
         // showed the desktop wallpaper through it instead).
-        bitmapContext.setFillColor(x11Color(red: 1, green: 1, blue: 1))
+        let rgb = background ?? 0x00FF_FFFF
+        bitmapContext.setFillColor(x11Color(red: CGFloat((rgb >> 16) & 0xFF) / 255,
+                                            green: CGFloat((rgb >> 8) & 0xFF) / 255,
+                                            blue: CGFloat(rgb & 0xFF) / 255))
         bitmapContext.fill(CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
     }
 
     required init?(coder: NSCoder) { fatalError("X11CanvasView does not support NSCoding") }
 
-    func resize(width: Int, height: Int) {
+    /// Resizes the backing bitmap.
+    ///
+    /// `preserveContent` is the window's **bit-gravity**, and the default
+    /// in X11 is `Forget`: on a resize the contents become *undefined* and
+    /// the server exposes the whole window. This server instead preserved
+    /// the old pixels at top-left, in a bitmap it never discards, which is
+    /// the architectural reason stale content reappears here where a real
+    /// server shows background - and why a client told its contents are
+    /// `Forget` does not repaint them.
+    ///
+    /// **The caller must expose the whole window after a resize that does
+    /// not preserve.** Otherwise the window is cleared with nothing
+    /// telling the client to paint it, and it simply goes blank. The
+    /// reference (`miext/rootless`'s `FinishFrameResize`) damages the
+    /// entire new area for exactly this reason.
+    func resize(width: Int, height: Int, preserveContent: Bool = true, background: UInt32? = nil) {
         guard width > 0, height > 0, width != pixelWidth || height != pixelHeight else { return }
         let newContext = makeFlippedBitmapContext(width: width, height: height)
-        newContext.setFillColor(x11Color(red: 1, green: 1, blue: 1))
+        if let background {
+            newContext.setFillColor(x11Color(red: CGFloat((background >> 16) & 0xFF) / 255,
+                                             green: CGFloat((background >> 8) & 0xFF) / 255,
+                                             blue: CGFloat(background & 0xFF) / 255))
+        } else {
+            newContext.setFillColor(x11Color(red: 1, green: 1, blue: 1))
+        }
         newContext.fill(CGRect(x: 0, y: 0, width: width, height: height))
-        if let image = bitmapContext.makeImage() {
+        if preserveContent, let image = bitmapContext.makeImage() {
             // See `drawImageTopLeftOriented`'s doc comment - a plain
             // `draw(image, in:)` here would flip the window's existing
             // content vertically on every resize (same root cause as the
@@ -98,8 +182,36 @@ final class X11CanvasView: NSView, X11Drawable {
         bitmapContext = newContext
         pixelWidth = width
         pixelHeight = height
-        setFrameSize(NSSize(width: width, height: height))
+        setFrameSize(NSSize(width: CGFloat(width) * displayScale, height: CGFloat(height) * displayScale))
+        // A shape is in window pixels and does not grow with the window;
+        // the mask image does, so it is rebuilt at the new size.
+        if shapeRects != nil { refreshShapeMaskFromRects() }
+        else if let mask = layer?.mask { mask.frame = bounds }
         needsDisplay = true
+    }
+
+    /// Points per X11 pixel for this view's own frame - Native Scaling
+    /// (`X11DisplayScale`). Only a TOP-LEVEL window's canvas is ever
+    /// scaled: its bounds stay in X11 pixels while its frame is `pixels x
+    /// displayScale`, so AppKit scales both the drawing and every mouse
+    /// coordinate (`convert(_:from:)` answers in bounds), and each child
+    /// window - a subview laid out in those bounds - needs nothing at all.
+    /// A canvas reparented into another window goes back to 1.
+    var displayScale: CGFloat = 1 {
+        didSet {
+            guard displayScale != oldValue else { return }
+            setFrameSize(NSSize(width: CGFloat(pixelWidth) * displayScale,
+                                height: CGFloat(pixelHeight) * displayScale))
+        }
+    }
+
+    /// Keeps the bounds in X11 pixels whatever size AppKit gives the frame
+    /// - including when the window is resized by hand, which sets the
+    /// content view's frame directly. At a scale of 1 this is the identity
+    /// and changes nothing.
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        setBoundsSize(NSSize(width: newSize.width / displayScale, height: newSize.height / displayScale))
     }
 
     /// `NSView.isFlipped` only affects AppKit's OWN graphics-context setup
@@ -115,6 +227,8 @@ final class X11CanvasView: NSView, X11Drawable {
     override var isFlipped: Bool { true }
 
     override func draw(_ dirtyRect: NSRect) {
+        let perfStart = X11Perf.enabled ? DispatchTime.now().uptimeNanoseconds : 0
+        defer { if X11Perf.enabled { X11Perf.frame(nanos: DispatchTime.now().uptimeNanoseconds - perfStart) } }
         guard let image = bitmapContext.makeImage(),
               let cgContext = NSGraphicsContext.current?.cgContext else { return }
         // `NSGraphicsContext.current`'s CGContext, inside a flipped
@@ -130,23 +244,48 @@ final class X11CanvasView: NSView, X11Drawable {
         // ambient flip for just this blit so the two cancel back to
         // exactly the one flip `bitmapContext` itself wanted.
         cgContext.saveGState()
+        // Composite only what AppKit asked for. The blit used to cover the
+        // whole window however small the damage was, so the cost of a
+        // partial update scaled with the window's area rather than with
+        // what changed. Clipping rather than cropping the image keeps the
+        // flip arithmetic below exactly as it was - this is the one place
+        // in this file where getting that wrong shows every pixel upside
+        // down, and it is not worth re-deriving for a saving CoreGraphics
+        // already gives for free behind a clip.
+        cgContext.clip(to: dirtyRect)
+        // Native Scaling draws X11 pixels at a fraction of a point, which
+        // is not a whole number of physical pixels; the default filter
+        // shimmers on text at that ratio.
+        if displayScale != 1 { cgContext.interpolationQuality = .high }
         cgContext.translateBy(x: 0, y: CGFloat(pixelHeight))
         cgContext.scaleBy(x: 1, y: -1)
         cgContext.draw(image, in: CGRect(x: 0, y: 0, width: pixelWidth, height: pixelHeight))
         cgContext.restoreGState()
     }
 
-    func notifyChanged() {
-        setNeedsDisplayFromAnyThread()
+    func notifyChanged(damage: CGRect? = nil) {
+        X11Perf.notified()
+        setNeedsDisplayFromAnyThread(damage)
         X11Snapshot.dump(windowID: windowID, context: bitmapContext)
     }
 
-    func setNeedsDisplayFromAnyThread() {
-        if Thread.isMainThread {
-            needsDisplay = true
-        } else {
-            DispatchQueue.main.async { [weak self] in self?.needsDisplay = true }
+    func setNeedsDisplayFromAnyThread(_ damage: CGRect? = nil) {
+        // This view is `isFlipped`, so its coordinates are top-left origin
+        // - the same space X11 uses. A damage rect therefore needs no
+        // conversion, only clamping to the view in case a client drew
+        // partly outside it.
+        let mark = { [weak self] in
+            guard let self else { return }
+            if let damage {
+                let clamped = damage.intersection(self.bounds)
+                if !clamped.isNull, !clamped.isEmpty {
+                    self.setNeedsDisplay(clamped)
+                    return
+                }
+            }
+            self.needsDisplay = true
         }
+        if Thread.isMainThread { mark() } else { DispatchQueue.main.async(execute: mark) }
     }
 
     // MARK: - Input (mouse + keyboard - see X11Keyboard for the real
@@ -176,9 +315,19 @@ final class X11CanvasView: NSView, X11Drawable {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         for area in trackingAreas { removeTrackingArea(area) }
+        // `.activeInActiveApp`, not `.activeInKeyWindow`: with the latter
+        // AppKit synthesises `mouseExited` the instant this window stops
+        // being key and `mouseEntered` when it is key again - pointer
+        // unmoved. A popup (tooltip, Firefox's tab preview) takes key when
+        // mapped, so the main window got LeaveNotify, the app hid the popup
+        // as "no longer hovered", key came back, EnterNotify, popup shown
+        // again: ~40 map/unmap cycles a second and the whole window
+        // flickering. In X11 crossing depends only on where the pointer
+        // is, never on focus. Each Linux app is its own macOS process, so
+        // "active app" is exactly this app's windows.
         addTrackingArea(NSTrackingArea(
             rect: bounds,
-            options: [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect],
+            options: [.activeInActiveApp, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect],
             owner: self, userInfo: nil
         ))
     }
@@ -284,59 +433,17 @@ final class X11CanvasView: NSView, X11Drawable {
     override func otherMouseDragged(with event: NSEvent) { eventSink?.mouseMoved(event, in: self) }
     override func mouseMoved(with event: NSEvent) { eventSink?.mouseMoved(event, in: self) }
 
-    /// Scroll wheel. X11 has no scroll event: the core protocol expresses
-    /// a wheel notch as a press+release pair on button 4 (up), 5 (down),
-    /// 6 (left) or 7 (right), and that is still how GTK and Qt read
-    /// scrolling under XInput2 as well (`XI_ButtonPress` with `detail` 4-7)
-    /// whenever the server advertises no smooth-scroll valuator classes -
-    /// which this server deliberately does not, see
-    /// `handleXIQueryDevice`'s doc comment on the GDK
-    /// `_gdk_x11_device_xi2_add_scroll_valuator` assertion that advertising
-    /// them triggered.
-    ///
-    /// This view had NO `scrollWheel` override at all, so scrolling was
-    /// entirely non-functional in every app - no document scrolling, no
-    /// list scrolling, no canvas zoom.
-    ///
-    /// A trackpad reports many small `hasPreciseScrollingDeltas` events
-    /// rather than discrete notches, so deltas are accumulated here and
-    /// only emitted once a notch's worth has built up; a real wheel
-    /// (non-precise) already reports whole notches and passes straight
-    /// through.
-    private var scrollAccumX: CGFloat = 0
-    private var scrollAccumY: CGFloat = 0
-    override func scrollWheel(with event: NSEvent) {
-        let notch: CGFloat = 10 // points of precise scrolling per emitted button click
-        var dx = event.scrollingDeltaX
-        var dy = event.scrollingDeltaY
-        // Cap the per-event burst: a fast flick can otherwise synthesize
-        // hundreds of button pairs in one go and swamp the client.
-        let maxClicks: CGFloat = 8
-        if event.hasPreciseScrollingDeltas {
-            scrollAccumX += dx
-            scrollAccumY += dy
-            // Clamp BEFORE draining the accumulator, so a burst that hits
-            // the cap leaves its excess in the accumulator for the next
-            // event instead of silently losing that scroll distance.
-            dx = min(max((scrollAccumX / notch).rounded(.towardZero), -maxClicks), maxClicks)
-            dy = min(max((scrollAccumY / notch).rounded(.towardZero), -maxClicks), maxClicks)
-            scrollAccumX -= dx * notch
-            scrollAccumY -= dy * notch
-        } else {
-            dx = min(max(dx, -maxClicks), maxClicks)
-            dy = min(max(dy, -maxClicks), maxClicks)
-        }
-        func emit(_ button: UInt8, times: Int) {
-            for _ in 0..<times {
-                eventSink?.mouseButton(event, in: self, pressed: true, button: button)
-                eventSink?.mouseButton(event, in: self, pressed: false, button: button)
-            }
-        }
-        // AppKit's positive `scrollingDeltaY` means the content moves down,
-        // i.e. the user scrolled UP - X11 button 4.
-        if dy > 0 { emit(4, times: Int(dy)) } else if dy < 0 { emit(5, times: Int(-dy)) }
-        if dx > 0 { emit(6, times: Int(dx)) } else if dx < 0 { emit(7, times: Int(-dx)) }
-    }
+    /// Wheel and trackpad scrolling, translated in `X11Connection.scrollWheel`
+    /// into XI 2.1 smooth-scroll valuator motion plus legacy button 4-7
+    /// clicks (see `X11ScrollTranslator`). This view used to do the
+    /// translation itself, as button clicks only, truncating each wheel
+    /// event's fractional delta - slow wheel ticks did nothing.
+    override func scrollWheel(with event: NSEvent) { eventSink?.scrollWheel(event, in: self) }
+
+    /// Trackpad pinch and rotation - XI 2.4 gestures, or Ctrl+scroll for
+    /// clients that don't take them (see `X11Connection.magnify`).
+    override func magnify(with event: NSEvent) { eventSink?.magnify(event, in: self) }
+    override func rotate(with event: NSEvent) { eventSink?.rotate(event, in: self) }
 
     /// Without these two overrides, the `.mouseEnteredAndExited` tracking
     /// area set up in `updateTrackingAreas` above fires into AppKit's
@@ -349,8 +456,14 @@ final class X11CanvasView: NSView, X11Drawable {
     override func mouseEntered(with event: NSEvent) { eventSink?.mouseCrossing(event, in: self, entered: true) }
     override func mouseExited(with event: NSEvent) { eventSink?.mouseCrossing(event, in: self, entered: false) }
 
-    override func keyDown(with event: NSEvent) { eventSink?.keyEvent(event, in: self, pressed: true) }
-    override func keyUp(with event: NSEvent) { eventSink?.keyEvent(event, in: self, pressed: false) }
+    override func keyDown(with event: NSEvent) {
+        if routeAsText(event) { return }
+        eventSink?.keyEvent(event, in: self, pressed: true)
+    }
+    override func keyUp(with event: NSEvent) {
+        if textRoutedKeys.remove(event.keyCode) != nil { return }
+        eventSink?.keyEvent(event, in: self, pressed: false)
+    }
 
     /// Command-key events, which AppKit never delivers to `keyDown`/`keyUp`
     /// reliably - see `X11KeyboardRouter`.
@@ -371,8 +484,13 @@ final class X11CanvasView: NSView, X11Drawable {
 /// events.
 protocol X11EventSink: AnyObject {
     func mouseButton(_ event: NSEvent, in view: X11CanvasView, pressed: Bool, button: UInt8)
+    func scrollWheel(_ event: NSEvent, in view: X11CanvasView)
+    func magnify(_ event: NSEvent, in view: X11CanvasView)
+    func rotate(_ event: NSEvent, in view: X11CanvasView)
     func mouseMoved(_ event: NSEvent, in view: X11CanvasView)
     func mouseCrossing(_ event: NSEvent, in view: X11CanvasView, entered: Bool)
     func keyEvent(_ event: NSEvent, in view: X11CanvasView, pressed: Bool)
     func modifierFlagsChanged(_ event: NSEvent, in view: X11CanvasView)
+    /// Text with no key behind it (emoji picker, dictation, input methods).
+    func insertText(_ text: String, in view: X11CanvasView)
 }

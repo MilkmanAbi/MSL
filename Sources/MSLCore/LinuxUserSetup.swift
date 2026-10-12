@@ -21,10 +21,10 @@ public enum LinuxUserSetup {
 
     public static func registry() -> DefaultUserRegistry { DefaultUserRegistry(path: registryURL) }
 
-    /// Keyed by distro, not instance: instances of a distro share one disk,
-    /// and so one `/etc/passwd`.
-    public static func defaultUser(for distro: GuestDistro) -> String? {
-        registry().defaultUser(for: distro)
+    /// Keyed by instance: each one has its own disk, and so its own
+    /// `/etc/passwd` (`InstanceDisk`).
+    public static func defaultUser(forInstance instance: String) -> String? {
+        registry().defaultUser(forInstance: instance)
     }
 
     // MARK: - Rules
@@ -157,6 +157,32 @@ public enum LinuxUserSetup {
         fi
         mv "$pending" /etc/sudoers.d/10-msl-admins
 
+        # `~/Mac` for the account just created.
+        #
+        # **Done here rather than left to /etc/skel.** That is what it
+        # depended on before, and on Alpine it could never work: Alpine
+        # ships **no /etc/skel at all**, so `GuestHomeLinks`' loop skips it
+        # (`[ -d "$home" ] || continue`) and nothing was ever copied into a
+        # new account's home. Measured in a live Alpine guest: /root and
+        # /home/msl both had the link - they existed when the start-time
+        # task ran - and /etc/skel did not exist, so the account created
+        # afterwards got nothing. Reported as "the Mac folder appears under
+        # the msl user, not for the user that's created", which is exactly
+        # that.
+        #
+        # Creating it here does not depend on skel existing, on the start
+        # task having run, or on the order of the two.
+        #
+        # Same rules as `GuestHomeLinks`: never replace something already
+        # there, chown to the account so `HomeOwnership`'s scan does not
+        # count it as wrongly owned, and say nothing if the share is not
+        # mounted.
+        home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+        [ -n "${home:-}" ] || home="/home/$user"
+        if [ -d \#(GuestPathMapper.macHomeMountPoint) ] && [ -d "$home" ]            && [ ! -e "$home/\#(GuestHomeLinks.linkName)" ]            && [ ! -L "$home/\#(GuestHomeLinks.linkName)" ]; then
+            ln -s \#(GuestPathMapper.macHomeMountPoint) "$home/\#(GuestHomeLinks.linkName)" 2>/dev/null               && chown -h "$user" "$home/\#(GuestHomeLinks.linkName)" 2>/dev/null || true
+        fi
+
         command -v sudo >/dev/null 2>&1 || exit 4
         echo "created $user, in the $group group"
         """#
@@ -200,7 +226,7 @@ public enum LinuxUserSetup {
                 instance: instance, distro: distro, command: script(username: username, password: password))
             let result = outcome(exitCode: code, output: output, username: username)
             if case .created = result {
-                try? registry().setDefaultUser(username, for: distro)
+                try? registry().setDefaultUser(username, forInstance: instance)
             }
             return result
         } catch {

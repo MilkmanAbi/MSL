@@ -38,7 +38,11 @@ final class TerminalSession: NSObject, ObservableObject, LocalProcessTerminalVie
         guard exitCode != nil || !hasStarted else { return }
         exitCode = nil
         hasStarted = true
-        view.startProcess(executable: MSLPaths.tool("msl").path, args: [instance])
+        // TERM_PROGRAM=MSL: `msl` tells the guest this terminal does
+        // colour and Unicode (see `TerminalProfile`).
+        view.startProcess(executable: MSLPaths.tool("msl").path, args: [instance],
+                          environment: Terminal.getEnvironmentVariables(termName: "xterm-256color")
+                              + ["TERM_PROGRAM=MSL"])
     }
 
     /// Ends the session. The shell gets a `SIGHUP`, the same signal a real
@@ -111,10 +115,50 @@ struct TerminalTab: View {
     private var session: TerminalSession { sessions.session(for: instance.name) }
 
     var body: some View {
-        TerminalContent(session: session, instance: instance)
-            // Keyed by instance so SwiftUI rebuilds the wrapper - but not
-            // the session - when the selection changes.
-            .id(instance.name)
+        Group {
+            if let why = MSLAPGate.reason("system.terminal", instance: instance.name) {
+                TerminalRefused(instance: instance, reason: why)
+            } else {
+                TerminalContent(session: session, instance: instance)
+            }
+        }
+        // Keyed by instance so SwiftUI rebuilds the wrapper - but not
+        // the session - when the selection changes.
+        .id(instance.name)
+    }
+}
+
+/// What the Terminal tab shows when a policy denies `system.terminal`.
+///
+/// **Says what this is worth, because it is the weakest tier MSLAP has.**
+/// The tab runs `msl <instance>` in a pseudo-terminal, and nothing here
+/// stops anyone running that same command in Terminal.app, or opening a
+/// shell over SSH. Claiming otherwise would be the exact dishonesty the
+/// `enforced` flag exists to prevent, so the refusal names the two routes
+/// that do close a guest shell properly instead of implying this one did.
+private struct TerminalRefused: View {
+    let instance: Instance
+    let reason: String
+
+    var body: some View {
+        VStack(spacing: Design.Spacing.medium) {
+            Image(systemName: "lock")
+                .font(.system(size: 34))
+                .foregroundStyle(.secondary)
+            Text("The terminal is turned off here")
+                .font(.headline)
+            Text(reason)
+                .font(.callout).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Text("This hides MSL's own terminal tab. It does not stop `msl \(instance.name)` "
+                 + "in Terminal.app or a shell over SSH - an administrator who means to close "
+                 + "those denies system.ssh and locks the instance.")
+                .font(.caption).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 420)
+        }
+        .padding(Design.Spacing.large)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -142,6 +186,11 @@ private struct TerminalContent: View {
             // which counts against the concurrent-VM cap - if the daemon
             // refuses, `msl` prints its reason into this very terminal, so
             // the refusal explains itself where the user is looking.
+            // Checked again here, not just in the wrapper above: this is
+            // the call that actually spawns `msl`, and a view that renders
+            // for a moment before a policy loads must not leave a shell
+            // behind it.
+            guard MSLAPGate.allows("system.terminal", instance: instance.name) else { return }
             if !session.hasStarted { session.start() }
         }
         .toolbar {

@@ -7,7 +7,7 @@ extension HelpChapter {
         id: "troubleshooting", title: "Troubleshooting", symbol: "cross.case", tint: .watermelon,
         blurb: "Symptoms first, then what to do — and where to look when that isn't enough.",
         articles: [.troubleWontStart, .troubleService, .troubleApps, .troubleSSH, .troubleDisk, .troubleFilesystem,
-                   .troubleClock, .troubleMaintenance, .troubleMemory, .logsAndDoctor, .reclaimSpace])
+                   .troubleClock, .troubleMaintenance, .troubleMemory, .troubleNetwork, .logsAndDoctor, .reclaimSpace])
 }
 
 extension HelpArticle {
@@ -355,5 +355,79 @@ extension HelpArticle {
         > A dynamic disk grows as Linux writes, but deleting files inside Linux doesn't hand the space back to your Mac.
         > **Clear caches inside Linux** makes room *inside* the instance, not on your Mac. The only way to get that space
         > back is to delete the image and start fresh.
+        """#)
+
+    static let troubleNetwork = HelpArticle(
+        id: "trouble-network", title: "Linux has no internet", symbol: "wifi.slash",
+        summary: "Working out where the connection stops: the gate, the guest, DNS, or your Mac.",
+        keywords: ["internet", "network", "offline", "dns", "ping", "resolve", "connection", "apt", "download",
+                   "no route", "temporary failure"],
+        related: ["sandbox-gates", "trouble-ssh", "traffic-monitor", "trouble-clock"],
+        body: #"""
+        Work down this list. Each step rules out one layer, and the first one that fails is the answer.
+
+        ## 1. Is the network gate open? {#gate}
+
+        The Sandbox tab's **Network** gate detaches the virtual network card. It is kept across restarts, so an
+        instance you sealed last week is still sealed.
+
+        This is by far the most common cause, and it looks exactly like a broken connection: no internet, no
+        local network, SSH not answering. Note that `msl` shells, the Terminal tab and MSL Files keep working
+        with it closed, because they do not use the network — so "the terminal works but nothing downloads" points
+        straight here.
+
+        ## 2. Does the guest have an address? {#address}
+
+        In the instance:
+
+        ```
+        ip addr
+        ip route
+        ```
+
+        You want an address on the main interface and a default route. If there is no address, ask for one:
+
+        ```
+        sudo dhclient -v
+        ```
+
+        ## 3. Can it reach anything by number? {#ping}
+
+        ```
+        ping -c 3 1.1.1.1
+        ```
+
+        Working here but not by name means DNS, which is the next step. Failing here with the gate open points
+        at your Mac's own connection — check that the Mac itself is online.
+
+        ## 4. Can it resolve names? {#dns}
+
+        ```
+        getent hosts deb.debian.org
+        cat /etc/resolv.conf
+        ```
+
+        "Temporary failure in name resolution" from `apt` is almost always this. `/etc/resolv.conf` should name a
+        resolver; if it is empty or points somewhere unreachable, that is the fault.
+
+        ## 5. Is the clock right? {#clock}
+
+        A clock that is badly wrong breaks anything using certificates, which looks like a network problem:
+        downloads fail, `apt` complains that release files are not valid yet. See [The clock is
+        wrong](help:trouble-clock).
+
+        ## What each symptom usually means {#symptoms}
+
+        | Symptom | Usually |
+        |---|---|
+        | Terminal works, nothing downloads | The Network gate is closed |
+        | `ping 1.1.1.1` works, names do not | DNS |
+        | Everything fails, the Mac is also offline | Your Mac's connection |
+        | `apt` says release files are not valid yet | The clock |
+        | SSH refused but shells work | The Network gate, or SSH is not running |
+
+        > [!NOTE] Watching it live
+        > The Traffic Monitor's **Guest connections** lane shows what Linux itself has open, read from Linux's own
+        > network stack. It is the quickest way to see whether an app is even trying to connect.
         """#)
 }

@@ -92,12 +92,36 @@ final class FileIconCache {
 struct FileIcon: View {
     let item: MSLFileItem
     var size: CGFloat = 16
+    /// Set when the folder area is tinted: folders are drawn in the theme's
+    /// muted colour instead of the system's blue.
+    @Environment(\.filesFolderTint) private var folderTint
 
     var body: some View {
-        Image(nsImage: FileIconCache.shared.icon(for: item))
+        if let folderTint, item.isBrowsableDirectory {
+            ThemedFolderGlyph(tint: folderTint, size: size)
+        } else {
+            Image(nsImage: FileIconCache.shared.icon(for: item))
+                .resizable()
+                .interpolation(.high)
+                .aspectRatio(contentMode: .fit)
+                .frame(width: size, height: size)
+        }
+    }
+}
+
+/// A folder in the theme's colour, for the tinted folder area. An SF Symbol
+/// rather than the system folder recoloured: the system icon's own blue can't
+/// be shifted to an arbitrary hue without looking muddy.
+struct ThemedFolderGlyph: View {
+    let tint: Color
+    let size: CGFloat
+
+    var body: some View {
+        Image(systemName: "folder.fill")
             .resizable()
-            .interpolation(.high)
             .aspectRatio(contentMode: .fit)
+            .foregroundStyle(tint.gradient)
             .frame(width: size, height: size)
+            .padding(size > 32 ? size * 0.06 : 0)
     }
 }

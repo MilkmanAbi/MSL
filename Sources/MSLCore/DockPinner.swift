@@ -48,6 +48,32 @@ public enum DockPinner {
         apply(url, pinned: false)
     }
 
+    /// Unpins every tile whose bundle lives under `directory`, in **one**
+    /// write and **one** Dock restart.
+    ///
+    /// Needed because `unpin` restarts the Dock per call, and an instance
+    /// can have a dozen pinned apps - unpinning them one at a time would
+    /// blink the Dock and the wallpaper a dozen times for one action. Used
+    /// when an instance is renamed or removed, where its generated bundles
+    /// are about to stop existing: a pin pointing at a deleted bundle
+    /// shows as a "?" tile that the person then has to drag off by hand.
+    ///
+    /// Returns how many tiles went.
+    @discardableResult
+    public static func unpinAll(under directory: URL) -> Int {
+        let prefix = standardized(directory) + "/"
+        let current = entries()
+        // `path(of:)` is optional - a `persistent-apps` entry may be a
+        // folder or a spacer with no file at all - and anything without a
+        // path is certainly not one of ours, so it stays.
+        let updated = current.filter { !(path(of: $0)?.hasPrefix(prefix) ?? false) }
+        let removed = current.count - updated.count
+        // No tiles of ours: nothing to write, and - more to the point - no
+        // reason to restart the Dock.
+        guard removed > 0 else { return 0 }
+        return write(updated) ? removed : 0
+    }
+
     /// Brings the Dock to the requested state for `url`.
     ///
     /// **Exactly one Dock restart per call.** There is no API to add a tile

@@ -61,6 +61,10 @@ struct SandboxTab: View {
                 }
             }
 
+            PrivacyCard(instance: instance)
+
+            VPNCard(instance: instance)
+
             if !policy.isOpen { sealedNote }
         }
         .task(id: instance.name) { model.refreshSandbox(instance) }

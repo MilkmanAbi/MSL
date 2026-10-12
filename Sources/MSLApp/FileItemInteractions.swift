@@ -15,6 +15,8 @@ struct FileItemInteractions: ViewModifier {
     /// What a single click does. Column view overrides it to navigate;
     /// every other mode leaves it nil and gets Finder's selection rules.
     var onSingleTap: (() -> Void)?
+    /// See `FileClickLayer.dragHandleWidth`.
+    var dragHandleWidth: CGFloat? = nil
 
     @State private var dropTargeted = false
 
@@ -22,31 +24,50 @@ struct FileItemInteractions: ViewModifier {
         content
             .contentShape(Rectangle())
             .background(dropHighlight)
-            .onTapGesture(count: 2) { files.open(item) }
-            .modifier(SingleTap(action: onSingleTap ?? {
-                // Read the modifiers at the moment of the click: SwiftUI's
-                // tap gesture does not carry them, and Finder's ⌘ and ⇧
-                // behaviour is most of what makes multi-selection usable.
-                files.handleTap(on: item, modifiers: NSEvent.modifierFlags)
-            }))
+            // Every left click - select, open, drag - goes through this one
+            // AppKit layer; see `FileClickLayer` for why there must be exactly
+            // one. Right-clicks pass through it to the context menu below.
+            .overlay(
+                FileClickLayer(
+                    path: item.path,
+                    isSelected: { files.selection.contains(item.path) },
+                    onSelect: { modifiers in
+                        if let onSingleTap { onSingleTap() }
+                        else { files.handleTap(on: item, modifiers: modifiers) }
+                    },
+                    onOpen: {
+                        // In column view the first click already descended into
+                        // a folder; opening it again would push it twice.
+                        if onSingleTap != nil, item.isBrowsableDirectory { return }
+                        files.open(item)
+                    },
+                    dragItems: { dragPayload },
+                    enabled: files.renaming != item.path,
+                    dragHandleWidth: dragHandleWidth))
             .contextMenu { menu }
-            // Dragging out hands over the real file URL, so a drop into
-            // Finder, Mail, or the other root is an ordinary file copy that
-            // needs no cooperation from this app.
-            .draggable(URL(fileURLWithPath: item.path)) {
-                HStack(spacing: 6) {
-                    FileIcon(item: item, size: 16)
-                    Text(item.name).lineLimit(1)
-                }
-                .padding(4)
+            // Dropping onto a folder puts the files inside it.
+            .fileDropTarget(targeted: $dropTargeted) {
+                // Decided at drop time rather than when the row was built: a
+                // folder can stop being writable while it is on screen.
+                item.isBrowsableDirectory && files.canWrite ? item.path : nil
+            } receive: { urls, destination in
+                files.receive(urls, into: destination)
             }
-            .modifier(FolderDropTarget(item: item, files: files, targeted: $dropTargeted))
+
+    }
+
+    /// What a drag starting on this item carries: the whole selection if the
+    /// item is part of it, otherwise just the item.
+    private var dragPayload: [MSLFileItem] {
+        guard files.selection.contains(item.path), files.selection.count > 1 else { return [item] }
+        let selected = files.visibleItems.filter { files.selection.contains($0.path) }
+        return selected.isEmpty ? [item] : selected
     }
 
     @ViewBuilder private var dropHighlight: some View {
         if dropTargeted {
             RoundedRectangle(cornerRadius: 5)
-                .fill(Color.accentColor.opacity(0.25))
+                .fill(files.theme.selection.opacity(0.25))
         }
     }
 
@@ -57,11 +78,14 @@ struct FileItemInteractions: ViewModifier {
         files.selection.contains(item.path) ? files.selection : [item.path]
     }
 
-    /// Finder's label: the name for one item, a count for several.
-    private var copyPathTitle: String {
+    /// Finder's label for the Mac path: the name for one item, a count for
+    /// several. ("Mac" rather than Finder's bare "Pathname" because the twin
+    /// item right below it copies the Linux path, and the pair has to read as
+    /// a pair.)
+    private var copyMacPathTitle: String {
         targets.count == 1
-            ? "Copy \u{201C}\(item.name)\u{201D} as Pathname"
-            : "Copy \(targets.count) Items as Pathnames"
+            ? "Copy \u{201C}\(item.name)\u{201D} as Mac Path"
+            : "Copy \(targets.count) Items as Mac Paths"
     }
 
     /// "Open Folder in MSL", which is only meaningful where the guest can
@@ -112,19 +136,57 @@ struct FileItemInteractions: ViewModifier {
         Button(item.isBrowsableDirectory ? "Open" : "Open with default app") {
             files.open(item)
         }
+        // The Finder-parity "Open With ▸" - every Mac app that can open this
+        // file, plus Other…. Works on a guest file because the row's path is a
+        // real mounted file the system can hand to any app.
+        OpenWithMenu(item: item, targets: targets)
         Button("Quick Look") {
-            files.quickLookTarget = QuickLookTarget(url: URL(fileURLWithPath: item.path))
+            files.quickLookTarget = QuickLookTarget(item: item)
         }
+        // No `.keyboardShortcut("i")` here: the File menu (`FilesCommands`)
+        // is the one authoritative ⌘I registration. A context menu is rebuilt
+        // per row, so attaching it here would register ⌘I once for every
+        // visible row - the same trap the Copy-as-Pathname item documents.
         Button("Get Info") { files.infoTarget = item }
-            .keyboardShortcut("i", modifiers: .command)
+        // Folders only: git is about a working tree, and a file's repository
+        // is its folder's. Offered on every folder rather than only on ones
+        // that are repositories, because finding out is the question - and
+        // for a folder that is not one, the panel offers to make it one.
+        if item.isBrowsableDirectory {
+            Button("Git…") {
+                files.gitTarget = GitPanelTarget(path: item.path, name: item.name)
+            }
+        }
+        if files.canEditAsText(item) {
+            Button("Edit as Text…") {
+                files.editorTarget = FileTextEditorTarget(url: URL(fileURLWithPath: item.path))
+            }
+        }
         Divider()
-        Button("Rename…") { files.renaming = item.path }
-            .disabled(!files.canWrite)
+        // One item renames inline; several open Power Rename - the batch
+        // find/replace + numbering sheet Finder never had.
+        if targets.count > 1 {
+            Button("Rename \(targets.count) Items…") { files.beginPowerRename(targets) }
+                .disabled(!files.canWrite)
+        } else {
+            Button("Rename…") { files.renaming = item.path }
+                .disabled(!files.canWrite)
+        }
         Button("Duplicate") { files.duplicate(targets) }
             .disabled(!files.canWrite)
         Button("Copy") { files.copyToPasteboard(targets) }
+        // The modern macOS share sheet: Mail, Messages, AirDrop, Reminders and
+        // any third-party service registered for these files - macOS's own
+        // "services for this selection", surfaced the supported way.
         ShareLink(items: targets.sorted().map { URL(fileURLWithPath: $0) }) {
             Text("Share…")
+        }
+        // The one Finder has no reason to offer: chmod +x on a Linux file,
+        // straight to the guest inode (a WebDAV permission change never
+        // reaches it). Shown only for a guest file that isn't already
+        // runnable - "I downloaded a script and it won't run."
+        if files.canMakeExecutable(targets) {
+            Button("Make Executable") { files.makeExecutable(targets) }
         }
         Divider()
         Menu("Tags") {
@@ -132,26 +194,38 @@ struct FileItemInteractions: ViewModifier {
                          applied: Set(item.tags.map(\.name)))
         }
         Divider()
-        // Finder's own wording and shortcut. It acts on `targets`, not on
-        // `item`: right-clicking inside a multiple selection used to copy
-        // three files with "Copy" and exactly one path with this one.
-        // No `.keyboardShortcut` here, deliberately - unlike "Get Info"
-        // above, which predates this. A context menu is rebuilt per row, so
-        // attaching one registers the same ⌥⌘C once for every visible row on
-        // top of the File menu's registration. The menu-bar item is the one
-        // authoritative registration; the cost is that this item shows no
-        // accelerator glyph next to it, where Finder does.
-        Button(copyPathTitle) { files.copyPaths(targets) }
+        // Two paths for the same file, because the file has two: the
+        // `/Volumes/127.0.0.1/...` the Mac sees, and the `/etc/...` the guest
+        // does. "Copy Linux Path" is the one Finder cannot offer, and the
+        // reason someone reaches for this browser over Finder for a guest
+        // file - it's the path your shell, a Dockerfile, or a config actually
+        // wants. It offers itself only when the row maps into a guest.
+        //
+        // No `.keyboardShortcut` on either: a context menu is rebuilt per row,
+        // so a shortcut here would register once for every visible row on top
+        // of the File menu's one authoritative ⌥⌘C. The menu bar owns them.
+        Button(copyMacPathTitle) { files.copyPaths(targets) }
+        if files.hasLinuxPath(targets) {
+            Button("Copy Linux Path") { files.copyLinuxPaths(targets) }
+        }
+
+        Divider()
+
+        Toggle("Show Hidden Files", isOn: Binding(
+            get: { files.showHidden },
+            set: { files.showHidden = $0 }))
+
         Button("Reveal in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting(targets.sorted().map {
                 URL(fileURLWithPath: $0)
             })
         }
         Divider()
-        // A shell on either side of the boundary, at this row's folder -
-        // the enclosing folder when the row is a file, as Finder's "New
-        // Terminal at Folder" does.
-        Button("Open in Terminal") { files.openInTerminal(item) }
+        // A shell on either side of the boundary, at this row's folder - the
+        // enclosing folder when the row is a file, as Finder's "New Terminal
+        // at Folder" does. On the Mac side it offers every terminal installed;
+        // on the Linux side it opens a shell in the guest that owns the file.
+        TerminalMenu(item: item, files: files)
         openInMSL
         Divider()
         Button("Move to Trash", role: .destructive) { files.delete(targets) }
@@ -159,39 +233,15 @@ struct FileItemInteractions: ViewModifier {
     }
 }
 
-/// Runs the mode's click behaviour.
-private struct SingleTap: ViewModifier {
-    let action: () -> Void
-
-    func body(content: Content) -> some View {
-        content.onTapGesture(perform: action)
-    }
-}
-
 /// Dropping onto a folder copies into *that* folder, not the one being
 /// viewed - which is what makes dragging into a subfolder work without
 /// opening it first.
-private struct FolderDropTarget: ViewModifier {
-    let item: MSLFileItem
-    @ObservedObject var files: FilesModel
-    @Binding var targeted: Bool
-
-    func body(content: Content) -> some View {
-        if item.isBrowsableDirectory, files.canWrite {
-            content.dropDestination(for: URL.self) { urls, _ in
-                files.receive(urls, into: item.path)
-                return true
-            } isTargeted: { targeted = $0 }
-        } else {
-            content
-        }
-    }
-}
-
 extension View {
     func fileItemInteractions(_ item: MSLFileItem, files: FilesModel,
-                              onSingleTap: (() -> Void)? = nil) -> some View {
-        modifier(FileItemInteractions(item: item, files: files, onSingleTap: onSingleTap))
+                              onSingleTap: (() -> Void)? = nil,
+                              dragHandleWidth: CGFloat? = nil) -> some View {
+        modifier(FileItemInteractions(item: item, files: files, onSingleTap: onSingleTap,
+                                      dragHandleWidth: dragHandleWidth))
     }
 }
 

@@ -77,12 +77,15 @@ public enum X11Opcode {
     public static let ungrabKeyboard: UInt8 = 32
     public static let grabKey: UInt8 = 33
     public static let ungrabKey: UInt8 = 34
+    public static let allowEvents: UInt8 = 35
+    public static let rotateProperties: UInt8 = 114
     public static let polyPoint: UInt8 = 64
     public static let reparentWindow: UInt8 = 7
     public static let setInputFocus: UInt8 = 42
     public static let changeGC: UInt8 = 56
     public static let clearArea: UInt8 = 61
     public static let copyArea: UInt8 = 62
+    public static let copyPlane: UInt8 = 63
     public static let polyFillRectangle: UInt8 = 70
     public static let putImage: UInt8 = 72
     public static let getImage: UInt8 = 73
@@ -151,6 +154,35 @@ public enum X11Opcode {
     /// to a non-rectangular shape - see `handleShapeRequest`'s doc
     /// comment for the concrete follow-up that would close that gap.
     public static let shapeExtension: UInt8 = 156
+
+    /// XTEST. Real clients discover this through `QueryExtension`, so the
+    /// number only has to be unique here and stable within a session.
+    ///
+    /// Worth having for a reason that is not app compatibility: XTEST
+    /// injects input **at the protocol level**, where it is deterministic.
+    /// Everything driving this project's UI testing so far has gone
+    /// through `CGEventPost`, which replays an activating click and - as
+    /// found on 2026-09-23 - can leave a modifier stuck in the window
+    /// server, silently turning every later keystroke into a chord and
+    /// looking exactly like an MSL bug.
+    public static let xtestExtension: UInt8 = 157
+
+    /// MIT-SCREEN-SAVER. Cheap to answer and several toolkits probe for
+    /// it at startup, taking a slower path (or polling) when it is absent.
+    /// There is no screen saver here - macOS owns that - so the honest
+    /// answer to every query is "disabled, nothing is blanked".
+    public static let screenSaverExtension: UInt8 = 158
+    /// GLX. Every classic OpenGL app queries this before it draws; mslgd
+    /// advertised nothing, so they refused to start. See `X11GLX.swift` -
+    /// the server does the setup half only, Mesa renders in the guest.
+    public static let glxExtension: UInt8 = 159
+
+    /// XFIXES. Wanted for one request in particular:
+    /// `XFixesSelectSelectionInput`, which is how GTK, Qt and every
+    /// clipboard manager learn that the clipboard changed. Without the
+    /// extension a toolkit either polls the selection on a timer or simply
+    /// never notices a copy it did not make itself.
+    public static let xfixesExtension: UInt8 = 160
 }
 
 /// Minor (request) opcodes within the XInput2 extension (see `X11Opcode.
@@ -173,6 +205,9 @@ public enum XIOpcode {
     /// gets a working XI2 handshake at all, no matter how correct the
     /// rest of the implementation is.
     public static let getExtensionVersion: UInt8 = 1
+    /// XInput 1.x `ListInputDevices` (minor 2). GTK2 sends it at startup
+    /// looking for tablets.
+    public static let listInputDevices: UInt8 = 2
     public static let queryPointer: UInt8 = 40
     public static let changeCursor: UInt8 = 42
     public static let getClientPointer: UInt8 = 45
@@ -212,6 +247,18 @@ public enum XIEventType {
     /// `XI_RawMotion`. xeyes selects it on the root window to follow the
     /// pointer anywhere on screen; see `X11PointerMonitor`.
     public static let rawMotion: UInt16 = 17
+    /// XI 2.4 touchpad gestures (XI2.h).
+    public static let gesturePinchBegin: UInt16 = 27
+    public static let gesturePinchUpdate: UInt16 = 28
+    public static let gesturePinchEnd: UInt16 = 29
+}
+
+/// XI2 event flags and class constants (XI2.h).
+public enum XIFlag {
+    /// On the emulated half of a scroll: the legacy button 4-7 events a
+    /// server derives from scroll-valuator motion.
+    public static let pointerEmulated: UInt32 = 1 << 16
+    public static let gesturePinchCancelled: UInt32 = 1 << 0
 }
 
 /// XI2 device-use values (`xXIDeviceInfo.use` / `xXIHierarchyInfo.use`).
@@ -234,6 +281,13 @@ public enum XIDeviceUse {
     public static let coreKeyboardID: UInt16 = 3
     public static let xtestPointerID: UInt16 = 4
     public static let xtestKeyboardID: UInt16 = 5
+    /// The Mac's pointing hardware as two slave pointers, the way Xorg shows
+    /// a mouse and a touchpad: scroll wheels (no precise deltas) are the
+    /// mouse, trackpads and the Magic Mouse the touchpad. Pointer events
+    /// carry one of these as `sourceid`; Qt and Chromium look up scroll and
+    /// gesture classes by the source, so the master id there found nothing.
+    public static let mslMouseID: UInt16 = 6
+    public static let mslTouchpadID: UInt16 = 7
 }
 
 /// Minor (request) opcodes within the XKEYBOARD extension - real values
@@ -320,6 +374,71 @@ public enum X11ExtensionBase {
     public static let xinputErrorCount = 5
     /// XKEYBOARD: `XkbNumberEvents` = 1.
     public static let xkbEventCount = 1
+    /// GLX: `__GLX_NUMBER_EVENTS` = 17 reserved, `__GLX_NUMBER_ERRORS` = 14
+    /// (glxproto.h). Neither event is ever generated here, but the bases
+    /// must not overlap anything already handed out (XKB's single event is
+    /// 92, XInput's errors end at 133).
+    public static let glxFirstEvent: UInt8 = 93
+    public static let glxEventCount = 17
+    public static let glxFirstError: UInt8 = 134
+    public static let glxErrorCount = 14
+    /// XFIXES: `XFixesNumberEvents` = 2 (`XFixesSelectionNotify`,
+    /// `XFixesCursorNotify`), `XFixesNumberErrors` = 1 (`BadRegion`).
+    /// Placed past GLX's reserved block, which ends at 109 for events and
+    /// 147 for errors - the bases must not overlap anything already handed
+    /// out or a client decodes someone else's event as its own.
+    /// RENDER: `BadPictFormat`, `BadPicture`, `BadPictOp`, `BadGlyphSet`,
+    /// `BadGlyph` - `RenderNumberErrors` = 5. mslgd advertised `0` here,
+    /// which is not a base but "no errors registered": it could not name a
+    /// single one of its own errors, so every bad Picture or PictFormat had
+    /// to be accepted or reported as something else entirely.
+    ///
+    /// 149 because everything below is taken: XInput's errors end at 133,
+    /// GLX's reserved block at 147, XFIXES at 148.
+    public static let renderFirstError: UInt8 = 149
+    public static let renderErrorCount = 5
+
+    public static let xfixesFirstEvent: UInt8 = 110
+    public static let xfixesEventCount = 2
+    public static let xfixesFirstError: UInt8 = 148
+    public static let xfixesErrorCount = 1
+}
+
+/// Minor (request) opcodes within XFIXES - real values from
+/// `<X11/extensions/xfixesproto.h>`. Only version 1.0's are listed,
+/// because 1.0 is what this server reports; see `handleXFixesRequest`.
+/// RENDER's own errors, as offsets from `X11ExtensionBase.renderFirstError`
+/// - real order from `<X11/extensions/renderproto.h>`.
+public enum X11RenderError {
+    public static var pictFormat: UInt8 { X11ExtensionBase.renderFirstError + 0 }
+    public static var picture: UInt8 { X11ExtensionBase.renderFirstError + 1 }
+    public static var pictOp: UInt8 { X11ExtensionBase.renderFirstError + 2 }
+    public static var glyphSet: UInt8 { X11ExtensionBase.renderFirstError + 3 }
+    public static var glyph: UInt8 { X11ExtensionBase.renderFirstError + 4 }
+}
+
+public enum X11XFixesOpcode {
+    public static let queryVersion: UInt8 = 0
+    public static let changeSaveSet: UInt8 = 1
+    public static let selectSelectionInput: UInt8 = 2
+    public static let selectCursorInput: UInt8 = 3
+    public static let getCursorImage: UInt8 = 4
+    /// The last request defined in XFIXES 1.0. Anything past this belongs
+    /// to a later version this server does not claim.
+    public static let lastInVersion1: UInt8 = 4
+}
+
+/// `XFixesSelectionNotify`'s `subtype`, and the event-mask bits a client
+/// passes to `XFixesSelectSelectionInput` to ask for each.
+public enum X11XFixesSelectionEvent {
+    public static let setSelectionOwner: UInt8 = 0
+    public static let selectionWindowDestroy: UInt8 = 1
+    public static let selectionClientClose: UInt8 = 2
+
+    public static let setSelectionOwnerMask: UInt32 = 1 << 0
+    public static let selectionWindowDestroyMask: UInt32 = 1 << 1
+    public static let selectionClientCloseMask: UInt32 = 1 << 2
+    public static let allMasks: UInt32 = 0b111
 }
 
 /// `xkbStateNotify`'s own `changed`-field bits (which parts of state
@@ -344,6 +463,7 @@ public enum XKBStateChange {
 public enum X11RenderOpcode {
     public static let queryVersion: UInt8 = 0
     public static let queryPictFormats: UInt8 = 1
+    public static let queryPictIndexValues: UInt8 = 2
     public static let createPicture: UInt8 = 4
     public static let changePicture: UInt8 = 5
     public static let setPictureClipRectangles: UInt8 = 6
@@ -351,6 +471,9 @@ public enum X11RenderOpcode {
     public static let composite: UInt8 = 8
     public static let trapezoids: UInt8 = 10
     public static let createGlyphSet: UInt8 = 17
+    /// `ReferenceGlyphSet` - a second id for one glyph set. Cairo uses it
+    /// so two surfaces can share a glyph cache.
+    public static let referenceGlyphSet: UInt8 = 18
     public static let freeGlyphSet: UInt8 = 19
     public static let addGlyphs: UInt8 = 20
     public static let compositeGlyphs8: UInt8 = 23
@@ -359,8 +482,14 @@ public enum X11RenderOpcode {
     public static let fillRectangles: UInt8 = 26
     public static let createSolidFill: UInt8 = 33
     public static let createLinearGradient: UInt8 = 34
+    public static let createRadialGradient: UInt8 = 35
+    public static let createConicalGradient: UInt8 = 36
+    public static let freeGlyphs: UInt8 = 22
     public static let setPictureTransform: UInt8 = 28
     public static let setPictureFilter: UInt8 = 30
+    public static let createCursor: UInt8 = 27
+    public static let queryFilters: UInt8 = 29
+    public static let createAnimCursor: UInt8 = 31
 }
 
 /// Error codes (the second byte of a 32-byte Error response).
@@ -384,6 +513,34 @@ public enum X11ErrorCode {
     public static let implementation: UInt8 = 17
 }
 
+/// Minor (request) opcodes within MIT-SCREEN-SAVER.
+public enum X11ScreenSaverOpcode {
+    public static let queryVersion: UInt8 = 0
+    public static let queryInfo: UInt8 = 1
+    public static let selectInput: UInt8 = 2
+    public static let setAttributes: UInt8 = 3
+    public static let unsetAttributes: UInt8 = 4
+    public static let suspend: UInt8 = 5
+}
+
+/// Minor (request) opcodes within XTEST, from `xtestproto.h`.
+public enum X11XTestOpcode {
+    public static let getVersion: UInt8 = 0
+    public static let compareCursor: UInt8 = 1
+    public static let fakeInput: UInt8 = 2
+    public static let grabControl: UInt8 = 3
+}
+
+/// The `type` field of an `XTestFakeInput` request - the core event codes
+/// it is asking the server to pretend happened.
+public enum X11FakeInputType {
+    public static let keyPress: UInt8 = 2
+    public static let keyRelease: UInt8 = 3
+    public static let buttonPress: UInt8 = 4
+    public static let buttonRelease: UInt8 = 5
+    public static let motionNotify: UInt8 = 6
+}
+
 /// Minor (request) opcodes within RANDR (see `X11Opcode.randrExtension`'s
 /// doc comment) - real values from `<X11/extensions/randr.h>`. Only the
 /// subset a typical GDK/Qt startup handshake actually sends against a
@@ -397,6 +554,18 @@ public enum RandRRequest {
     public static let getCrtcInfo: UInt8 = 20
     public static let getScreenResourcesCurrent: UInt8 = 25
     public static let getOutputPrimary: UInt8 = 31
+    public static let getProviders: UInt8 = 32
+    public static let setScreenConfig: UInt8 = 2
+    public static let getScreenInfo: UInt8 = 5
+    public static let listOutputProperties: UInt8 = 10
+    public static let changeOutputProperty: UInt8 = 13
+    public static let deleteOutputProperty: UInt8 = 14
+    public static let getOutputProperty: UInt8 = 15
+    public static let getCrtcGammaSize: UInt8 = 22
+    public static let getCrtcGamma: UInt8 = 23
+    public static let setCrtcGamma: UInt8 = 24
+    public static let getCrtcTransform: UInt8 = 27
+    public static let getPanning: UInt8 = 28
     public static let getMonitors: UInt8 = 42
 }
 

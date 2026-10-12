@@ -32,12 +32,18 @@ final class GuestDistroIdentityTests: XCTestCase {
 
     func testPublishedBootFilesAreTheSharedKernel() {
         let support = URL(fileURLWithPath: "/tmp/support")
-        let files = GuestDistro.fedora.bootFiles(appSupport: support)
+        let files = GuestDistro.fedora.bootFiles(instance: "box", appSupport: support)
         XCTAssertEqual(files.kernel.path, "/tmp/support/disk-Image")
         XCTAssertEqual(files.initramfs.path, "/tmp/support/disk-initramfs-virt")
-        XCTAssertEqual(files.disk.path, "/tmp/support/rootfs-fedora.img")
-        XCTAssertEqual(files.storageKey, "rootfs-fedora.img")
+        // The instance's own disk, never the distro's downloaded image: a
+        // boot that wrote to the base would taint every instance made after
+        // it (`InstanceDisk`).
+        XCTAssertEqual(files.disk.path, "/tmp/support/disks/box.img")
+        XCTAssertEqual(files.storageKey, "disks/box.img")
         XCTAssertNil(files.kernelCommandLine)
+        // The base is still the per-distro file - that is what gets cloned.
+        XCTAssertEqual(GuestDistro.fedora.baseImageURL(appSupport: support).path,
+                       "/tmp/support/rootfs-fedora.img")
     }
 }
 
@@ -168,11 +174,17 @@ final class CustomImageTests: XCTestCase {
         XCTAssertEqual(good.files.kernelCommandLine, "console=hvc0 root=/dev/nvme0n1p2")
         // Same files by path - the scan reports /private/var where the temp
         // directory was named /var, which is the same folder.
-        let resolved = GuestDistro.custom("good").bootFiles(appSupport: support)
-        for (a, b) in [(resolved.kernel, good.files.kernel), (resolved.initramfs, good.files.initramfs), (resolved.disk, good.files.disk)] {
+        let resolved = GuestDistro.custom("good").bootFiles(instance: "box", appSupport: support)
+        // Kernel and initramfs come from the custom image's own folder; the
+        // disk is the instance's clone, like any other distro.
+        for (a, b) in [(resolved.kernel, good.files.kernel), (resolved.initramfs, good.files.initramfs)] {
             XCTAssertEqual(a.resolvingSymlinksInPath().path, b.resolvingSymlinksInPath().path)
         }
-        XCTAssertEqual(resolved.storageKey, good.files.storageKey)
+        XCTAssertEqual(resolved.disk.path, support.appendingPathComponent("disks/box.img").path)
+        XCTAssertEqual(resolved.storageKey, "disks/box.img")
+        XCTAssertEqual(GuestDistro.custom("good").baseImageURL(appSupport: support)
+                        .resolvingSymlinksInPath().path,
+                       good.files.disk.resolvingSymlinksInPath().path)
         XCTAssertEqual(resolved.kernelCommandLine, good.files.kernelCommandLine)
 
         let broken = try XCTUnwrap(images.first { $0.slug == "broken" })

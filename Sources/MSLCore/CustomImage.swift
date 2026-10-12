@@ -282,16 +282,23 @@ public struct CustomImage: Equatable, Identifiable, Sendable {
     public static func create(slug: String, from distro: GuestDistro, name: String? = nil,
                               appSupport: URL = MSLPaths.appSupport) throws -> CustomImage {
         guard isValidSlug(slug) else { throw CreateError.invalidName(slug) }
-        let source = distro.bootFiles(appSupport: appSupport)
-        guard FileManager.default.fileExists(atPath: source.disk.path) else { throw CreateError.notInstalled(distro) }
+        // The **base**, not any instance's disk: a custom image started from
+        // a distro should be that distro as downloaded, not a copy of
+        // whatever some instance happened to have done to it. Before
+        // instances had their own disks there was no difference; now there
+        // is, and this is the one worth having.
+        let sourceDisk = distro.baseImageURL(appSupport: appSupport)
+        let sourceKernel = appSupport.appendingPathComponent("disk-Image")
+        let sourceInitramfs = appSupport.appendingPathComponent("disk-initramfs-virt")
+        guard FileManager.default.fileExists(atPath: sourceDisk.path) else { throw CreateError.notInstalled(distro) }
         let root = directory(appSupport: appSupport)
         let folder = root.appendingPathComponent(slug, isDirectory: true)
         guard !FileManager.default.fileExists(atPath: folder.path) else { throw CreateError.exists(slug) }
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         do {
-            try FileManager.default.copyItem(at: source.kernel, to: folder.appendingPathComponent(kernelNames[0]))
-            try FileManager.default.copyItem(at: source.initramfs, to: folder.appendingPathComponent(initramfsNames[0]))
-            try FileManager.default.copyItem(at: source.disk, to: folder.appendingPathComponent(diskNames[0]))
+            try FileManager.default.copyItem(at: sourceKernel, to: folder.appendingPathComponent(kernelNames[0]))
+            try FileManager.default.copyItem(at: sourceInitramfs, to: folder.appendingPathComponent(initramfsNames[0]))
+            try FileManager.default.copyItem(at: sourceDisk, to: folder.appendingPathComponent(diskNames[0]))
             var metadata: [String: String] = ["description": "Started from \(distro.rawValue)"]
             if let name, !name.isEmpty { metadata["name"] = name }
             let encoder = JSONEncoder()

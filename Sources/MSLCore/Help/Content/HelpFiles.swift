@@ -6,10 +6,98 @@ extension HelpChapter {
     static let files = HelpChapter(
         id: "files", title: "MSL Files", symbol: "folder", tint: .mango,
         blurb: "Browse your Mac and your Linux instances side by side, and move files between them.",
-        articles: [.filesWindow, .filesSidebar, .filesViews, .filesMoving, .filesTags, .filesDeleting, .filesOpenInMSL])
+        articles: [.filesWindow, .filesSidebar, .filesViews, .filesMoving, .filesGit, .filesTags, .filesDeleting, .filesOpenInMSL])
 }
 
 extension HelpArticle {
+    static let filesGit = HelpArticle(
+        id: "files-git", title: "Git in MSL Files", symbol: "point.3.filled.connected.trianglepath.dotted",
+        summary: "See a folder's branch, changes and history without leaving the file browser.",
+        keywords: ["git", "repository", "repo", "branch", "commit", "history", "origin",
+                   "untracked", "staged", "git init", "version control"],
+        related: ["files-moving", "files-window", "instances-forward"],
+        body: #"""
+        ## The dot {#dot}
+
+        A folder that is a git repository carries a dot in the listing:
+
+        | | |
+        |---|---|
+        | A green ring | Nothing has changed |
+        | A filled red dot | Something has — hover it for the branch and a count |
+        | No dot | Not a repository, or MSL could not read it |
+
+        That last row matters. **No dot never means "clean"** — a repository MSL could not read in time produces no
+        dot at all, rather than a green one on the strength of an answer nobody got.
+
+        The dots are read when you open a folder, when you come back to the MSL Files window, and when you close the
+        Git panel. They are deliberately not on a timer: inside an instance every check is a command sent to Linux,
+        and asking on a loop would stop an idle instance ever going to sleep. So if you change something in a
+        terminal, click back into MSL Files and the dot catches up.
+
+        ## The panel {#panel}
+
+        Right-click a folder and choose **Git…**, or press ⌃⌘G. MSL Files shows what git knows about it:
+        the branch, the origin with a button to copy it, how far ahead or behind the upstream, the working
+        tree split into conflicted, staged, changed and untracked, and the last fifty commits.
+
+        It works on Mac folders and on folders inside an instance, and it looks the same either way.
+
+        ## Where git actually runs {#where}
+
+        For a folder inside an instance, **git runs inside that instance**, not on your Mac. This matters
+        more than it sounds:
+
+        | | Why |
+        |---|---|
+        | The share MSL mounts does not carry real Linux permissions | Mac-side git would report every file as changed |
+        | A status check stats every file | Doing that over the share is slow enough to be unusable |
+        | The repository's own config, hooks and ignore rules live in Linux | They are what should apply |
+
+        So the instance has to be running. A stopped one says so rather than guessing, because MSL will
+        not start an instance just to decorate a folder.
+
+        ## It reads, and does not write {#readonly}
+
+        There is no commit, push, pull or fetch, and that is the design rather than a gap. Anything that
+        talks to a remote may need a password, and MSL has nowhere to ask for one — so it would hang
+        rather than prompt. Anything that rewrites history deserves a terminal, where you can see what
+        happened and undo it.
+
+        The one thing it will create is a repository where there is none: a folder that is not one offers
+        **Initialise a repository here**, which is `git init` and nothing else.
+
+        ## The remote {#remote}
+
+        The panel shows `origin` if there is one, with buttons to copy it and — for addresses that certainly have a
+        web page — open it in your Mac browser. **Change** edits it; a repository with no remote offers **Add one**
+        instead. Clearing the box removes the remote.
+
+        This only writes the address into the repository's own config. It does not contact anything, and there is
+        still no push or pull here for the reason above.
+
+        > [!note]
+        > A repository created this way belongs to you, not to root — even though MSL's background
+        > service runs as root. A `.git` owned by root inside your home folder would make your very next
+        > commit fail, which would be a strange thing for a button offering to set git up.
+
+        ## If the panel says git is not installed {#nogit}
+
+        That is the instance talking, not your Mac. Install it the way that distro does — `apk add git`,
+        `apt install git`, `dnf install git` — and open the panel again.
+
+        On the Mac side, git comes with Xcode's Command Line Tools. MSL checks for them first rather than
+        running `/usr/bin/git`, because without them that command does not fail: it opens a system dialog
+        offering to install them, and a dialog appearing because you opened a folder is not what anyone
+        wants from a file browser.
+
+        > [!note]
+        > MSL runs git as the owner of the folder, never as the administrator — even though the background service
+        > that carries the request is one. A repository's own configuration can name programs git will run, and the
+        > dots are read simply because you opened a folder. Running those as the administrator would mean a
+        > repository you merely browsed past deciding what your computer does.
+        """#)
+
     static let filesWindow = HelpArticle(
         id: "files-window", title: "The MSL Files window", symbol: "folder",
         summary: "A Finder work-alike that shows your Mac and your running Linux instances side by side.",
@@ -139,14 +227,32 @@ extension HelpArticle {
         id: "files-moving", title: "Moving files between Mac and Linux", symbol: "arrow.left.arrow.right",
         summary: "Drag, copy and paste, duplicate, new folders, rename, compress, share.",
         keywords: ["copy", "paste", "drag and drop", "transfer", "move files", "upload", "duplicate", "new folder", "rename", "compress", "zip", "share"],
-        related: ["home-share", "files-deleting", "files-window"],
+        related: ["home-share", "files-deleting", "files-git"],
         body: #"""
         ## Drag and drop {#drag}
 
-        Drag files from Finder, or from anywhere in MSL Files, into a folder — on your Mac or inside an instance. They're
-        **copied**; the originals stay where they were. An empty folder says "Drag files here to copy them in."
+        Drag files from Finder, or from anywhere in MSL Files, into a folder — on your Mac or inside an instance.
 
-        Places that are read-only won't accept a drop.
+        | Dragging | What happens |
+        |---|---|
+        | Within your Mac, or within one instance | **Moved**, as in Finder |
+        | Between your Mac and an instance, or between two instances | **Copied** — the original stays |
+        | Holding ⌥ | **Copied**, always |
+
+        The rule is the same one Finder uses, and it is not arbitrary: a move is only possible within a single
+        filesystem, and an instance's files are a separate one from your Mac's.
+
+        Drop them **anywhere in the window**: onto a folder to put them inside it, into the empty space to put them
+        in the folder you're looking at, or onto a place in the sidebar — Downloads, Desktop, an instance — to send
+        them there without navigating first. Dropping onto a tag applies the tag instead.
+
+        Dropping onto a name that is already taken is refused rather than overwritten, and so is dropping a folder
+        into itself. Places that are read-only won't accept a drop.
+
+        > [!tip]
+        > A script dragged into an instance stays executable. The share MSL mounts cannot carry Linux permissions,
+        > so MSL puts the executable bit back afterwards — without it, a program you dropped in would land
+        > unrunnable and Linux would tell you permission was denied on your own file.
 
         ## Copy and paste {#copy-paste}
 

@@ -7,10 +7,25 @@ struct PermissionsAndStartupButton: View {
     @Environment(\.openWindow) private var openWindow
     /// Only for the icon - the window keeps its own model.
     @StateObject private var permissions = PermissionsModel()
+    @State private var highlighted = false
+
+    /// Whether this Mac has ever been shown where the permissions live.
+    ///
+    /// A `UserDefaults` flag rather than a file, so it is per-person and
+    /// survives the app being replaced - which happens on every update.
+    private static let seenKey = "msl.permissions.introduced"
+
+    nonisolated static var hasBeenIntroduced: Bool {
+        get { UserDefaults.standard.bool(forKey: seenKey) }
+        set { UserDefaults.standard.set(newValue, forKey: seenKey) }
+    }
 
     var body: some View {
         Button {
             openWindow(id: "permissions")
+            // Clicking it is the thing the pulse was asking for, so it stops.
+            Self.hasBeenIntroduced = true
+            highlighted = false
         } label: {
             Label("Permissions & Startup",
                   systemImage: permissions.needsAttention ? "exclamationmark.shield" : "checkmark.shield")
@@ -20,7 +35,41 @@ struct PermissionsAndStartupButton: View {
         .buttonStyle(.plain)
         .padding(.horizontal, Design.Spacing.medium)
         .padding(.vertical, Design.Spacing.small + 2)
-        .task { permissions.refresh() }
+        // **Pulsed once, on the very first launch.** Nothing MSL does works
+        // properly until macOS has been told to let it - and a first-time
+        // user has no reason to go looking in a sidebar row for that. So the
+        // row asks for them, three slow pulses, and then never again on this
+        // Mac. Deliberately not a modal: it is a nudge, not a gate, and
+        // someone who wants to get on with it can ignore it entirely.
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.accentColor.opacity(highlighted ? 0.28 : 0))
+                .padding(.horizontal, Design.Spacing.small)
+        )
+        .task {
+            permissions.refresh()
+            guard !Self.hasBeenIntroduced else { return }
+            // Never while the welcome guide is up. On a first launch both
+            // want the same moment, and three slow pulses behind a sheet
+            // are three pulses nobody sees - which would spend the one
+            // chance this row gets. The guide's last page points straight
+            // at this row, so the pulse lands just as it is mentioned.
+            while !WelcomeGuide.hasBeenSeen {
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                if Task.isCancelled { return }
+            }
+            // After the window has settled, or the first pulse is lost in
+            // the app's own appearance.
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            guard !Self.hasBeenIntroduced else { return }
+            for _ in 0..<3 {
+                withAnimation(.easeInOut(duration: 0.45)) { highlighted = true }
+                try? await Task.sleep(nanoseconds: 450_000_000)
+                withAnimation(.easeInOut(duration: 0.45)) { highlighted = false }
+                try? await Task.sleep(nanoseconds: 350_000_000)
+            }
+            Self.hasBeenIntroduced = true
+        }
     }
 }
 
@@ -31,7 +80,7 @@ struct OpenFilesButton: View {
 
     var body: some View {
         Button {
-            openWindow(id: "files")
+            MSLFilesLauncher.open { openWindow(id: "files") }
         } label: {
             Label("Open MSL Files", systemImage: "folder")
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -78,8 +127,16 @@ final class PermissionsModel: ObservableObject {
             || networkVolumes == .denied || localNetwork == .denied
     }
 
-    func refresh() {
+    /// Reads what can be read without raising a prompt.
+    ///
+    /// `mounts` and `sshHosts` are passed in because the two network rows
+    /// have no status API at all - the only way to learn anything about
+    /// them is to try the thing they govern. Without them the panel opened
+    /// with both showing a bare minus until somebody pressed Allow All,
+    /// which made "not asked yet" and "denied" look identical.
+    func refresh(mounts: [String] = [], sshHosts: [String] = []) {
         fullDiskAccess = MacPermissions.hasFullDiskAccess
+        refreshNetworkRows(mounts: mounts, sshHosts: sshHosts)
         Task {
             let status = await Task.detached(priority: .utility) {
                 MacPermissions.automationStatus(bundleIdentifier: MacPermissions.terminalBundleIdentifier, ask: false)
@@ -88,6 +145,39 @@ final class PermissionsModel: ObservableObject {
             // problem worth flagging.
             let state = MacPermissions.automationState(osStatus: status)
             terminal = state == .unavailable("Terminal isn't running") ? .notChecked : state
+        }
+    }
+
+    /// What the two network rows can say without asking for anything.
+    ///
+    /// Neither has a TCC status API. Network volumes is inferred from a
+    /// mount being readable, and Local Network from a guest answering - so
+    /// a failure here genuinely cannot tell "MSL was refused" apart from
+    /// "there is nothing listening". The wording says so rather than
+    /// picking one and sounding certain, because picking the wrong one is
+    /// what sent an entire afternoon after sshd when the real answer was a
+    /// permission macOS had quietly dropped.
+    private func refreshNetworkRows(mounts: [String], sshHosts: [String]) {
+        guard !mounts.isEmpty || !sshHosts.isEmpty else { return }
+        Task { [mounts, sshHosts] in
+            if let mount = mounts.first {
+                let readable = await Task.detached(priority: .utility) {
+                    FileManager.default.isReadableFile(atPath: mount)
+                }.value
+                networkVolumes = readable ? .granted
+                    : .unavailable("Not readable yet - allow it when macOS asks")
+            } else {
+                networkVolumes = .unavailable("Start an instance to ask")
+            }
+            if let host = sshHosts.first {
+                let reached = await Task.detached(priority: .utility) {
+                    SSHSetup.canReach(host: host, timeout: 2)
+                }.value
+                localNetwork = reached ? .granted
+                    : .unavailable("Can't reach \(host) - either MSL hasn't been allowed, or that instance isn't running")
+            } else {
+                localNetwork = .unavailable("Set up SSH on an instance to ask")
+            }
         }
     }
 
@@ -115,7 +205,8 @@ final class PermissionsModel: ObservableObject {
                 let reached = await Task.detached(priority: .userInitiated) {
                     SSHSetup.canReach(host: host)
                 }.value
-                localNetwork = reached ? .granted : .unavailable("Couldn't reach \(host) - denied, or SSH isn't running")
+                localNetwork = reached ? .granted
+                    : .unavailable("Can't reach \(host) - either MSL hasn't been allowed, or that instance isn't running")
             } else {
                 localNetwork = .unavailable("Set up SSH on an instance to ask")
             }
@@ -175,10 +266,12 @@ struct PermissionsAndStartupPanel: View {
             Divider()
             CommandLineSection()
             Divider()
+            PersonalitySection()
+            Divider()
             UninstallSection()
         }
         .padding(Design.Spacing.large)
-        .onAppear { permissions.refresh() }
+        .onAppear { permissions.refresh(mounts: liveMounts, sshHosts: sshHosts) }
     }
 
     // MARK: Permissions
@@ -249,11 +342,29 @@ struct PermissionsAndStartupPanel: View {
             }
             Spacer()
             stateBadge(state)
-            if state == .denied {
+            // Settings for anything MSL cannot settle itself, not only for a
+            // flat denial. Local Network has no status API and no prompt MSL
+            // can raise, so System Settings is the *only* way to act on it -
+            // and until now the row offered a bare minus and no way forward.
+            if state == .denied || isUnavailable(state) {
                 Button("Settings") { permissions.open(pane) }
                     .controlSize(.small)
             }
         }
+    }
+
+    /// Four or five words for the badge; the sentence lives in the tooltip.
+    static func shortReason(_ reason: String) -> String {
+        if reason.hasPrefix("Can't reach") { return "Not reachable" }
+        if reason.hasPrefix("Start an instance") { return "Start an instance" }
+        if reason.hasPrefix("Set up SSH") { return "Set up SSH first" }
+        if reason.hasPrefix("Not readable") { return "Not allowed yet" }
+        return "Can't tell"
+    }
+
+    private func isUnavailable(_ state: MacPermissions.State) -> Bool {
+        if case .unavailable = state { return true }
+        return false
     }
 
     @ViewBuilder
@@ -271,7 +382,20 @@ struct PermissionsAndStartupPanel: View {
         case .notChecked:
             Text("—").foregroundStyle(.secondary).font(.caption)
         case .unavailable(let reason):
-            Image(systemName: "minus.circle").foregroundStyle(.secondary).help(reason)
+            // The reason on screen, not only in a tooltip. A bare minus says
+            // nothing, and these two rows are exactly the ones where "why"
+            // matters: a minus on Local Network can mean not asked, denied,
+            // or sshd simply not running, and guessing wrong costs an
+            // afternoon.
+            // Short label, full reason in the tooltip and on the row's own
+            // second line. Spelling the whole sentence out beside every
+            // badge made the panel read as a wall of grey text, which is
+            // its own kind of unreadable.
+            Label(Self.shortReason(reason), systemImage: "minus.circle")
+                .labelStyle(.titleAndIcon)
+                .foregroundStyle(.secondary)
+                .font(.caption)
+                .help(reason)
         }
     }
 

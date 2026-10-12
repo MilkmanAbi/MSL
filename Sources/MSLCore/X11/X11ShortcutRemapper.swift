@@ -49,14 +49,21 @@ struct X11ShortcutRemapper: Equatable {
 
     private enum Key {
         static let home: UInt8 = 110, end: UInt8 = 115, backspace: UInt8 = 22, delete: UInt8 = 119
+        /// `u` and `w`, for a terminal's "kill line" and "kill word".
+        static let u: UInt8 = 30, w: UInt8 = 25
     }
 
-    func remap(macKeyCode: UInt16, flags: NSEvent.ModifierFlags) -> [X11KeyChord]? {
+    /// `appClass` is the focused window's `WM_CLASS`, which decides whether
+    /// this is a terminal - see `X11TerminalApps` for why that changes
+    /// everything.
+    func remap(macKeyCode: UInt16, flags: NSEvent.ModifierFlags,
+               appClass: String? = nil) -> [X11KeyChord]? {
         guard isActive, let keycode = X11KeyCodes.keycode(forMac: macKeyCode) else { return nil }
         let command = flags.contains(.command)
         let shift = flags.contains(.shift)
         let option = flags.contains(.option)
         let control = flags.contains(.control)
+        let terminal = X11TerminalApps.isTerminal(appClass)
         let m = X11KeyCodes.Modifier.self
         let keepShift: [UInt8] = shift ? [m.leftShift] : []
 
@@ -76,6 +83,10 @@ struct X11ShortcutRemapper: Equatable {
             case Mac.up: return [X11KeyChord(keycode: Key.home, modifiers: [m.leftControl] + keepShift)]
             case Mac.down: return [X11KeyChord(keycode: Key.end, modifiers: [m.leftControl] + keepShift)]
             case Mac.backspace:
+                // A terminal has a key for this and no line to select:
+                // Ctrl+U kills to the start of the line. Shift+Home would
+                // scroll the scrollback in some terminals instead.
+                if terminal { return [X11KeyChord(keycode: Key.u, modifiers: [m.leftControl])] }
                 return [X11KeyChord(keycode: Key.home, modifiers: [m.leftShift]), X11KeyChord(keycode: Key.backspace, modifiers: [])]
             case Mac.forwardDelete:
                 return [X11KeyChord(keycode: Key.end, modifiers: [m.leftShift]), X11KeyChord(keycode: Key.delete, modifiers: [])]
@@ -87,17 +98,37 @@ struct X11ShortcutRemapper: Equatable {
             switch macKeyCode {
             case Mac.left, Mac.right, Mac.up, Mac.down:
                 return [X11KeyChord(keycode: keycode, modifiers: [m.leftControl] + keepShift)]
-            case Mac.backspace: return [X11KeyChord(keycode: Key.backspace, modifiers: [m.leftControl])]
+            case Mac.backspace:
+                // Ctrl+W is "kill the word before the cursor" at a shell
+                // prompt; Ctrl+BackSpace is not bound there.
+                if terminal { return [X11KeyChord(keycode: Key.w, modifiers: [m.leftControl])] }
+                return [X11KeyChord(keycode: Key.backspace, modifiers: [m.leftControl])]
             case Mac.forwardDelete: return [X11KeyChord(keycode: Key.delete, modifiers: [m.leftControl])]
             default: break
             }
         }
 
         if shortcuts, command {
-            // Everything else with Command: the same key with Control, the
-            // other modifiers kept - Cmd+Shift+Z is Ctrl+Shift+Z.
+            // **A terminal gets Ctrl+Shift, and that is the whole reason
+            // this feature can be on by default.** Ctrl+C at a shell is
+            // SIGINT, so a plain ⌘→Ctrl mapping would kill the running
+            // command every time a Mac user tried to copy - and Ctrl+D
+            // would close the shell, Ctrl+Z suspend it. Ctrl+Shift+C/V/T/W
+            // is what the VTE family, Konsole and kitty bind copy, paste,
+            // new tab and close tab to, so the Mac shortcuts land on the
+            // right actions rather than on signals.
+            if terminal, !X11TerminalApps.bindsControlShift(appClass) {
+                // A classic X terminal (xterm, urxvt, st) binds neither, and
+                // Shift does not change the control character - Ctrl+Shift+C
+                // would arrive at the pty as a plain Ctrl+C and interrupt
+                // whatever is running. So Command does nothing here at all.
+                // An empty chord list consumes the key without sending one:
+                // returning nil would deliver it bare, and with Command
+                // hidden ⌘C would type a stray "c" into the shell.
+                return []
+            }
             var modifiers = [m.leftControl]
-            if shift { modifiers.append(m.leftShift) }
+            if shift || terminal { modifiers.append(m.leftShift) }
             if option { modifiers.append(m.leftOption) }
             return [X11KeyChord(keycode: keycode, modifiers: modifiers)]
         }

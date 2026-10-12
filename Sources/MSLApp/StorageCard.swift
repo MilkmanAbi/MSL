@@ -88,7 +88,7 @@ struct StorageCard: View {
                 Divider()
             }
             if !instance.isInstalled {
-                Text("This distro isn't installed yet, so it has no disk.")
+                Text("\(instance.name) has no disk yet. It gets its own copy of \(instance.distro.displayName) the first time it starts.")
                     .foregroundStyle(.secondary)
             } else {
                 usageBar
@@ -310,6 +310,23 @@ struct StorageCard: View {
         error = nil
         let newPolicy = StoragePolicy(mode: draftMode, size: max(draftBytes, capacity), autoGrow: draftMode == .dynamic)
 
+        // **Refuse BEFORE the write, not after it.** `setPolicy` is the gate
+        // for `resources.disk`, but this card grows the image first and
+        // records the policy second - so relying on that return value alone
+        // would reserve tens of gigabytes and only then decline to remember
+        // why. Asking up front costs nothing and is the only order in which
+        // a refusal actually refuses anything.
+        if newPolicy != DiskStorage.storedPolicy(forImageNamed: imageName),
+           DiskStorage.storedPolicy(forImageNamed: imageName) != nil {
+            for capability in ["resources.edit", "resources.disk"] {
+                if let why = MSLAPGate.reason(capability, instance: instance.name) {
+                    error = why
+                    reload()
+                    return
+                }
+            }
+        }
+
         // Off the main thread, always. Reserving space for a fixed disk
         // writes zeroes over every unallocated block - for a 512 GB disk
         // that is 512 GB of real writes, and doing it inline froze the
@@ -335,7 +352,9 @@ struct StorageCard: View {
                 }
                 // Saved only once the disk really is what it says, so an
                 // interrupted reservation still shows Provision.
-                DiskStorage.setPolicy(newPolicy, forImageNamed: name)
+                guard DiskStorage.setPolicy(newPolicy, forImageNamed: name) else {
+                    return "the disk settings could not be saved"
+                }
                 // Only when the disk actually grew: scheduling a guest-side
                 // `resize2fs` after a change that resized nothing means a
                 // pointless command on the next boot and a "pending" notice

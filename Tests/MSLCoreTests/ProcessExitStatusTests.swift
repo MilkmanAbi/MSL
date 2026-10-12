@@ -17,14 +17,23 @@ final class ProcessExitStatusTests: XCTestCase {
         XCTAssertEqual(ProcessExitStatus.code(fromWaitStatus: SIGKILL), 137)
     }
 
+    /// Spawned with `posix_spawn` rather than `Process`, so that this test
+    /// is the only thing waiting for the child. Foundation reaps its own
+    /// children on a private queue, and when it won the race this test's
+    /// `waitpid` returned -1 with the status untouched - a failure that
+    /// said "0 is not equal to 3" and had nothing to do with the decoding
+    /// being tested.
     func testMatchesWhatTheSystemReallyReturns() throws {
         for expected: Int32 in [0, 3, 127] {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/sh")
-            process.arguments = ["-c", "exit \(expected)"]
-            try process.run()
+            var pid: pid_t = 0
+            let arguments = ["/bin/sh", "-c", "exit \(expected)"]
+            var argv: [UnsafeMutablePointer<CChar>?] = arguments.map { strdup($0) }
+            argv.append(nil)
+            defer { for argument in argv where argument != nil { free(argument) } }
+
+            XCTAssertEqual(posix_spawn(&pid, "/bin/sh", nil, nil, &argv, environ), 0)
             var status: Int32 = 0
-            waitpid(process.processIdentifier, &status, 0)
+            XCTAssertEqual(waitpid(pid, &status, 0), pid)
             XCTAssertEqual(ProcessExitStatus.code(fromWaitStatus: status), expected)
         }
     }

@@ -15,6 +15,10 @@ enum X11ConnectionSetup {
         var colormapID: UInt32
         var visualID: UInt32
         var argbVisualID: UInt32
+        /// GLX's one-visual-per-config extras (`X11GLXConfig.all`), listed
+        /// after each depth's main visual.
+        var extraVisuals24: [UInt32] = []
+        var extraVisuals32: [UInt32] = []
         var screenWidthPixels: Int
         var screenHeightPixels: Int
     }
@@ -36,14 +40,18 @@ enum X11ConnectionSetup {
         let vendorBytes = Array(vendor.utf8)
         let vendorPadded = X11Wire.pad(vendorBytes.count)
 
-        let depthBytes = depthFixedBytes + visualTypeBytes // one DEPTH, one VISUALTYPE in it
+        let visuals24 = [config.visualID] + config.extraVisuals24
+        let visuals32 = [config.argbVisualID] + config.extraVisuals32
         // One SCREEN: the 24-bit and 32-bit ARGB depths (see `argbVisualID`'s
-        // doc comment) each with a visual, plus depth 1 with none.
-        let screenBytes = screenFixedBytes + depthBytes * 2 + depthFixedBytes
+        // doc comment) with their visuals, plus depth 1 with none.
+        let screenBytes = screenFixedBytes
+            + depthFixedBytes + visualTypeBytes * visuals24.count
+            + depthFixedBytes + visualTypeBytes * visuals32.count
+            + depthFixedBytes
 
         let additionalDataBytes = fixedHeaderAfterFirst8Bytes
             + vendorPadded
-            + pixmapFormatEntryBytes * 3 // one PIXMAP FORMAT per depth advertised anywhere: 1, 24, 32
+            + pixmapFormatEntryBytes * 5 // one PIXMAP FORMAT per depth a pixmap can have: 1, 4, 8, 24, 32
             + screenBytes
         precondition(additionalDataBytes % 4 == 0, "X11 connection setup response must be a whole number of 4-byte units")
 
@@ -60,7 +68,7 @@ enum X11ConnectionSetup {
         w.writeU16(UInt16(vendorBytes.count))
         w.writeU16(65535) // maximum-request-length - generous; this server doesn't actually enforce a cap
         w.writeU8(1) // number of SCREENs
-        w.writeU8(3) // number of PIXMAP FORMATs
+        w.writeU8(5) // number of PIXMAP FORMATs
         w.writeU8(config.littleEndian ? 0 : 1) // image-byte-order: 0 = LSBFirst, matches the connection's own order
         w.writeU8(config.littleEndian ? 0 : 1) // bitmap-format-bit-order
         w.writeU8(32) // bitmap-format-scanline-unit
@@ -79,6 +87,28 @@ enum X11ConnectionSetup {
         // `XRenderCreatePicture` dereferenced the NULL format it got back.
         w.writeU8(1) // depth
         w.writeU8(1) // bits-per-pixel
+        w.writeU8(32) // scanline-pad
+        w.writePadding(5)
+
+        // PIXMAP FORMATs for depth 4 and 8. Both are depths a client can
+        // really create a pixmap at here - depth 8 is RENDER's A8 coverage
+        // mask (every antialiased glyph cairo draws), and depth 4 is accepted
+        // because libXrender's `XRenderHasDepths` probe refuses to enable
+        // RENDER at all without it. Accepting the pixmap while advertising no
+        // FORMAT for its depth left Xlib with no bits-per-pixel to compute
+        // with, so `XCreateImage`/`XPutImage` against one had nothing to go
+        // on. 8 bits per pixel with 32-bit padding, which is what Xorg and
+        // Xvfb both report for these depths (measured, xdiff `setup.formats`
+        // 2026-09-28). Depth 16 is deliberately NOT here: there is no 16-bit
+        // visual and no 16bpp packer, and claiming one would be a lie a
+        // client could act on.
+        w.writeU8(4) // depth
+        w.writeU8(8) // bits-per-pixel
+        w.writeU8(32) // scanline-pad
+        w.writePadding(5)
+
+        w.writeU8(8) // depth
+        w.writeU8(8) // bits-per-pixel
         w.writeU8(32) // scanline-pad
         w.writePadding(5)
 
@@ -122,35 +152,22 @@ enum X11ConnectionSetup {
         // DEPTH (8 bytes + its VISUALTYPE list)
         w.writeU8(24) // depth
         w.writePadding(1)
-        w.writeU16(1) // number of VISUALTYPEs
+        w.writeU16(UInt16(visuals24.count)) // number of VISUALTYPEs
         w.writePadding(4)
 
-        // VISUALTYPE (24 bytes)
-        w.writeU32(config.visualID)
-        w.writeU8(4) // class: TrueColor
-        w.writeU8(8) // bits-per-rgb-value
-        w.writeU16(256) // colormap-entries
-        w.writeU32(0x00FF_0000) // red-mask
-        w.writeU32(0x0000_FF00) // green-mask
-        w.writeU32(0x0000_00FF) // blue-mask
-        w.writePadding(4)
+        // VISUALTYPEs (24 bytes each), identical but for the id: the extras
+        // exist for GLX (one per config), not for any colour difference.
+        for visual in visuals24 { writeTrueColor(visual, to: w) }
 
         // Second DEPTH (32-bit, ARGB) - see `argbVisualID`'s doc comment
         // on why this needs to exist at all, not just the 24-bit one.
         w.writeU8(32) // depth
         w.writePadding(1)
-        w.writeU16(1) // number of VISUALTYPEs
+        w.writeU16(UInt16(visuals32.count)) // number of VISUALTYPEs
         w.writePadding(4)
 
-        // VISUALTYPE (24 bytes) for the ARGB visual
-        w.writeU32(config.argbVisualID)
-        w.writeU8(4) // class: TrueColor
-        w.writeU8(8) // bits-per-rgb-value
-        w.writeU16(256) // colormap-entries
-        w.writeU32(0x00FF_0000) // red-mask
-        w.writeU32(0x0000_FF00) // green-mask
-        w.writeU32(0x0000_00FF) // blue-mask
-        w.writePadding(4)
+        // VISUALTYPEs for the ARGB visual and its GLX extras
+        for visual in visuals32 { writeTrueColor(visual, to: w) }
 
         // Third DEPTH: 1, with no visuals - pixmaps only, as on xorg.
         w.writeU8(1) // depth
@@ -159,5 +176,17 @@ enum X11ConnectionSetup {
         w.writePadding(4)
 
         return w.bytes
+    }
+
+    /// One 24-byte VISUALTYPE: TrueColor, 8 bits per channel.
+    private static func writeTrueColor(_ visual: UInt32, to w: X11ByteWriter) {
+        w.writeU32(visual)
+        w.writeU8(4) // class: TrueColor
+        w.writeU8(8) // bits-per-rgb-value
+        w.writeU16(256) // colormap-entries
+        w.writeU32(0x00FF_0000) // red-mask
+        w.writeU32(0x0000_FF00) // green-mask
+        w.writeU32(0x0000_00FF) // blue-mask
+        w.writePadding(4)
     }
 }

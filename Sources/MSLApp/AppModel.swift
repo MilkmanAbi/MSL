@@ -38,6 +38,12 @@ final class AppModel: ObservableObject {
     /// spinner and their buttons can disable without freezing the app.
     @Published private(set) var busy: Set<String> = []
     @Published var banner: Banner?
+    /// Instances whose shipment is being written, plus `""` while one is
+    /// being installed. Drives the spinners in the Tools card and the
+    /// New Instance sheet.
+    @Published var shipping: Set<String> = []
+    /// The current line from `Shipment`, by the same key.
+    @Published var shipmentStatus: [String: String] = [:]
     @Published var showingNewInstance = false
 
     /// Cached app lists, per instance.
@@ -47,6 +53,15 @@ final class AppModel: ObservableObject {
     /// Keyed by distro, not instance, because the image is shared: two
     /// instances of the same distro are one download.
     @Published private(set) var installing: [GuestDistro: String] = [:]
+    /// Distro -> how far its download has got, while bytes are arriving.
+    /// Separate from `installing` because it is absent for the parts of an
+    /// install that are not a transfer (verifying, unpacking), and the view
+    /// should fall back to an indeterminate spinner for those.
+    @Published private(set) var installTransfer: [GuestDistro: DistroInstaller.TransferProgress] = [:]
+    /// Handles for stopping a download in progress, one per distro being
+    /// installed. Not `@Published`: the view asks `isInstalling` whether to
+    /// offer the button, and this is only ever read when it is pressed.
+    private var installCancels: [GuestDistro: DistroInstaller.InstallCancellation] = [:]
     /// Apps whose high-resolution icon is being fetched from the guest, by
     /// `iconKey`. Drives the per-tile spinner.
     @Published private(set) var preparingIcons: Set<String> = []
@@ -81,11 +96,77 @@ final class AppModel: ObservableObject {
     /// parse per tile per render (twice, for the symbol and the tooltip).
     /// Fine for one app, absurd for sixty.
     @Published private(set) var pinnedPaths: Set<String> = []
+    /// Per-app GPU/CPU choices (`AppGraphicsStore`), mirrored here so the
+    /// tiles redraw when one changes.
+    @Published var graphicsModes: [String: AppGraphicsMode] = AppGraphicsStore.load()
+    /// Per-app launch overrides, for apps that need different arguments or
+    /// a different binary than their `.desktop` entry names.
+    @Published var customCommands: [String: String] = AppCustomCommandStore.load()
+    /// Apps pinned to the top of each instance's Applications tab, by
+    /// desktop-file path.
+    @Published var topPins: [String: Set<String>] = AppModel.loadTopPins()
 
     /// Icons, loaded once per scan rather than per render - the same
     /// problem: `LinuxAppCatalog.icon` either reads a file off disk or
     /// draws a monogram, and it was doing so on every redraw of every tile.
     @Published private(set) var iconCache: [String: NSImage] = [:]
+
+    /// The badge each instance wears, when its owner picked one
+    /// (`InstanceAppearance`). Held here, not read per row: the sidebar
+    /// redraws constantly and this would be a file read every time - the
+    /// same lesson as `iconCache` and `graphicsModes` above.
+    @Published var appearances: [String: InstanceAppearance] = InstanceAppearanceStore.load()
+
+    /// Pictures someone chose, decoded once. Keyed on the stored file name,
+    /// which changes on every import, so a replaced logo can never be served
+    /// from this.
+    ///
+    /// Deliberately **not** `@Published`: `logo(of:)` fills it while a badge
+    /// is drawing, and publishing a change from inside a view update is
+    /// undefined behaviour in SwiftUI ("Publishing changes from within view
+    /// updates"). Nothing is lost - `appearances` changing is what redraws
+    /// the badge, and this only ever caches what that already decided.
+    private var logoCache: [String: NSImage] = [:]
+
+    /// The instance whose logo is being picked (`InstanceLogoSheet`).
+    @Published var editingLogo: Instance?
+
+    func appearance(of instance: String) -> InstanceAppearance {
+        appearances[instance] ?? InstanceAppearance()
+    }
+
+    /// `instance`'s chosen picture, decoded on first use.
+    func logo(of instance: String) -> NSImage? {
+        guard let file = appearances[instance]?.image else { return nil }
+        if let cached = logoCache[file] { return cached }
+        guard let image = NSImage(contentsOf: InstanceAppearanceStore.imageURL(file)) else { return nil }
+        logoCache[file] = image
+        return image
+    }
+
+    /// Stores `appearance` for `instance` and redraws every badge of it.
+    func setAppearance(_ appearance: InstanceAppearance, for instance: String) {
+        guard InstanceAppearanceStore.set(appearance, for: instance) else {
+            banner = Banner(kind: .error, title: "Couldn't save that logo",
+                            detail: "MSL couldn't write to its Application Support folder.")
+            return
+        }
+        if appearance.isDefault { appearances[instance] = nil } else { appearances[instance] = appearance }
+    }
+
+    /// Copies a picture in as `instance`'s logo. Reports rather than throws:
+    /// the caller is a button.
+    func chooseLogoImage(_ source: URL, for instance: String) {
+        do {
+            let file = try InstanceAppearanceStore.importImage(from: source, for: instance)
+            var appearance = self.appearance(of: instance)
+            appearance.image = file
+            setAppearance(appearance, for: instance)
+        } catch {
+            banner = Banner(kind: .error, title: "Couldn't use that picture",
+                            detail: error.localizedDescription)
+        }
+    }
 
     var atCap: Bool { runningCount >= runningCap }
 
@@ -95,7 +176,24 @@ final class AppModel: ObservableObject {
 
     // MARK: - Lifecycle
 
-    func start() {
+    /// `installsTools: false` is MSL Files: a separate app built from the
+    /// same code that only needs the live instance list. Installing and
+    /// re-signing the host tools, rewriting shell profiles and the LaunchAgent
+    /// stay MSL's job - two apps doing it at once would race over the same
+    /// files (and re-signing mslhd mid-flight is exactly what strips its
+    /// entitlement).
+    func start(installsTools: Bool = true) {
+        if installsTools { installHostTools() }
+        refreshTask?.cancel()
+        refreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                await self?.refresh()
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
+    }
+
+    private func installHostTools() {
         // Installing the tools is what makes generated `.app` bundles and
         // the LaunchAgent work at all, and it has to happen from a build
         // the user actually ran - so it happens here, every launch, rather
@@ -122,12 +220,33 @@ final class AppModel: ObservableObject {
             if !AppModel.launchAgentOptedOut {
                 DaemonClient.installLaunchAgent()
             }
-        }
-        refreshTask?.cancel()
-        refreshTask = Task { [weak self] in
-            while !Task.isCancelled {
-                await self?.refresh()
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            // "Open a Terminal at login" used to point straight at the `msl`
+            // tool. Plain `msl` prints an overview now rather than opening a
+            // shell (`CLIOverview`), so an item enabled before this version
+            // would greet its owner at login with a help page. Rewriting it
+            // is what installs the little script that supplies the `run`;
+            // it is idempotent, so it also repairs a deleted one.
+            if LoginItem.terminal.isEnabled {
+                LoginItem.terminal.setEnabled(true)
+            }
+            // **And then make sure it is actually running.** The toggle above
+            // is about *login* - whether mslhd comes back by itself after a
+            // restart. It is not about whether the app works: opening MSL
+            // with no daemon means a window that can list nothing and start
+            // nothing, which is not a state worth showing anybody. So the app
+            // starts it either way, including for someone who deliberately
+            // turned the login agent off.
+            //
+            // `ensureRunning` returns at once when it is already up, so this
+            // costs a connect on every launch and nothing else.
+            do {
+                try DaemonClient.ensureRunning()
+            } catch {
+                await MainActor.run { [weak self] in
+                    self?.banner = Banner(
+                        kind: .error, title: "MSL's background service didn't start",
+                        detail: "\(error) - instances can't start without it.")
+                }
             }
         }
     }
@@ -144,9 +263,13 @@ final class AppModel: ObservableObject {
             (DaemonClient.send(.instanceDetails, timeout: 10), DaemonClient.isRunning())
         }.value
 
-        daemonReachable = snapshot.1
+        // Every assignment below is guarded: @Published fires on assignment,
+        // not on change, so this 3-second poll used to redraw every view in
+        // the app each time - and an open context menu on an app tile was
+        // torn down and rebuilt, flickering in and out while being read.
+        if daemonReachable != snapshot.1 { daemonReachable = snapshot.1 }
         guard let response = snapshot.0, response.hasPrefix("OK") else {
-            if !snapshot.1 { instances = [] }
+            if !snapshot.1, !instances.isEmpty { instances = [] }
             return
         }
 
@@ -180,12 +303,21 @@ final class AppModel: ObservableObject {
                 sandboxMountPath: fields.count >= 5 && !fields[4].isEmpty ? fields[4] : nil))
         }
 
-        instances = parsed
-        runningCount = used
-        runningCap = cap
+        if instances != parsed { instances = parsed }
+        // An instance that is gone takes its badge with it. The daemon
+        // already forgets the stored one (`removeInstanceState`), but this
+        // in-memory copy was only loaded at launch: within one session, a
+        // new instance reusing a deleted one's name wore the old badge -
+        // and the next change to it wrote that badge back to disk.
+        let live = Set(parsed.map(\.name))
+        let stale = appearances.keys.filter { !live.contains($0) }
+        if !stale.isEmpty { for name in stale { appearances[name] = nil } }
+        if runningCount != used { runningCount = used }
+        if runningCap != cap { runningCap = cap }
         autoConfigureSSHIfNeeded(parsed)
 
-        if selection == nil || !parsed.contains(where: { $0.name == selection }) {
+        if selection == nil || !parsed.contains(where: { $0.name == selection }),
+           selection != parsed.first?.name {
             selection = parsed.first?.name
         }
         for instance in parsed where apps[instance.name] == nil {
@@ -220,9 +352,44 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Whether the welcome guide is on screen.
+    ///
+    /// Shown once per Mac on the first launch, and from the Help menu after
+    /// that. Lives here rather than in a `@State` because the menu command
+    /// is built in `MSLApp` and has no other way to reach the window.
+    @Published var showingWelcome = false
+
+    /// Opens it if this Mac has never been through it.
+    func showWelcomeIfNeeded() {
+        guard !WelcomeGuide.hasBeenSeen else { return }
+        showingWelcome = true
+    }
+
+    /// Finish, Skip and close all land here: whichever it was, the guide is
+    /// done and does not come back on its own.
+    func finishWelcome() {
+        showingWelcome = false
+        WelcomeGuide.hasBeenSeen = true
+    }
+
+    /// Whether the "hibernate is not how you save your work" explanation has
+    /// been dismissed for good.
+    static var hibernateWarningSilenced: Bool {
+        get { UserDefaults.standard.bool(forKey: "msl.hibernate.warned") }
+        set { UserDefaults.standard.set(newValue, forKey: "msl.hibernate.warned") }
+    }
+
     func hibernate(_ instance: Instance) {
-        perform(instance.name, title: "Couldn't hibernate \(instance.name)") {
-            DaemonClient.send(.hibernate(instance: instance.name), timeout: 300)
+        // Said before it happens, once, because this is the thing people are
+        // surprised by - and being surprised by it costs them whatever was
+        // open. Hibernate stops the VM, and a stopped VM takes mslgd with
+        // it: the apps' X server is on the Mac, so their windows cannot come
+        // back. The shell can, and does.
+        HibernateNotice.confirm(instance: instance) { [weak self] goAhead in
+            guard goAhead, let self else { return }
+            self.perform(instance.name, title: "Couldn't hibernate \(instance.name)") {
+                DaemonClient.send(.hibernate(instance: instance.name), timeout: 300)
+            }
         }
     }
 
@@ -354,10 +521,14 @@ final class AppModel: ObservableObject {
     /// Drives `LinuxUserSetupSheet`.
     @Published var userSetup: UserSetupRequest?
 
-    /// Whether this instance's distro still has no everyday account - the
-    /// WSL-style question every distro gets asked on its first start.
+    /// Whether this instance still has no everyday account - the WSL-style
+    /// question every instance gets asked on its first start.
+    ///
+    /// Per instance, not per distro: each one has its own disk and so its own
+    /// `/etc/passwd`, so a second instance of a distro you already use is a
+    /// fresh machine that needs its own account (`InstanceDisk`).
     func needsUserSetup(_ instance: Instance) -> Bool {
-        instance.isInstalled && LinuxUserSetup.defaultUser(for: instance.distro) == nil
+        instance.isInstalled && LinuxUserSetup.defaultUser(forInstance: instance.name) == nil
     }
 
     /// Asks for the account first when the distro has none, and runs
@@ -604,10 +775,35 @@ final class AppModel: ObservableObject {
     /// round trip. Used when the card appears.
     func verifySSH(_ instance: Instance) {
         let name = instance.name
-        guard !sshInFlight.contains(name), SSHSetup.RecordStore.load(instance: name) != nil else { return }
+        guard !sshInFlight.contains(name),
+              let record = SSHSetup.RecordStore.load(instance: name) else { return }
         Task { [weak self] in
-            let confirmed = await Task.detached(priority: .utility) {
-                SSHSetup.verifyExisting(instance: name)
+            let confirmed = await Task.detached(priority: .utility) { () -> SSHSetup.Result? in
+                // The quick answer first: an instance that has been up for a
+                // while answers immediately and this costs one TCP connect.
+                if let now = SSHSetup.verifyExisting(instance: name) { return now }
+
+                // **Then keep watching, because one probe is a sample and
+                // what is being sampled is a guest that may still be coming
+                // up.** A guest resumed from hibernate rebuilds its network
+                // card and has to take a DHCP lease again, which routinely
+                // outlasts the setup path's own ten-second wait - so the
+                // card was left saying "isn't answering on port 22", and
+                // blaming the Sandbox's network gate, about a guest that
+                // `nc` and `ssh` both reached perfectly well from the same
+                // Mac moments later (2026-10-04, after a resume).
+                //
+                // Nothing re-checked, either: this runs once when the card
+                // appears, so the stale error stayed on screen for as long
+                // as that instance was selected.
+                //
+                // Every two seconds rather than three times a second: this
+                // is a background watch, not a countdown anybody is staring
+                // at, and a minute of it should cost thirty connects.
+                guard SSHSetup.waitUntilReachable(host: record.host, within: 60, every: 2) else {
+                    return nil
+                }
+                return SSHSetup.verifyExisting(instance: name)
             }.value
             guard let self, let confirmed else { return }
             self.ssh[name] = .ready(confirmed)
@@ -626,7 +822,7 @@ final class AppModel: ObservableObject {
                 // address still answers, there is nothing to do. Only an
                 // instance that fails this costs a guest shell session.
                 if automatic, let confirmed = SSHSetup.verifyExisting(
-                    instance: name, expectedUser: LinuxUserSetup.defaultUser(for: distro) ?? "msl") {
+                    instance: name, expectedUser: LinuxUserSetup.defaultUser(forInstance: name) ?? "msl") {
                     return .ready(confirmed)
                 }
                 // Asked again at the last moment, because the poll that
@@ -639,9 +835,9 @@ final class AppModel: ObservableObject {
                     return .failed("no longer running")
                 }
                 do {
-                    // As the distro's own account, the way WSL would; the
+                    // As the instance's own account, the way WSL would; the
                     // image's built-in `msl` account only until there is one.
-                    let user = LinuxUserSetup.defaultUser(for: distro) ?? "msl"
+                    let user = LinuxUserSetup.defaultUser(forInstance: name) ?? "msl"
                     return .ready(try SSHSetup.configure(instance: name, distro: distro, user: user))
                 } catch {
                     return .failed("\(error)")
@@ -690,8 +886,13 @@ final class AppModel: ObservableObject {
     func isScanning(_ instance: Instance) -> Bool { scanning.contains(instance.name) }
     func isBusy(_ name: String) -> Bool { busy.contains(name) }
 
+    /// `qualifiedName`, matching `descriptor(for:)`. Checking the plain
+    /// name meant a Flatpak app installed as "Calculator (Flatpak).app" was
+    /// then looked up as "Calculator": the tile never showed its checkmark,
+    /// the menu kept offering "Add to Applications" for something already
+    /// added, and "Remove" had nothing to remove.
     func isBundleInstalled(_ app: LinuxApp, in instance: Instance) -> Bool {
-        installedBundles[instance.name]?.contains(LinuxAppBundle.fileSafeName(app.name)) ?? false
+        installedBundles[instance.name]?.contains(LinuxAppBundle.fileSafeName(app.qualifiedName)) ?? false
     }
 
     /// Re-reads the instance's `.desktop` entries and icons. Needs the VM
@@ -708,16 +909,35 @@ final class AppModel: ObservableObject {
     func installDistro(_ distro: GuestDistro) {
         guard installing[distro] == nil else { return }
         installing[distro] = "Fetching manifest…"
+        let cancellation = DistroInstaller.InstallCancellation()
+        installCancels[distro] = cancellation
 
         Task { [weak self] in
             let result = await Task.detached(priority: .userInitiated) { () -> String? in
                 do {
                     try DistroInstaller.install(
                         distro: distro,
-                        manifestURLString: DistroInstaller.resolveManifestURLString(override: nil),
-                        appSupportDir: MSLPaths.appSupport
+                        // The whole chain, same as `msl install`: Hugging
+                        // Face first, SourceForge if it will not serve.
+                        // No override, so nothing to refuse: `distro.source`
+                        // governs pointing MSL at someone else's manifest,
+                        // and the app never does. Installing at all is
+                        // `distro.install`, refused inside `install`.
+                        sources: DistroInstaller.defaultSources,
+                        appSupportDir: MSLPaths.appSupport,
+                        cancellation: cancellation
                     ) { message in
-                        Task { @MainActor [weak self] in self?.installing[distro] = message }
+                        Task { @MainActor [weak self] in
+                            self?.installing[distro] = message
+                            // Each new stage ends the previous transfer, so
+                            // the bar does not linger at 100% through
+                            // verifying and unpacking.
+                            self?.installTransfer[distro] = nil
+                        }
+                    } transfer: { update in
+                        Task { @MainActor [weak self] in
+                            self?.installTransfer[distro] = update
+                        }
                     }
                     return nil
                 } catch {
@@ -727,7 +947,16 @@ final class AppModel: ObservableObject {
 
             guard let self else { return }
             self.installing[distro] = nil
-            if let result {
+            self.installTransfer[distro] = nil
+            let wasCancelled = cancellation.isCancelled
+            self.installCancels[distro] = nil
+            if wasCancelled {
+                // Not an error: they asked for this. The half-downloaded file
+                // is already gone - the installer deletes it on its way out.
+                self.banner = Banner(
+                    kind: .info, title: "Download stopped",
+                    detail: "\(distro.displayName) wasn't installed, and the part that had downloaded has been deleted.")
+            } else if let result {
                 self.banner = Banner(
                     kind: .error, title: "Couldn't install \(distro.displayName)", detail: result)
             } else {
@@ -751,6 +980,17 @@ final class AppModel: ObservableObject {
     }
 
     func isInstalling(_ distro: GuestDistro) -> Bool { installing[distro] != nil }
+
+    /// Stops a download in progress and deletes what it had fetched.
+    ///
+    /// Safe at any point: before the transfer starts, mid-transfer, or after
+    /// it has already finished (in which case nothing is waiting to be
+    /// killed and the install completes as normal).
+    func cancelInstall(_ distro: GuestDistro) {
+        installCancels[distro]?.cancel()
+        installing[distro] = "Stopping…"
+        installTransfer[distro] = nil
+    }
 
     // MARK: - Custom images
 
@@ -808,6 +1048,7 @@ final class AppModel: ObservableObject {
     }
 
     func scanApps(_ instance: Instance) {
+        guard allows("apps.discovery", in: instance) else { return }
         guard !scanning.contains(instance.name) else { return }
         guard !atCap || instance.isLive else {
             banner = Banner(
@@ -859,9 +1100,17 @@ final class AppModel: ObservableObject {
         // are the same path - if one works, both do.
         let descriptor = descriptor(for: app, in: instance)
         if LinuxAppBundle.exists(descriptor) {
+            // A new instance every time, rather than activating the one
+            // already running. Clicking an app twice should open a second
+            // window, the way it would on a Linux desktop; an app that
+            // allows only one instance will still say so itself and raise
+            // the window it has. MSL does not decide that for it.
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.createsNewApplicationInstance = true
+            configuration.activates = true
             NSWorkspace.shared.openApplication(
                 at: LinuxAppBundle.bundleURL(for: descriptor),
-                configuration: NSWorkspace.OpenConfiguration())
+                configuration: configuration)
             return
         }
         let name = instance.name
@@ -887,6 +1136,7 @@ final class AppModel: ObservableObject {
     }
 
     func addToApplications(_ app: LinuxApp, in instance: Instance) {
+        guard allows("apps.launchpad", in: instance) else { return }
         withBestIcon(app, in: instance) { [weak self] resolved in
             guard let self else { return }
             do {
@@ -978,6 +1228,18 @@ final class AppModel: ObservableObject {
     /// load, so drawing a grid of tiles touches neither the disk nor
     /// Core Graphics.
     func icon(for app: LinuxApp, in instance: Instance) -> NSImage {
+        // MSL Files' tile wears the real app's icon, not anything from the
+        // guest - it is a Mac app, and the guest has only the small SVG the
+        // kit installs for the Linux menu.
+        if app.isMSLFiles {
+            if let cached = iconCache[LinuxApp.mslFilesPath] { return cached }
+            let image = MSLAsset.url("MSL_Files_Logo", extension: "png")
+                .flatMap { NSImage(contentsOf: $0) }
+                ?? NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
+                ?? NSImage()
+            iconCache[LinuxApp.mslFilesPath] = image
+            return image
+        }
         if let cached = iconCache[iconKey(app, instance: instance)] { return cached }
         let image = LinuxAppCatalog.icon(for: app, instance: instance.name)
         iconCache[iconKey(app, instance: instance)] = image
@@ -1009,6 +1271,9 @@ final class AppModel: ObservableObject {
     /// the app hasn't been added yet - "pin to Dock" implying "add to
     /// Applications" is far less surprising than refusing.
     func togglePin(_ app: LinuxApp, in instance: Instance) {
+        // Unpinning is always allowed - removing a tile takes nothing away
+        // from the policy, and trapping one in the Dock helps nobody.
+        guard isPinned(app, in: instance) || allows("apps.dock", in: instance) else { return }
         // Unpinning must never boot anything, so the icon upgrade is only
         // worth doing on the path that will actually generate a bundle.
         if LinuxAppBundle.exists(descriptor(for: app, in: instance)) {
@@ -1061,6 +1326,7 @@ final class AppModel: ObservableObject {
         // `qualifiedName` is just `name` for them.
         LinuxAppBundle.Descriptor(
             instance: instance.name, distro: instance.distro, displayName: app.qualifiedName,
+            menuName: app.name,
             command: app.command, icon: LinuxAppCatalog.icon(for: app, instance: instance.name))
     }
 

@@ -1,2 +1,0 @@
-#!/bin/sh
-mount /mnt/mac 2>/dev/null

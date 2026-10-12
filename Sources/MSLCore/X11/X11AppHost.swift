@@ -28,6 +28,22 @@ public final class X11AppHost {
     private let liveConnections = NSCountedSet()
     private let lock = NSLock()
     private var everHadConnection = false
+    /// Connections accepted but not yet counted in `liveConnections`.
+    ///
+    /// Without this the idle check could run in the gap between a
+    /// successful handoff and the `add` below, and a host would `exit(0)`
+    /// holding a descriptor it had just been given - the client on the
+    /// other end simply hangs.
+    private var pendingHandoffs = 0
+    /// Set, under `lock`, once this host has decided to exit: from then on
+    /// every handoff is declined rather than accepted and lost.
+    private var closing = false
+    /// Last time a connection arrived or ended. Exiting needs a full idle
+    /// period since then, not merely "no connection at this instant": a
+    /// client that reconnects often (xhell does per test; Qt does
+    /// routinely) always has instants between connections, and a check
+    /// that happened to land in one exited under the next connection.
+    private var lastActivity = Date()
 
     /// `hostSlot` partitions this host's X11 resource-ID space away from
     /// every other host's - see `X11State.seedClientIndex(hostSlot:)` for
@@ -48,7 +64,27 @@ public final class X11AppHost {
         guard let listener = X11FDChannel.listen(atSocketPath: socketPath) else { return false }
         Thread { [weak self] in
             while let self {
-                guard let handoff = X11FDChannel.accept(on: listener) else { continue }
+                // `break`, not `continue`: a listener that has been closed
+                // or gone invalid fails every time, and continuing turned
+                // that into a host process pinning a core forever with no
+                // windows open. `X11Connection.run`'s read loop already
+                // breaks on error for the same reason.
+                guard let handoff = X11FDChannel.accept(on: listener) else { break }
+                // Taken only if this host is not already on its way out.
+                // Deciding under the same lock as `exitIfIdle` is what
+                // closes the race: either the exit check sees this handoff
+                // pending and stays, or this sees `closing` and declines,
+                // and the router - getting no ack - starts a fresh host.
+                self.lock.lock()
+                let declined = self.closing
+                if !declined { self.pendingHandoffs += 1; self.lastActivity = Date() }
+                self.lock.unlock()
+                if declined {
+                    close(handoff.fd)
+                    close(handoff.control)
+                    continue
+                }
+                X11FDChannel.acknowledge(handoff.control)
                 self.runConnection(fd: handoff.fd, prefix: handoff.payload)
             }
         }.start()
@@ -56,7 +92,7 @@ public final class X11AppHost {
         // the other side - don't sit in the Dock forever if no client ever
         // arrives.
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
-            self?.exitIfIdle()
+            self?.exitIfNeverUsed()
         }
         return true
     }
@@ -67,15 +103,20 @@ public final class X11AppHost {
         // a host whose windows have all gone.
         if prefix == X11AppIdentity.menuMagic {
             Thread { X11GlobalMenuConnection(fd: fd).run() }.start()
+            lock.lock(); pendingHandoffs -= 1; lock.unlock()
             return
         }
         let state = self.state
         let clientIndex = state.nextClientIndex()
-        lock.lock(); liveConnections.add(clientIndex); everHadConnection = true; lock.unlock()
+        lock.lock()
+        liveConnections.add(clientIndex)
+        everHadConnection = true
+        pendingHandoffs -= 1
+        lock.unlock()
         Thread { [weak self] in
             X11Connection(fd: fd, clientIndex: clientIndex, state: state, prefix: prefix, instance: self?.instance).run()
             guard let self else { return }
-            self.lock.lock(); self.liveConnections.remove(clientIndex); self.lock.unlock()
+            self.lock.lock(); self.liveConnections.remove(clientIndex); self.lastActivity = Date(); self.lock.unlock()
             // A little grace: an app often closes one connection and opens
             // another (Qt does this routinely), and quitting in that gap
             // would take the Dock tile down and lose the windows.
@@ -88,13 +129,31 @@ public final class X11AppHost {
     /// outlived its client would leave a tile with no windows behind it.
     private func exitIfIdle() {
         lock.lock()
-        let idle = liveConnections.count == 0
-        let hadOne = everHadConnection
+        let quiet = Date().timeIntervalSince(lastActivity) >= 2.9
+        let idle = liveConnections.count == 0 && pendingHandoffs == 0 && quiet
+        if idle { closing = true }
         lock.unlock()
         guard idle else { return }
-        // A host that never got a client either lost a race with the router
-        // or was started in error; either way it should not linger.
-        _ = hadOne
+        unlink(socketPath)
+        exit(0)
+    }
+
+    /// The startup timer's own check: a host that never got a client
+    /// either lost a race with the router or was started in error, and
+    /// should not sit in the Dock forever.
+    ///
+    /// This is what `everHadConnection` was computed for. It used to be
+    /// read into a local and thrown away (`_ = hadOne`), so the guard the
+    /// comment describes was never actually wired up - which meant the
+    /// 20-second timer applied to every host, including one that was
+    /// simply between connections at that moment. Qt closes one connection
+    /// and opens another routinely.
+    private func exitIfNeverUsed() {
+        lock.lock()
+        let unused = !everHadConnection && liveConnections.count == 0 && pendingHandoffs == 0
+        if unused { closing = true }
+        lock.unlock()
+        guard unused else { return }
         unlink(socketPath)
         exit(0)
     }

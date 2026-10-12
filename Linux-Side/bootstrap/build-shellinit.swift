@@ -1,1 +1,0 @@
-../../Sources/build-shellinit/main.swift

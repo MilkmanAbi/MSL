@@ -25,6 +25,15 @@ final class LaunchFailureTests: XCTestCase {
         XCTAssertFalse(text!.contains("\na\n"))
     }
 
+    /// Guest output arrives CRLF-terminated from the pty, and Swift reads
+    /// "\r\n" as one Character, so a naive split keeps it all on one line.
+    func testCrlfOutputIsSplitIntoLines() {
+        let text = message(1, output: "a\r\nb\r\nc\r\nd\r\nGtk-WARNING: cannot open display\r\n")
+        XCTAssertTrue(text!.contains("cannot open display"))
+        XCTAssertFalse(text!.contains("a\r"), "carriage returns should not survive into the message")
+        XCTAssertFalse(text!.contains("\na\n"), "only the last few lines belong in the message")
+    }
+
     func testLongRunningAppsMayExitHowTheyLike() {
         XCTAssertNil(message(1, runTime: 600))
     }

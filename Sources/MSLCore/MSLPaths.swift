@@ -19,9 +19,55 @@ import Foundation
 /// now one stable, versionless install prefix that bundles can hard-code,
 /// and `HostToolInstaller` keeps it populated.
 public enum MSLPaths {
+    /// Where everything MSL stores lives.
+    ///
+    /// **Under `swift test` this is a temporary directory, not the real
+    /// one.** Tests reach code that writes here without meaning to - the
+    /// greeter records which line it showed last, `DiskStorage` keeps a
+    /// policy index, several types call `ensureDirectory` on construction -
+    /// and every one of those was landing in the developer's own
+    /// `~/Library/Application Support/MSL`. A full run left `last-greeting`,
+    /// a `storage.json` full of invented disks, and five empty directories
+    /// behind, in a folder that had just been deleted to test a fresh
+    /// install.
+    ///
+    /// Writing there is the lesser half of the problem. A test that *reads*
+    /// it is a test whose result depends on the machine it runs on, which
+    /// is how a suite comes to pass for one person and fail for another.
+    ///
+    /// Detected rather than injected on purpose: an opt-in that every test
+    /// file has to remember is an opt-in some test file will forget, and
+    /// the one that forgets is the one that writes to a real home
+    /// directory. `XCTestConfigurationFilePath` is set by `xctest` for the
+    /// whole process and by nothing else.
     public static var appSupport: URL {
-        URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/MSL")
+        if let testing = testingAppSupport { return testing }
+        return URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/MSL")
     }
+
+    /// Set only while running under `xctest`. Computed once: a fresh
+    /// directory per *process*, not per call, or two reads would disagree
+    /// about where something was written.
+    private static let testingAppSupport: URL? = {
+        let environment = ProcessInfo.processInfo.environment
+        // An explicit override wins, for a test that wants a directory it
+        // controls or for a CI run that wants everything in one place.
+        if let explicit = environment["MSL_APP_SUPPORT"], !explicit.isEmpty {
+            return URL(fileURLWithPath: explicit)
+        }
+        // Whether XCTest is loaded into this process, not an environment
+        // variable. `XCTestConfigurationFilePath` was the obvious check and
+        // is simply not set by SwiftPM's runner - measured: the only
+        // test-ish variable present is `SWIFT_TESTING_ENABLED=0`. A class
+        // lookup is true for any runner that loads XCTest at all, which is
+        // the thing actually being asked.
+        guard NSClassFromString("XCTestCase") != nil
+                || ProcessInfo.processInfo.processName == "xctest" else { return nil }
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("msl-tests-\(ProcessInfo.processInfo.processIdentifier)")
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
+    }()
 
     /// Where the host-side executables (`msl`, `mslhd`, `mslgui`,
     /// `msl-applauncher`) are installed for everything outside this

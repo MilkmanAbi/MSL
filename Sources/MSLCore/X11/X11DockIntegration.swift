@@ -66,7 +66,12 @@ final class X11DockIntegration: NSObject {
     /// minimized-in-the-Dock image, which is what actually makes a
     /// minimized Linux window recognizable down there - AppKit's default is
     /// a shrunken screenshot of the window with the *host* app's badge.
-    func setIcon(_ icon: NSImage, forWindow windowID: UInt32, window: NSWindow) {
+    func setIcon(_ rawIcon: NSImage, forWindow windowID: UInt32, window: NSWindow) {
+        // In a squircle, like every other tile in the Dock - a runtime icon
+        // gets no masking from macOS at all (see `SquircleIcon`). Dark tile
+        // when the Mac is in dark mode as the icon arrives.
+        let dark = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let icon = SquircleIcon.framed(rawIcon, dark: dark)
         icons[windowID] = icon
         window.miniwindowImage = icon
         if window.isKeyWindow || openWindows.count == 1 { applyIcon(forKeyWindowID: windowID) }
@@ -114,6 +119,10 @@ final class X11DockIntegration: NSObject {
         // treat the flag as "what actually happened", not "what we asked
         // for", so a refusal doesn't leave us thinking a Dock tile exists.
         isRegular = NSApplication.shared.setActivationPolicy(.regular)
+        // Until (unless) the app sends its own icon - see `placeholderIcon`.
+        if isRegular, NSApplication.shared.applicationIconImage == nil || icons.isEmpty {
+            NSApplication.shared.applicationIconImage = Self.placeholderIcon
+        }
         if isRegular { NSApplication.shared.activate(ignoringOtherApps: true) }
     }
 
@@ -125,9 +134,30 @@ final class X11DockIntegration: NSObject {
     }
 
     private func applyIcon(forKeyWindowID windowID: UInt32) {
-        guard let icon = icons[windowID] else { return }
-        NSApplication.shared.applicationIconImage = icon
+        // Falling back to nil - the generic application icon - rather than
+        // returning early. Returning left the Dock showing the icon of the
+        // app the user just switched AWAY from, which is a worse answer
+        // than a generic one: it names the wrong application.
+        NSApplication.shared.applicationIconImage = icons[windowID] ?? fallbackIcon()
     }
+
+    /// Any icon this app has published for another of its windows, before
+    /// giving up and letting macOS use the generic one. A second window
+    /// without its own `_NET_WM_ICON` is far more likely to belong to the
+    /// same app than to want a blank tile.
+    private func fallbackIcon() -> NSImage? {
+        for entry in openWindows.reversed() {
+            if let icon = icons[entry.id] { return icon }
+        }
+        return Self.placeholderIcon
+    }
+
+    /// For an app that never publishes `_NET_WM_ICON` (glmark2, LÖVE games,
+    /// most SDL and GL tools). The host is a bare executable, not a bundle,
+    /// so "no icon" meant macOS's generic Unix-executable icon - a black
+    /// square reading "exec" - sitting in the Dock. MSL's melon, in the same
+    /// squircle as every other Linux tile, says what it actually is.
+    static let placeholderIcon: NSImage? = LinuxAppBundle.melonIcon.map { SquircleIcon.framed($0) }
 
     // MARK: - Menus
 
@@ -156,6 +186,18 @@ final class X11DockIntegration: NSObject {
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
 
+        // Edit > Emoji & Symbols, as every Mac app has: the character palette
+        // types into the first responder, and the X11 canvas takes text now
+        // (see X11CanvasView+TextInput). Ctrl+Cmd+Space is reserved for it
+        // in X11KeyboardRouter so it isn't forwarded to the Linux app.
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        let emoji = editMenu.addItem(withTitle: "Emoji & Symbols",
+                                     action: #selector(NSApplication.orderFrontCharacterPalette(_:)), keyEquivalent: " ")
+        emoji.keyEquivalentModifierMask = [.command, .control]
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+
         let windowItem = NSMenuItem()
         let windowMenu = NSMenu(title: "Window")
         windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
@@ -179,7 +221,13 @@ final class X11DockIntegration: NSObject {
     private func refreshAppMenuTitle() {
         guard menuInstalled, let appMenu = NSApplication.shared.mainMenu?.item(at: 0)?.submenu else { return }
         let keyID = openWindows.first(where: { $0.window.isKeyWindow })?.id
-        let name = keyID.flatMap { names[$0] } ?? names.values.first ?? "MSL"
+        // `names.values.first` is whatever Swift's per-process hash order
+        // yields, so with two named windows and none key the bar's
+        // leftmost title flipped between reads. `openWindows` is ordered
+        // oldest-first, so the newest named window is a real answer.
+        let name = keyID.flatMap { names[$0] }
+            ?? openWindows.reversed().compactMap { names[$0.id] }.first
+            ?? "MSL"
         appMenu.title = name
         NSApplication.shared.mainMenu?.item(at: 0)?.title = name
     }
@@ -346,7 +394,14 @@ extension X11DockIntegration: NSApplicationDelegate {
     /// windows back, the same way it reopens a native app's window.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
         guard !hasVisibleWindows else { return true }
-        for entry in openWindows { entry.window.deminiaturize(nil) }
+        // `orderFront` as well as `deminiaturize`: `handleUnmapWindow`
+        // hides a window with `orderOut`, which does not miniaturize it,
+        // so a deminiaturize alone left clicking the Dock tile doing
+        // nothing at all for the most common way a window goes away here.
+        for entry in openWindows {
+            entry.window.deminiaturize(nil)
+            entry.window.orderFront(nil)
+        }
         return true
     }
 }

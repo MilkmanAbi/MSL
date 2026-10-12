@@ -1,0 +1,178 @@
+--- a/vtest/vtest_renderer.c	2026-02-10 21:43:59
++++ b/vtest/vtest_renderer.c	2026-09-25 10:08:57
+@@ -235,11 +235,137 @@
+       fprintf(stderr, "Unable to open rendernode '%s' falling back to default search\n",
+               renderer->rendernode_name);
+    return fd;
++}
++
++#ifdef __APPLE__
++/* MSL: macOS has no EGL, and this virglrenderer build expects its embedder
++ * to own the GL contexts (as QEMU does). Two backends:
++ *   MSL_VIRGL_BACKEND=cgl   Apple's desktop OpenGL 4.1 core (on Metal) - default
++ *   MSL_VIRGL_BACKEND=angle ANGLE's EGL, OpenGL ES 3.0 on Metal
++ * Surfaceless either way: virglrenderer renders into its own FBOs. */
++#include <stdlib.h>
++#include <string.h>
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
++#define GL_SILENCE_DEPRECATION 1
++#include <OpenGL/OpenGL.h>
++#include <OpenGL/CGLCurrent.h>
++#include <OpenGL/gl3.h>
++static int msl_use_cgl = 1;
++static EGLDisplay msl_dpy = EGL_NO_DISPLAY;
++static EGLConfig msl_config;
++static CGLPixelFormatObj msl_pf;
++/* The share-group anchor: made at init, never given to virglrenderer (which
++ * destroys its first, probe context), never destroyed. */
++static CGLContextObj msl_root;
++
++static int msl_gl_init(void)
++{
++   const char *backend = getenv("MSL_VIRGL_BACKEND");
++   msl_use_cgl = !(backend && !strcmp(backend, "angle"));
++   if (msl_use_cgl) {
++      CGLPixelFormatAttribute attrs[] = {
++         kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core,
++         kCGLPFAAccelerated, kCGLPFAColorSize, 24, kCGLPFAAlphaSize, 8,
++         kCGLPFADepthSize, 24, kCGLPFAStencilSize, 8, 0
++      };
++      GLint n = 0;
++      if (CGLChoosePixelFormat(attrs, &msl_pf, &n) != kCGLNoError || !msl_pf) {
++         fprintf(stderr, "msl: CGL GL4 core pixel format failed\n");
++         return -1;
++      }
++      if (CGLCreateContext(msl_pf, NULL, &msl_root) != kCGLNoError) {
++         fprintf(stderr, "msl: CGL root context failed\n");
++         return -1;
++      }
++      fprintf(stderr, "msl: backend CGL (desktop GL 4.1 core)\n");
++      return 0;
++   }
++   EGLint major, minor, n = 0;
++   msl_dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
++   if (msl_dpy == EGL_NO_DISPLAY || !eglInitialize(msl_dpy, &major, &minor)) {
++      fprintf(stderr, "msl: ANGLE eglInitialize failed 0x%x\n", eglGetError());
++      return -1;
++   }
++   eglBindAPI(EGL_OPENGL_ES_API);
++   static const EGLint attrs[] = {
++      EGL_RENDERABLE_TYPE, EGL_OPENGL_ES3_BIT, EGL_SURFACE_TYPE, EGL_PBUFFER_BIT,
++      EGL_RED_SIZE, 8, EGL_GREEN_SIZE, 8, EGL_BLUE_SIZE, 8, EGL_ALPHA_SIZE, 8, EGL_NONE
++   };
++   if (!eglChooseConfig(msl_dpy, attrs, &msl_config, 1, &n) || n < 1) {
++      fprintf(stderr, "msl: no ES3 config\n");
++      return -1;
++   }
++   fprintf(stderr, "msl: backend ANGLE EGL %d.%d (%s)\n", major, minor, eglQueryString(msl_dpy, EGL_VENDOR));
++   return 0;
++}
++
++static virgl_renderer_gl_context msl_create_gl_context(void *cookie, int scanout_idx,
++                                                       struct virgl_renderer_gl_ctx_param *param)
++{
++   (void)cookie; (void)scanout_idx;
++   if (msl_use_cgl) {
++      /* One share group for everything, rooted at the first context - as
++       * QEMU does. Sharing with "whatever is current" gave a context
++       * created with nothing current no sharing at all: its buffer and
++       * texture names meant other objects, and a draw from a vertex
++       * buffer made in another context fetched from nothing (Apple's GL
++       * then failed to build the pipeline and drew nothing). */
++      CGLContextObj ctx = NULL;
++      if (getenv("MSL_VIRGL_ONE_CONTEXT")) {
++         /* Every vrend context on ONE GL context. Apple's GL builds its
++          * Metal pipelines per context and fails for a program linked in
++          * another one. virglrenderer serialises everything here anyway. */
++         CGLRetainContext(msl_root);
++         return (virgl_renderer_gl_context)msl_root;
++      }
++      CGLError err = CGLCreateContext(msl_pf, msl_root, &ctx);
++      if (err != kCGLNoError)
++         fprintf(stderr, "msl: CGLCreateContext failed: %s\n", CGLErrorString(err));
++      (void)param;
++      return (virgl_renderer_gl_context)ctx;
++   }
++   const EGLint attrs[] = {
++      EGL_CONTEXT_MAJOR_VERSION, param->major_ver, EGL_CONTEXT_MINOR_VERSION, param->minor_ver, EGL_NONE
++   };
++   EGLContext shared = param->shared ? eglGetCurrentContext() : EGL_NO_CONTEXT;
++   return (virgl_renderer_gl_context)eglCreateContext(msl_dpy, msl_config, shared, attrs);
+ }
+ 
++static void msl_destroy_gl_context(void *cookie, virgl_renderer_gl_context ctx)
++{
++   (void)cookie;
++   if (msl_use_cgl)
++      CGLReleaseContext((CGLContextObj)ctx);
++   else
++      eglDestroyContext(msl_dpy, (EGLContext)ctx);
++}
++
++static int msl_make_current(void *cookie, int scanout_idx, virgl_renderer_gl_context ctx)
++{
++   (void)cookie; (void)scanout_idx;
++   if (msl_use_cgl) {
++      /* GL only guarantees another context sees this one's rendering after
++       * a flush. Mesa hosts flush implicitly on a switch; Apple's GL
++       * batches for Metal and doesn't, so readbacks from the next context
++       * saw the frame before the draws landed - exactly the clear colour. */
++      CGLContextObj current = CGLGetCurrentContext();
++      if (current && current != (CGLContextObj)ctx)
++         glFlush();
++      return CGLSetCurrentContext((CGLContextObj)ctx) == kCGLNoError ? 0 : -1;
++   }
++   return eglMakeCurrent(msl_dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, (EGLContext)ctx) ? 0 : -1;
++}
++#endif
++
+ static struct virgl_renderer_callbacks renderer_cbs = {
+    .version = VIRGL_RENDERER_CALLBACKS_VERSION,
+    .write_fence = vtest_write_implicit_fence,
++#ifdef __APPLE__
++   .create_gl_context = msl_create_gl_context,
++   .destroy_gl_context = msl_destroy_gl_context,
++   .make_current = msl_make_current,
++#endif
+    .get_drm_fd = vtest_get_drm_fd,
+    .write_context_fence = vtest_write_context_fence,
+ };
+@@ -613,6 +739,20 @@
+ 
+    ctx_flags |= VIRGL_RENDERER_THREAD_SYNC |
+                 VIRGL_RENDERER_USE_EXTERNAL_BLOB;
++#ifdef __APPLE__
++   if (msl_gl_init())
++      return -1;
++   /* Our callbacks own the contexts: no internal EGL/GLX winsys. */
++   ctx_flags &= ~(VIRGL_RENDERER_USE_EGL | VIRGL_RENDERER_USE_GLX | VIRGL_RENDERER_USE_SURFACELESS);
++   if (!msl_use_cgl)
++      ctx_flags |= VIRGL_RENDERER_USE_GLES;
++   /* No fence thread: it drives a second shared context concurrently, and
++    * Apple's GL is not safe for that without CGLLockContext (pipeline
++    * builds failed and its software fallback aborted, only when
++    * unslowed). Fences are polled on this thread instead. */
++   if (!getenv("MSL_VIRGL_THREAD_SYNC"))
++      ctx_flags &= ~VIRGL_RENDERER_THREAD_SYNC;
++#endif
+    ret = virgl_renderer_init(&renderer, ctx_flags, &renderer_cbs);
+    if (ret) {
+       fprintf(stderr, "failed to initialise renderer.\n");
+--- a/src/vrend/vrend_renderer.c	2026-09-25 10:15:58
++++ b/src/vrend/vrend_renderer.c	2026-09-25 02:03:37
+@@ -7798,7 +7798,14 @@
+ #ifdef __APPLE__
+    /* macOS core GL 4.1 lacks GL_ARB_copy_image; force fallback paths. */
+    clear_feature(feat_copy_image);
++#ifdef __APPLE__
++   /* MSL: Apple's Metal-backed GL can't build a pipeline for separable
++    * program pipelines fed by vertex attributes - every draw from a vertex
++    * buffer rendered nothing. Plain linked programs work. */
++   if (!getenv("MSL_VIRGL_SSO"))
++      clear_feature(feat_separate_shader_objects);
+ #endif
++#endif
+ 
+    /* Disable host video decode/encode paths entirely in this build to avoid
+     * guest CREATE_VIDEO_BUFFER commands on configurations that cannot service

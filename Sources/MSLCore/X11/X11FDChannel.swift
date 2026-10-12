@@ -80,8 +80,26 @@ enum X11FDChannel {
                 sent = sendmsg(sock, &msg, 0) == iovBuf.count
             }
         }
-        guard sent else { return false }
-        return writeAll(sock, payload)
+        guard sent, writeAll(sock, payload) else { return false }
+        // Wait for the host to say it has taken the connection. Without
+        // this, a host that exited between our connect and its accept
+        // swallowed the connection: the bytes were in its socket buffer, so
+        // this reported success, and the client saw only a dropped display
+        // (found by xhell, which reconnects once per test). No ack means
+        // the caller's existing fallback - start a fresh host - runs.
+        var timeout = timeval(tv_sec: 3, tv_usec: 0)
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var ack: UInt8 = 0
+        return read(sock, &ack, 1) == 1 && ack == Self.ackByte
+    }
+
+    static let ackByte: UInt8 = 0x4B // "K"
+
+    /// Tells the router the handed-off connection has been taken.
+    static func acknowledge(_ control: Int32) {
+        var byte = ackByte
+        _ = write(control, &byte, 1)
+        close(control)
     }
 
     // MARK: - Receiving (per-app host side)
@@ -107,10 +125,15 @@ enum X11FDChannel {
 
     /// Blocks until one handoff arrives. Returns the installed descriptor
     /// and the replay prefix that came with it.
-    static func accept(on listeningFD: Int32) -> (fd: Int32, payload: [UInt8])? {
-        let client = Darwin.accept(listeningFD, nil, nil)
+    /// Receives one handed-off connection. `control` is left open: the
+    /// caller must either `acknowledge` it (connection taken) or close it
+    /// (declined - the router will start another host).
+    static func accept(on listeningFD: Int32) -> (fd: Int32, payload: [UInt8], control: Int32)? {
+        var client: Int32 = -1
+        repeat { client = Darwin.accept(listeningFD, nil, nil) } while client < 0 && errno == EINTR
         guard client >= 0 else { return nil }
-        defer { close(client) } // the CONTROL channel; the passed descriptor outlives it
+        var handedOff = false
+        defer { if !handedOff { close(client) } }
 
         var headerBuffer = [UInt8](repeating: 0, count: 4)
         var control = [UInt8](repeating: 0, count: cmsgSpace(MemoryLayout<Int32>.size))
@@ -152,7 +175,8 @@ enum X11FDChannel {
             }
             guard ok else { close(received); return nil }
         }
-        return (received, payload)
+        handedOff = true
+        return (received, payload, client)
     }
 
     private static func writeAll(_ fd: Int32, _ bytes: [UInt8]) -> Bool {

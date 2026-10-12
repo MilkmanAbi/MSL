@@ -24,9 +24,16 @@ public enum USBClaimError: Error, CustomStringConvertible {
 /// USB/IP requests once that transport is wired up - not yet done, see
 /// README).
 ///
-/// Requires the `com.apple.vm.device-access` entitlement (restricted, see
-/// `Resources/msl-usbd/`) - unlike `USBDeviceEnumerator`/`USBDeviceWatcher`,
-/// which only read the IOKit registry.
+/// **Superseded by `HostUSBDevice`**, which does the same open and then
+/// actually serves the device to a guest over USB/IP. This remains as the
+/// diagnostic path behind `msl-usbd open`.
+///
+/// Needs no entitlement. An earlier version of this comment said it
+/// required `com.apple.vm.device-access`; that is only true of
+/// `IOUSBHostObjectInitOptionsDeviceCapture`, which this does not pass -
+/// and even there the header says root is an alternative. A plain open is
+/// unprivileged and simply fails for a device macOS already has a driver
+/// for, which is the Phase 1 boundary described below.
 ///
 /// **Phase 1 scope, matching the design docs exactly**: this can only
 /// claim devices macOS has no existing system driver for (dev boards,

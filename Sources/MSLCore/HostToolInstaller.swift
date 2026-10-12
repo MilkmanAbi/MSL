@@ -14,13 +14,17 @@ public enum HostToolInstaller {
     /// `mslgui` is included because `X11AppRouter` looks for it as a
     /// sibling of the running host binary - installing them together keeps
     /// that relationship true in the install directory too.
-    public static let tools = ["msl", "mslhd", "mslgui", "msl-applauncher"]
+    public static let tools = ["msl", "mslhd", "mslgui", "msl-applauncher", "msl-usbd"]
 
     /// Tools that must carry `com.apple.security.virtualization` to work at
     /// all. `mslhd` is the only process that ever constructs a
     /// `VZVirtualMachine`; signed without it, it starts, accepts
     /// connections, and then fails the moment anything asks for a VM -
     /// a failure that looks nothing like a signing problem.
+    /// `msl-usbd` is deliberately absent: it is the one tool that runs under
+    /// `sudo`, and `com.apple.vm.device-access` is a *restricted*
+    /// entitlement - ad-hoc signing it gets the process SIGKILLed at exec
+    /// (measured, exit 137). It takes root instead, which is free.
     static let entitledTools: Set<String> = ["mslhd"]
 
     /// Written out next to the installed binaries rather than read from the
@@ -42,6 +46,9 @@ public enum HostToolInstaller {
         public var installed: [String] = []
         public var missing: [String] = []
         public var failed: [String: String] = [:]
+        /// Tools left alone because the copy on offer is older than the one
+        /// already installed - an old MSL.app trying to undo an update.
+        public var skippedOlder: [String] = []
         public var isComplete: Bool { missing.isEmpty && failed.isEmpty }
     }
 
@@ -54,6 +61,11 @@ public enum HostToolInstaller {
     /// location, which is the same lesson `X11AppRouter.ensureShimBinary`
     /// learned when it started copying a binary per Linux app.
     @discardableResult
+    /// Last-modified date, or nil when it cannot be read.
+    static func modified(_ url: URL) -> Date? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path))?[.modificationDate] as? Date
+    }
+
     public static func install(from sourceDirectory: URL) -> Result {
         var result = Result()
         MSLPaths.ensureDirectory(MSLPaths.binDirectory)
@@ -67,6 +79,21 @@ public enum HostToolInstaller {
             let destination = MSLPaths.tool(tool)
             if identical(source, destination) {
                 result.installed.append(tool)
+                continue
+            }
+            // Never go backwards. An older MSL.app left in /Applications
+            // still installs its own tools on every launch, so opening it
+            // once quietly replaced a working `mslhd` with a weeks-old one
+            // - and nothing said so. A copy older than what is installed is
+            // reported as skipped, not silently applied.
+            // An hour of slack. Re-signing rewrites the installed copy, so
+            // its timestamp is always a little newer than the build it came
+            // from; without the tolerance every later install reported a
+            // "downgrade" that was nothing of the sort. What this is for is
+            // an MSL.app that is *days* behind.
+            if let installedDate = modified(destination), let sourceDate = modified(source),
+               installedDate.timeIntervalSince(sourceDate) > 3600 {
+                result.skippedOlder.append(tool)
                 continue
             }
             do {
@@ -135,7 +162,26 @@ public enum HostToolInstaller {
     public static func adhocSign(_ url: URL, entitlements: URL? = nil, deep: Bool = false) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        var arguments = ["--force", "--sign", "-"]
+        // **A stable identity, not just a signature.**
+        //
+        // Ad-hoc signing defaults a binary's designated requirement to its
+        // cdhash, which changes on every build. macOS keys privacy grants -
+        // Local Network above all - on that requirement, so each update
+        // looked like a brand new program and silently lost every
+        // permission the user had given.
+        //
+        // That is how it presented: the Tailscale route worked, mslhd was
+        // rebuilt, and afterwards every connection was refused with
+        // EHOSTUNREACH while the same command from a shell still reached
+        // the guest. The app bundle's copy already carried
+        // `identifier "com.msl.app"`; the copy the LaunchAgent actually
+        // runs, installed here, did not.
+        //
+        // `--identifier` makes each tool's identity its name rather than
+        // its contents, and the designated requirement follows from it.
+        var arguments = ["--force", "--sign", "-",
+                         "--identifier", "com.msl." + url.lastPathComponent,
+                         "-r=designated => identifier \"com.msl." + url.lastPathComponent + "\""]
         if deep { arguments.append("--deep") }
         if let entitlements { arguments += ["--entitlements", entitlements.path] }
         arguments.append(url.path)

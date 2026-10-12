@@ -40,7 +40,14 @@ final class X11ConnectionSetupTests: XCTestCase {
             XCTAssertEqual(r.readU8(), 32) // scanline-pad
             r.skip(5)
         }
-        XCTAssertEqual(pixmapFormats, [1: 1, 24: 32, 32: 32])
+        // One format per depth a client can really create a pixmap at.
+        // 4 and 8 are here because both are accepted (depth 8 is RENDER's A8
+        // coverage mask; depth 4 exists so libXrender's `XRenderHasDepths`
+        // probe enables RENDER at all), and Xlib needs a bits-per-pixel for
+        // them. 16 is deliberately absent - no 16-bit visual, no 16bpp
+        // packer - and a client must not be told otherwise.
+        XCTAssertEqual(pixmapFormats, [1: 1, 4: 8, 8: 8, 24: 32, 32: 32])
+        XCTAssertNil(pixmapFormats[16], "claiming depth 16 would be a lie a client could act on")
 
         XCTAssertEqual(screens, 1)
         r.skip(39) // SCREEN fields up to number-of-depths

@@ -10,7 +10,6 @@
 MSL-Images/shared/kernel-Image
 MSL-Images/shared/initramfs-virt
 dist/
+
+# Session transcripts: working notes, never published.
 .claude-session/
-MSL-Images/*.xz
-MSL-Images/*.gz
-__pycache__/

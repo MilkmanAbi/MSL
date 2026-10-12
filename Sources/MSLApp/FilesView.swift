@@ -17,40 +17,144 @@ import UniformTypeIdentifiers
 /// and files move across the boundary by dragging.
 struct FilesView: View {
     @EnvironmentObject private var model: AppModel
-    @StateObject private var files = FilesModel()
+    @StateObject private var files: FilesModel
+    /// Which window this view is in, so a link can tell a real window from
+    /// the hidden one prewarming leaves behind. See `consumeLink`.
+    @StateObject private var hostWindow = HostWindowBox()
+
+    /// A bar across the bottom of the window. The file picker puts its
+    /// "Save as" field and Cancel/Open buttons here, which is the whole
+    /// reason this view is reusable: a Linux app's Open dialog is this
+    /// browser plus two buttons, not a second browser written from scratch.
+    private let accessory: AnyView?
+    /// The asking app's own dialog title ("Save As", "Open Image"), which
+    /// should win over the folder name a normal window shows.
+    private let titleOverride: String?
+
+    /// An ordinary MSL Files window, owning its own model.
+    init() {
+        _files = StateObject(wrappedValue: FilesModel())
+        accessory = nil
+        titleOverride = nil
+    }
+
+    /// The same browser driven by someone else's model, with a bar along the
+    /// bottom - what the file picker uses.
+    ///
+    /// The model is passed in because the picker has to configure it before
+    /// the view appears (select the instance, walk to the folder the app
+    /// asked for) and read the selection back when a button is pressed.
+    init(files: FilesModel, title: String?, @ViewBuilder accessory: () -> some View) {
+        _files = StateObject(wrappedValue: files)
+        self.accessory = AnyView(accessory())
+        titleOverride = title
+    }
+
+    /// True when this is a picker rather than a window in its own right.
+    private var isPicker: Bool { accessory != nil }
+
+    /// Takes the pending link, if this window is the one that gets it.
+    private func consumeLink() {
+        // Never in a picker: a reveal meant for a real MSL Files window must
+        // not be swallowed by a dialog that is about to close, which would
+        // lose it entirely.
+        guard !isPicker else { return }
+        // Nor in the hidden window prewarming left behind: it is alive and
+        // listening with nothing on screen, so it used to take the link and
+        // navigate invisibly, leaving the window that opened a moment later
+        // on the MSL tab. See `NSWindow.isWithdrawnPrewarm`.
+        if hostWindow.window?.isWithdrawnPrewarm == true { return }
+        guard let url = MSLFilesLink.take() else { return }
+        if files.reveal(url) { Task { await model.refresh() } }
+    }
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-        } detail: {
-            if files.selectedRoot == nil {
-                ContentUnavailableView {
-                    Label("Nothing to browse", systemImage: "folder")
-                } description: {
-                    Text("Start an instance to see its Linux filesystem here.")
-                }
-            } else {
-                browser
+        VStack(spacing: 0) {
+            NavigationSplitView {
+                sidebar
+            } detail: {
+                detail
+            }
+            if let accessory {
+                Divider()
+                accessory
             }
         }
-        .navigationTitle(files.breadcrumbs.last?.name ?? "MSL Files")
+        // Layer 1, the base: the window's own appearance (System / Light /
+        // Dark / Darker). Set on the NSWindow so sheets and menus agree.
+        .preferredColorScheme(files.appearance.colorScheme)
+        .background(WindowAppearance(appearance: files.appearance.nsAppearance))
+        // Layer 2, the highlight: tints selection, focused controls and the
+        // toolbar. `nil` keeps the system accent (Finder).
+        .tint(files.theme.accent)
+        // Published from the top of the window, not the browser: while the MSL
+        // dashboard showed, the menu bar couldn't see the model at all, so the
+        // Go menu, Go to Folder (⇧⌘G) and every File command went dead there.
+        .focusedSceneObject(files)
+        // Arrow keys move the selection in every view mode (shift extends).
+        // An AppKit key monitor rather than `.keyboardShortcut`: SwiftUI
+        // matched a plain arrow to the shift-registered shortcut, so every
+        // arrow press extended the selection.
+        .background(ArrowKeyMonitor(files: files))
+        .readsHostWindow(into: hostWindow)
+        .environment(\.filesFolderTint, files.tintFolderArea ? files.theme.muted : nil)
+        .environment(\.filesCustomBackdrop, files.usesCustomBackdrop)
+        .navigationTitle(titleOverride
+                         ?? (files.isShowingDashboard ? "MSL" : (files.breadcrumbs.last?.name ?? "MSL Files")))
         .onAppear { files.rebuildRoots(from: model.instances) }
-        .onOpenURL { url in
-            // The instance's mount may be newer than this window's list of
-            // roots; the reveal waits for the refresh if it has to.
-            if files.reveal(url) { Task { await model.refresh() } }
-        }
+        // Links come from `MSLFilesLink`, not SwiftUI's `onOpenURL`: routing
+        // them through SwiftUI opened a second window on a cold launch. The
+        // instance's mount may be newer than this window's list of roots, so
+        // the reveal waits for the refresh if it has to.
+        .onAppear { consumeLink() }
+        .onReceive(NotificationCenter.default.publisher(for: MSLFilesLink.didArrive)) { _ in consumeLink() }
         .onChange(of: model.instances) { _, new in files.rebuildRoots(from: new) }
         .sheet(item: $files.quickLookTarget) { target in
-            quickLookSheet(target.url)
+            QuickLookSheet(item: target.item, files: files) { files.quickLookTarget = nil }
+        }
+        .sheet(item: $files.editorTarget) { target in
+            FileTextEditorSheet(target: target) { files.editorTarget = nil }
         }
         .sheet(item: $files.infoTarget) { item in
             FileInfoSheet(item: item, files: files) { files.infoTarget = nil }
         }
+        .sheet(item: $files.gitTarget) { target in
+            GitPanel(path: target.path, folderName: target.name, files: files) {
+                files.gitTarget = nil
+                // Whatever was done in there may have changed the dots.
+                files.refreshGitBadges()
+            }
+        }
+        // Editing a file *inside* a repository does not change the listing
+        // that contains it, so navigation alone would never notice. Coming
+        // back to the window is the moment that matters: somebody worked in a
+        // terminal or an editor and returned. Deliberately not a timer -
+        // every pass is a guest command, and polling would keep an idle
+        // instance from ever suspending.
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification)) { _ in
+            files.refreshGitBadges()
+        }
         .sheet(isPresented: $files.goToFolderPresented) {
             GoToFolderSheet(files: files)
         }
+        .sheet(isPresented: Binding(
+            get: { !files.powerRenameTargets.isEmpty },
+            set: { if !$0 { files.powerRenameTargets = [] } })
+        ) {
+            PowerRenameSheet(files: files, paths: files.powerRenameTargets)
+        }
         .background(shortcuts)
+        // Track when a text field (search, rename, Go-to-Folder) is being
+        // edited, so the bare-key file shortcuts can stand aside for it. The
+        // field editor posts these for every `NSTextField`/`NSSearchField` in
+        // the window, which is exactly the set we want to yield to.
+        .onReceive(NotificationCenter.default.publisher(for: NSControl.textDidBeginEditingNotification)) { _ in
+            files.isEditingText = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSControl.textDidEndEditingNotification)) { _ in
+            files.isEditingText = false
+        }
         .confirmationDialog(
             "This volume has no Trash.",
             isPresented: Binding(
@@ -65,6 +169,22 @@ struct FilesView: View {
             Button("Cancel", role: .cancel) { files.pendingPermanentDelete = [] }
         } message: {
             Text("Deleting here cannot be undone.")
+        }
+    }
+
+    // MARK: - Detail
+
+    @ViewBuilder private var detail: some View {
+        if files.isShowingDashboard {
+            MSLDashboardView(files: files, instances: model.instances)
+        } else if files.selectedRoot == nil {
+            ContentUnavailableView {
+                Label("Nothing to browse", systemImage: "folder")
+            } description: {
+                Text("Start an instance to see its Linux filesystem here.")
+            }
+        } else {
+            browser
         }
     }
 
@@ -99,15 +219,21 @@ struct FilesView: View {
             }
         }
         .navigationSplitViewColumnWidth(min: 190, ideal: 210)
+        // Darker replaces the translucent sidebar material with a deep solid,
+        // matching the folder area; every other appearance keeps the system
+        // sidebar.
+        .scrollContentBackground(files.appearance == .darker ? .hidden : .automatic)
+        .background(files.appearance == .darker ? FolderBackdrop.darkerSidebar : Color.clear)
     }
 
     private func rootRow(_ root: FileRoot) -> some View {
         Label {
             HStack(spacing: 4) {
                 Text(root.name).lineLimit(1)
-                // A lock beside a *tag* would be nonsense - nothing about a
-                // saved search is read-only in the way a volume is.
-                if root.readOnly, !root.kind.isQuery {
+                // A lock belongs only on a real read-only directory - not on a
+                // saved search (nothing about it is "read-only" like a volume)
+                // and not on the MSL dashboard (which isn't a place at all).
+                if root.readOnly, root.kind == .directory {
                     Image(systemName: "lock.fill")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
@@ -122,15 +248,42 @@ struct FilesView: View {
                     .frame(width: 10, height: 10)
             } else {
                 Image(systemName: root.symbol)
-                    .foregroundStyle(root.isGuest ? Color.orange : Color.accentColor)
+                    .foregroundStyle(root.isGuest ? Color.orange : files.theme.selection)
             }
         }
         .help(root.subtitle)
-        // Dropping onto a tag applies it, the way Finder's sidebar tags do.
-        .dropDestination(for: URL.self) { urls, _ in
-            guard case .tag(let name) = root.kind else { return false }
-            files.toggleTag(name, on: Set(urls.map(\.path)))
-            return true
+        // Re-clicking the root you're already inside returns to its top, as
+        // Finder does. The gesture is masked off (`.subviews`) on every row
+        // except the selected one: a tap gesture on all of them competed with
+        // the List's own selection, which made clicking to *switch* roots
+        // laggy and sometimes eat the click after a text field had focus. Only
+        // the already-selected row needs it, and that's the row you re-click.
+        .simultaneousGesture(
+            TapGesture().onEnded { files.returnToTop(root) },
+            including: root.id == files.selectedRoot?.id ? .all : .subviews)
+        // Dropping onto a sidebar row does what the row is: a tag gets
+        // applied, the way Finder's sidebar tags do, and a place takes the
+        // files. Dragging something to Downloads or to an instance without
+        // first navigating there is most of what a sidebar is for.
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            switch root.kind {
+            case .tag(let name):
+                FileDropTarget.loadFileURLs(from: providers) { urls in
+                    guard !urls.isEmpty else { return }
+                    files.toggleTag(name, on: Set(urls.map(\.path)))
+                }
+                return true
+            case .directory:
+                guard !root.readOnly else { return false }
+                FileDropTarget.loadFileURLs(from: providers) { urls in
+                    guard !urls.isEmpty else { return }
+                    files.receive(urls, into: root.path)
+                }
+                return true
+            default:
+                // Recents and the dashboard are not places files can go.
+                return false
+            }
         }
     }
 
@@ -142,19 +295,26 @@ struct FilesView: View {
                 pathBar
                 Divider()
             }
+            // The background menu goes on the content area, not the whole
+            // window: right-clicking a row must still get the row's own menu,
+            // and SwiftUI gives the innermost one.
             content
+                .fileBackgroundMenu(files)
             if files.showStatusBar {
                 Divider()
                 statusBar
             }
         }
-        .dropDestination(for: URL.self) { urls, _ in
-            guard files.canWrite else { return false }
-            files.receive(urls)
-            return true
-        }
+        // The whole window, in AppKit: SwiftUI's List answers drags over its
+        // own empty space and never passes them out. See `FileDropCatcher`.
+        .background(
+            FileDropCatcher(destination: { files.canWrite ? files.currentPath : nil },
+                            folderUnderPoint: { files.dropFolder(at: $0) },
+                            receive: { urls, destination in
+                                files.receive(urls, into: destination)
+                            })
+        )
         .toolbar { toolbarContent }
-        .focusedSceneObject(files)
         // `.searchable` rather than a `TextField` in a `ToolbarItem`: the
         // toolbar drops items it has no room for, and a hand-rolled field
         // is the first thing to go - it vanished entirely at the window's
@@ -164,22 +324,22 @@ struct FilesView: View {
     }
 
     @ToolbarContentBuilder private var toolbarContent: some ToolbarContent {
+        // These are toolbar affordances only; their key equivalents are owned
+        // by `FilesCommands` (the Go menu, ⌘↓ Open) so they register exactly
+        // once. A key equivalent on a toolbar button *and* the menu fires the
+        // action twice.
         ToolbarItemGroup(placement: .navigation) {
             Button { files.goBack() } label: { Image(systemName: "chevron.left") }
                 .disabled(!files.canGoBack)
-                .keyboardShortcut("[", modifiers: .command)
                 .help("Back (⌘[)")
             Button { files.goForward() } label: { Image(systemName: "chevron.right") }
                 .disabled(!files.canGoForward)
-                .keyboardShortcut("]", modifiers: .command)
                 .help("Forward (⌘])")
             Button { files.goUp() } label: { Image(systemName: "chevron.up") }
                 .disabled(files.path.isEmpty)
-                .keyboardShortcut(.upArrow, modifiers: .command)
                 .help("Enclosing folder (⌘↑)")
             Button { openSelection() } label: { Image(systemName: "arrow.down.forward.square") }
                 .disabled(files.selection.isEmpty)
-                .keyboardShortcut(.downArrow, modifiers: .command)
                 .help("Open (⌘↓, or double-click)")
         }
 
@@ -197,19 +357,26 @@ struct FilesView: View {
 
         ToolbarItem { sortMenu }
 
+        ToolbarItem { ThemePicker(files: files) }
+
         ToolbarItemGroup {
             Button { files.newFolder() } label: { Image(systemName: "folder.badge.plus") }
                 .disabled(!files.canWrite)
-                .keyboardShortcut("n", modifiers: [.command, .shift])
                 .help(files.canWrite ? "New folder (⇧⌘N)" : "This location is read-only")
-            Button {
-                if let path = files.selection.first {
-                    files.quickLookTarget = QuickLookTarget(url: URL(fileURLWithPath: path))
-                }
-            } label: { Image(systemName: "eye") }
-                .disabled(files.selection.isEmpty)
-                .keyboardShortcut(.space, modifiers: [])
-                .help("Quick Look (space)")
+            // The eye toggles hidden files, for Mac and Linux roots alike
+            // (`showHidden` filters every root). A real `Toggle` in `.button`
+            // style, not a tinted `Button`: a toolbar draws the button style's
+            // on-state as a filled highlight (and ignores `foregroundStyle`),
+            // so "on" actually looks pressed the way the ask wanted. Open eye
+            // when showing everything, slashed eye when hiding. Quick Look
+            // lives on the space bar and in the right-click menu now.
+            Toggle(isOn: $files.showHidden) {
+                Image(systemName: files.showHidden ? "eye" : "eye.slash")
+            }
+            .toggleStyle(.button)
+            .help(files.showHidden
+                  ? "Showing hidden files - click to hide them (⇧⌘.)"
+                  : "Hidden files are hidden - click to show them (⇧⌘.)")
             ShareLink(items: files.selection.sorted().map { URL(fileURLWithPath: $0) }) {
                 Image(systemName: "square.and.arrow.up")
             }
@@ -227,31 +394,55 @@ struct FilesView: View {
             .help("Tags")
             Button { files.delete(files.selection) } label: { Image(systemName: "trash") }
                 .disabled(files.selection.isEmpty || !files.canWrite)
-                .keyboardShortcut(.delete, modifiers: .command)
                 .help("Move to Trash (⌘⌫)")
         }
 
     }
 
-    /// Shortcuts with no toolbar button of their own. Zero-sized buttons
-    /// are the supported way to register a key equivalent in SwiftUI
-    /// without putting a control on screen for it.
+    /// The bare-key and Edit-style file shortcuts, as zero-sized buttons -
+    /// the supported way to register a key equivalent in SwiftUI without a
+    /// visible control. Only the ones `FilesCommands` does *not* already own
+    /// live here (⌘D, ⌘I and the navigation keys are the menu's, registered
+    /// once): a key equivalent in two places fires twice.
+    ///
+    /// Every one of these is a key macOS also gives to a focused text field -
+    /// ⌘C/⌘V to copy and paste text, Space to type a space, Return to commit -
+    /// so each disables itself while `isEditingText`. A *disabled* button
+    /// yields its key equivalent instead of consuming it, so the keystroke
+    /// falls through to the search field, the rename field or the Go-to-Folder
+    /// sheet where it belongs.
     private var shortcuts: some View {
         Group {
-            Button("") { files.copyToPasteboard(files.selection) }
-                .keyboardShortcut("c", modifiers: .command)
-                .disabled(files.selection.isEmpty)
-            Button("") { files.pasteFromPasteboard() }
-                .keyboardShortcut("v", modifiers: .command)
-                .disabled(!files.canWrite)
-            Button("") { files.duplicate(files.selection) }
-                .keyboardShortcut("d", modifiers: .command)
-                .disabled(files.selection.isEmpty || !files.canWrite)
+            // ⌘C / ⌘V: the `isEditingText` disable hands the keystroke to a
+            // field once it is *actively editing*. But a field that has focus
+            // and a selection but hasn't been typed into yet doesn't count as
+            // editing, so these also forward to the field editor at action
+            // time - copying the selected *text*, not the selected files.
             Button("") {
-                if let item = files.focusedItem { files.infoTarget = item }
+                if let text = NSApp.keyWindow?.firstResponder as? NSText { text.copy(nil); return }
+                files.copyToPasteboard(files.selection)
             }
-            .keyboardShortcut("i", modifiers: .command)
-            .disabled(files.focusedItem == nil)
+            .keyboardShortcut("c", modifiers: .command)
+            .disabled(files.selection.isEmpty || files.isEditingText)
+            Button("") {
+                if let text = NSApp.keyWindow?.firstResponder as? NSText { text.paste(nil); return }
+                files.pasteFromPasteboard()
+            }
+            .keyboardShortcut("v", modifiers: .command)
+            .disabled(!files.canWrite || files.isEditingText)
+            // ⌘↓ opens the selection, the second Finder way to open (⌘O is the
+            // other, owned by FilesCommands). Guarded because ⌘↓ moves to
+            // end-of-text in a field.
+            Button("") { openSelection() }
+                .keyboardShortcut(.downArrow, modifiers: .command)
+                .disabled(files.selection.isEmpty || files.isEditingText)
+            // Space is Quick Look, as in Finder - owned here rather than by the
+            // toolbar's eye button so it can carry the text-field guard.
+            Button("") {
+                if let path = files.selection.first { files.quickLook(path: path) }
+            }
+            .keyboardShortcut(.space, modifiers: [])
+            .disabled(files.selection.isEmpty || files.isEditingText || files.renaming != nil)
             // Return renames the selection, as it does in Finder - where
             // Return is *not* "open", which trips up people arriving from
             // Windows but is what Mac muscle memory expects.
@@ -259,7 +450,8 @@ struct FilesView: View {
                 if let path = files.selection.first { files.renaming = path }
             }
             .keyboardShortcut(.return, modifiers: [])
-            .disabled(files.selection.count != 1 || !files.canWrite)
+            .disabled(files.selection.count != 1 || !files.canWrite
+                      || files.isEditingText || files.renaming != nil)
         }
         .opacity(0)
         .frame(width: 0, height: 0)
@@ -295,9 +487,16 @@ struct FilesView: View {
                             .font(.caption2)
                             .foregroundStyle(.tertiary)
                     }
+                    // The folder you're in is drawn in the theme colour (or
+                    // plain, under Finder), its ancestors dimmed - so the trail
+                    // carries the paint too.
+                    let isCurrent = index == files.breadcrumbs.count - 1
                     Button(crumb.name) { files.goTo(crumb.path) }
                         .buttonStyle(.plain)
-                        .foregroundStyle(index == files.breadcrumbs.count - 1 ? .primary : .secondary)
+                        .foregroundStyle(isCurrent
+                                         ? AnyShapeStyle(files.theme.accent ?? Color.primary)
+                                         : AnyShapeStyle(HierarchicalShapeStyle.secondary))
+                        .fontWeight(isCurrent ? .medium : .regular)
                 }
             }
             .padding(.vertical, 3)
@@ -331,6 +530,7 @@ struct FilesView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background { FolderBackdrop(files: files) }
     }
 
     private var statusBar: some View {
@@ -344,10 +544,14 @@ struct FilesView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            if files.selectedRoot?.readOnly == true, files.selectedRoot?.kind.isQuery == false {
+            if files.selectedRoot?.readOnly == true, files.selectedRoot?.kind == .directory {
                 Label("Read-only", systemImage: "lock.fill").foregroundStyle(.secondary)
             }
-            if let available = files.availableCapacity, !files.isShowingQueryResults {
+            // On a Linux root, the real disk figures (a WebDAV mount reports
+            // none); on a Mac root, the volume's free space.
+            if let guest = files.guestDiskSummary {
+                Text(guest).foregroundStyle(.secondary)
+            } else if let available = files.availableCapacity, !files.isShowingQueryResults {
                 Text("\(available) available").foregroundStyle(.secondary)
             }
         }
@@ -369,20 +573,5 @@ struct FilesView: View {
         let selected = files.selection.count
         let items = "\(total) item\(total == 1 ? "" : "s")"
         return selected > 1 ? "\(selected) of \(items) selected" : items
-    }
-
-    private func quickLookSheet(_ url: URL) -> some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text(url.lastPathComponent).font(.headline).lineLimit(1)
-                Spacer()
-                Button("Done") { files.quickLookTarget = nil }
-                    .keyboardShortcut(.defaultAction)
-            }
-            .padding(Design.Spacing.medium)
-            Divider()
-            QuickLookPreview(url: url)
-                .frame(minWidth: 640, minHeight: 460)
-        }
     }
 }

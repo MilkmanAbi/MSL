@@ -54,6 +54,68 @@ public enum DaemonClient {
         return text.hasSuffix("\n") ? String(text.dropLast()) : text
     }
 
+    /// Lists a guest directory through mslhd's `fileopsd` relay, returning the
+    /// real Linux entries (name + `st_mode`), or `nil` when the overlay isn't
+    /// available: the instance isn't running, an mslhd too old to know the
+    /// command, or a guest image too old for LIST2. Every one of those means
+    /// "just show the mount listing without the Linux mode," so the caller
+    /// treats `nil` as "no overlay," never as an error. A blocking socket
+    /// round trip - call it off the main actor.
+    public static func guestList(instance: String, guestPath: String,
+                                 timeout: TimeInterval = 8) -> [FileOpsProtocol.Entry]? {
+        guard let reply = send(.fileList(instance: instance, guestPath: guestPath), timeout: timeout),
+              reply.hasPrefix("OK ") else { return nil }
+        guard let data = Data(base64Encoded: String(reply.dropFirst(3))) else { return nil }
+        return (try? FileOpsProtocol.parseList2(Array(data)))?.entries
+    }
+
+    /// Sets a guest file's permission bits through the relay. Returns whether
+    /// it took - `false` covers a stopped instance, an old mslhd/image, or a
+    /// guest-side failure, all of which the caller reports the same way.
+    @discardableResult
+    public static func guestChmod(instance: String, guestPath: String, mode: UInt32,
+                                  timeout: TimeInterval = 8) -> Bool {
+        send(.fileChmod(instance: instance, guestPath: guestPath, mode: mode),
+             timeout: timeout)?.hasPrefix("OK ") ?? false
+    }
+
+    /// Reads a guest folder's git state, or initialises a repository in it.
+    ///
+    /// Thirty seconds, because the daemon allows the guest twenty and a
+    /// caller that gave up first would leave the answer it asked for
+    /// arriving at a closed socket.
+    public static func guestGit(instance: String, guestPath: String,
+                                operation: GitOperation, argument: String = "",
+                                timeout: TimeInterval = 30) -> Result<String, Git.Absence> {
+        guard let reply = send(.gitQuery(instance: instance, guestPath: guestPath,
+                                         operation: operation, argument: argument),
+                               timeout: timeout) else {
+            return .failure(.failed("MSL's daemon is not answering."))
+        }
+        guard reply.hasPrefix("OK ") else {
+            // The daemon's own refusal, which is a different thing from git
+            // having nothing to say - a stopped instance and a folder with no
+            // repository need different words and different buttons.
+            let reason = String(reply.dropFirst(reply.hasPrefix("ERROR ") ? 6 : 0))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if reason.contains("not running") { return .failure(.instanceNotRunning) }
+            // A daemon that does not recognise the request says nothing at
+            // all, which is what an mslhd older than this feature does. An
+            // empty refusal read as an empty error message was genuinely
+            // confusing to debug, so it says the useful thing instead.
+            guard !reason.isEmpty else {
+                return .failure(.failed("MSL's background service is older than this feature "
+                                        + "- quit and reopen MSL to update it."))
+            }
+            return .failure(.failed(reason))
+        }
+        guard let data = Data(base64Encoded: String(reply.dropFirst(3))),
+              let output = String(data: data, encoding: .utf8) else {
+            return .failure(.failed("MSL could not read git's answer."))
+        }
+        return .success(output)
+    }
+
     /// Whether the daemon is up *right now*. A live `connect()`, not a
     /// check for the socket file: `mslhd` unlinks and re-binds its socket
     /// on start but a killed daemon leaves the file behind, so the file
@@ -82,7 +144,26 @@ public enum DaemonClient {
         }
 
         log?("mslhd isn't running - starting it")
-        installLaunchAgent()
+
+        // **Someone who turned "start at login" off still gets a daemon, and
+        // still does not get a login item.** Those used to be the same
+        // switch by accident: the only way MSL knew how to start mslhd was
+        // to bootstrap a launchd job, and that job carries `RunAtLoad`, so
+        // starting the daemon re-created exactly the thing the person had
+        // just turned off. The toggle was a lie the first time the app
+        // opened after it (measured 2026-10-02: opt-out set, plist deleted,
+        // app opened, plist back).
+        //
+        // Opted out, mslhd is launched directly instead. It outlives whoever
+        // started it because it is given its own session, so quitting the app
+        // or closing the terminal leaves the guests running - just without a
+        // job that comes back by itself after a restart, which is the whole
+        // point of the setting.
+        if launchAgentOptedOut {
+            startDetached(daemon, log: log)
+        } else {
+            installLaunchAgent()
+        }
         // `kickstart` rather than `load`: idempotent, and it starts the job
         // immediately instead of waiting for the next RunAtLoad.
         //
@@ -103,10 +184,12 @@ public enum DaemonClient {
         // upgrade it hasn't. So: kickstart, and if the job is unknown,
         // bootstrap it back and kickstart that. Bootstrapping an
         // already-loaded job fails harmlessly, so only the first status matters.
-        let domain = "gui/\(getuid())"
-        if runLaunchctl(["kickstart", "\(domain)/\(MSLPaths.launchAgentLabel)"]) != 0 {
-            runLaunchctl(["bootstrap", domain, MSLPaths.launchAgentPlist.path])
-            runLaunchctl(["kickstart", "\(domain)/\(MSLPaths.launchAgentLabel)"])
+        if !launchAgentOptedOut {
+            let domain = "gui/\(getuid())"
+            if runLaunchctl(["kickstart", "\(domain)/\(MSLPaths.launchAgentLabel)"]) != 0 {
+                runLaunchctl(["bootstrap", domain, MSLPaths.launchAgentPlist.path])
+                runLaunchctl(["kickstart", "\(domain)/\(MSLPaths.launchAgentLabel)"])
+            }
         }
 
         let deadline = Date().addingTimeInterval(timeout)
@@ -163,14 +246,70 @@ public enum DaemonClient {
             return false
         }
         // Rewriting an identical plist would still need a bootout/bootstrap
-        // cycle to take effect, so skip when nothing changed.
+        // cycle to take effect, so skip when nothing changed **and the job is
+        // actually loaded**.
+        //
+        // That second half was missing, and it mattered: a plist on disk is
+        // not a job in launchd. Anything that boots the agent out - an
+        // upgrade, a crash, someone running `launchctl bootout` - leaves the
+        // file exactly as it was, so this returned "installed, nothing to do"
+        // and the daemon stayed down however many times the app was opened
+        // (measured 2026-10-02: agent unloaded, plist untouched, app
+        // launched, no mslhd).
         let existing = try? Data(contentsOf: MSLPaths.launchAgentPlist)
-        guard existing != data else { return true }
-        guard (try? data.write(to: MSLPaths.launchAgentPlist, options: .atomic)) != nil else { return false }
+        if existing == data, isLaunchAgentLoaded() { return true }
+        if existing != data {
+            guard (try? data.write(to: MSLPaths.launchAgentPlist, options: .atomic)) != nil else { return false }
+        }
         let domain = "gui/\(getuid())"
         runLaunchctl(["bootout", "\(domain)/\(MSLPaths.launchAgentLabel)"])
         runLaunchctl(["bootstrap", domain, MSLPaths.launchAgentPlist.path])
         return true
+    }
+
+    /// Whether the person has turned off "start MSL's service automatically".
+    ///
+    /// Read here, in Core, rather than only in the app: `msl` on the command
+    /// line reaches `ensureRunning` too, and a CLI that quietly reinstated
+    /// the login item would undo the setting just as thoroughly as the app
+    /// did.
+    public static var launchAgentOptedOut: Bool {
+        UserDefaults.standard.bool(forKey: "MSLLaunchAgentOptOut")
+    }
+
+    /// Starts mslhd without launchd, in its own session so it outlives the
+    /// process that started it.
+    private static func startDetached(_ daemon: URL, log: ((String) -> Void)?) {
+        MSLPaths.ensureDirectory(MSLPaths.logsDirectory)
+        let logPath = MSLPaths.logsDirectory.appendingPathComponent("mslhd.log").path
+        if !FileManager.default.fileExists(atPath: logPath) {
+            FileManager.default.createFile(atPath: logPath, contents: nil)
+        }
+        let process = Process()
+        // `setsid` so closing the terminal that ran `msl`, or quitting the
+        // app, does not take the daemon and every guest with it.
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["sh", "-c",
+                             "exec /usr/bin/nohup \(shellQuoted(daemon.path)) >> \(shellQuoted(logPath)) 2>&1 &"]
+        process.standardInput = FileHandle.nullDevice
+        do {
+            try process.run()
+            process.waitUntilExit()
+            log?("started mslhd directly (start at login is off)")
+        } catch {
+            log?("couldn't start mslhd directly: \(error)")
+        }
+    }
+
+    private static func shellQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Whether launchd actually holds the job, as opposed to the plist merely
+    /// existing on disk. Those are different questions and conflating them is
+    /// how the daemon stayed down.
+    public static func isLaunchAgentLoaded() -> Bool {
+        runLaunchctl(["print", "gui/\(getuid())/\(MSLPaths.launchAgentLabel)"]) == 0
     }
 
     /// Removes the LaunchAgent, so `mslhd` stops coming back at login.

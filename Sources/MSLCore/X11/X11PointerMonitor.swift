@@ -11,17 +11,27 @@ import AppKit
 /// windows (global monitors never see their own app's events). Mouse-event
 /// global monitors need no Accessibility permission (only key events do).
 ///
-/// Motion is coalesced to `minimumInterval` with a trailing flush, so a
-/// 120 Hz trackpad doesn't flood a client that redraws on every event,
-/// and the last position of a stroke is still always delivered.
+/// Motion is coalesced to `minimumInterval` (one display frame) with a
+/// trailing flush, so a 1000 Hz mouse doesn't flood a client that redraws
+/// on every event, and the last position of a stroke is still always
+/// delivered.
 ///
 /// Main thread only. Monitors are installed while at least one subscriber
 /// is alive and removed after the last one goes.
 final class X11PointerMonitor {
     static let shared = X11PointerMonitor()
 
-    /// Delivery cadence: 60 Hz.
-    static let minimumInterval: TimeInterval = 1.0 / 60
+    /// Delivery cadence: the fastest attached display's refresh rate
+    /// (120 Hz on ProMotion), clamped to 60...240. It was a fixed 60 Hz,
+    /// which on a 120 Hz Mac gave xeyes half the frames the display could
+    /// show - and a 60 Hz flush beating against a 120 Hz display paces
+    /// frames unevenly, which reads as stutter rather than just a lower
+    /// rate. Measured with `MSL_X11_PERF=1`: xeyes' input-to-paint loop is
+    /// ~1.6 ms, so the event rate, not rendering, was the limit.
+    static let minimumInterval: TimeInterval = {
+        let fastest = NSScreen.screens.map(\.maximumFramesPerSecond).max() ?? 60
+        return 1.0 / Double(min(240, max(60, fastest)))
+    }()
 
     private struct Subscriber {
         weak var owner: AnyObject?
@@ -66,8 +76,11 @@ final class X11PointerMonitor {
     }
 
     private func record(_ event: NSEvent) {
+        X11Perf.pointerSeen()
         let now = ProcessInfo.processInfo.systemUptime
-        if throttle.add(dx: Double(event.deltaX), dy: Double(event.deltaY), now: now) {
+        // Deltas arrive in points; clients expect X11 pixels (Native Scaling).
+        let scale = Double(X11DisplayScale.factor)
+        if throttle.add(dx: Double(event.deltaX) / scale, dy: Double(event.deltaY) / scale, now: now) {
             flush(now: now)
         } else if !flushScheduled {
             flushScheduled = true

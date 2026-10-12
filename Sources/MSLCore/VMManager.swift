@@ -119,12 +119,22 @@ public final class VMManager: NSObject, @unchecked Sendable {
     /// Same "only ever non-nil after an explicit start call, only ever
     /// touched from `vmQueue`" rules as `displayBridge`.
     private var x11Server: X11Server?
+    /// The socket device `x11Server` registered its listener on. A server
+    /// built for a previous virtual machine is not a running server, and
+    /// nothing else can tell the difference - see `startX11Server()`.
+    private var x11ServerDevice: VZVirtioSocketDevice?
 
     /// Links, mail and folders from Linux apps, carried out on the Mac -
     /// see `HostOpenService`. Unlike the display paths above, running
     /// whenever the VM is: a request can come from any app MSL launched.
     /// Only touched from `vmQueue`.
     private var hostOpenService: HostOpenService?
+    private var peripheralBridge: PeripheralBridge?
+    private var gpuBridge: GPUBridge?
+    private var usbBridge: USBBridge?
+    /// The socket device `usbBridge` was built on, so a resume can tell a
+    /// genuinely new VM from the same one coming back.
+    private weak var usbBridgeDevice: VZVirtioSocketDevice?
 
     /// `cage-planning.md` Phase 3 - the host side of the cage/Wayland
     /// frame stream, an independent third listener alongside
@@ -190,15 +200,41 @@ public final class VMManager: NSObject, @unchecked Sendable {
         return base
     }
 
+    /// Where saved guest memory goes.
+    ///
+    /// **Inside the container when there is one, and this is not optional
+    /// polish.** A `.state` file is the guest's *entire RAM*, written
+    /// whole - every secret the instance had in memory. Encrypting the
+    /// disk and leaving that beside it in the clear would protect the
+    /// filing cabinet and photocopy its contents onto the desk.
+    ///
+    /// Safe for both directions of the lifecycle: hibernate runs while the
+    /// VM is up, so the container is open, and a restore happens after
+    /// `openVaultIfNeeded` on the boot path.
+    private var stateDirectory: URL {
+        vaultLock.lock()
+        let mount = vaultMount
+        vaultLock.unlock()
+        if let mount { return URL(fileURLWithPath: mount) }
+        return appSupportDir
+    }
+
     /// The implicit "resume where I left off" snapshot hibernate uses.
     private var snapshotURL: URL {
-        appSupportDir.appendingPathComponent("vm-\(configuration.name).state")
+        stateDirectory.appendingPathComponent("vm-\(configuration.name).state")
     }
 
     private func namedSnapshotURL(_ name: String) -> URL {
-        appSupportDir.appendingPathComponent("vm-\(configuration.name)-\(name).state")
+        stateDirectory.appendingPathComponent("vm-\(configuration.name)-\(name).state")
     }
 
+    /// Stays on the host, deliberately.
+    ///
+    /// This is an opaque `VZGenericPlatformConfiguration` identifier, not
+    /// guest data - there is nothing in it to protect. More to the point,
+    /// it is needed to BUILD the VM, and the container is opened during
+    /// that build: putting it inside would be a circular dependency for no
+    /// benefit.
     private var machineIdentifierURL: URL {
         appSupportDir.appendingPathComponent("vm-\(configuration.name).machineid")
     }
@@ -224,6 +260,100 @@ public final class VMManager: NSObject, @unchecked Sendable {
         let identifier = VZGenericMachineIdentifier()
         try? identifier.dataRepresentation.write(to: machineIdentifierURL)
         return identifier
+    }
+
+    // MARK: - The encrypted container, for protected instances
+
+    /// Where this instance's container is attached, while it is.
+    ///
+    /// Held here rather than looked up each time so there is exactly one
+    /// answer to "is the container open right now", and so a detach cannot
+    /// race a boot that is still using it.
+    private var vaultMount: String?
+    private let vaultLock = NSLock()
+
+    /// Where this instance's disk actually is.
+    ///
+    /// **Every caller must use this, not `configuration.diskImagePath`.**
+    /// For a protected instance the image lives inside an attached
+    /// container at `/Volumes/MSL-…/rootfs.img`, and anything still
+    /// reading the configuration's path would find nothing there - or
+    /// worse, find a stale plaintext copy and boot it.
+    var diskImagePath: String? {
+        vaultLock.lock()
+        let mount = vaultMount
+        vaultLock.unlock()
+        if let mount { return InstanceVault.diskURL(mountPoint: mount).path }
+        return configuration.diskImagePath
+    }
+
+    /// Opens the container, if this instance has one.
+    ///
+    /// **Before the VM is built, and before anything opens the image.**
+    /// `VZDiskImageStorageDeviceAttachment` reads the file at construction
+    /// time, so a container attached afterwards would be attached to
+    /// nothing.
+    ///
+    /// Returns false only when a container exists and could not be opened,
+    /// which has to stop the boot: carrying on would mean booting
+    /// whatever plaintext disk is still lying around under the old path,
+    /// which is the one outcome worse than not starting.
+    func openVaultIfNeeded() -> Bool {
+        guard case .valid(let identity) = InstanceIdentityStore.verdict(
+            for: configuration.name, appSupport: appSupportDir) else { return true }
+        guard InstanceVault.exists(serial: identity.serial) else { return true }
+        do {
+            let mount = try InstanceVault.attach(identity)
+            vaultLock.lock(); vaultMount = mount; vaultLock.unlock()
+            MSLLog.line("vault", "\(configuration.name): container open at \(mount)")
+            return true
+        } catch {
+            MSLLog.line("vault", "\(configuration.name): could not open its container - \(error)")
+            return false
+        }
+    }
+
+    /// Closes it.
+    ///
+    /// **Only ever after the VM is fully stopped.** Detaching a container
+    /// out from under a running VM is guaranteed corruption - the guest
+    /// has the image open and its writes would land nowhere. Every caller
+    /// is on a path where `vm.state` is already `.stopped`.
+    ///
+    /// A container left attached by a crash is NOT an error: the next
+    /// `attach` finds it already mounted and returns the same mount point,
+    /// which is exactly the recovery behaviour wanted.
+    /// **Must be called on `vmQueue`.** It reads `virtualMachine.state`
+    /// directly, which Virtualization asserts is only touched there.
+    func closeVaultIfOpen() {
+        // **The guard lives with the dangerous operation, not with each
+        // caller.** There are a dozen places a VM reaches `.stopped`, and
+        // detaching a container out from under a running guest is
+        // guaranteed corruption - so rather than trusting every call site
+        // to be on a settled path, this refuses outright unless the VM
+        // really is down. A stray mount is a tidiness problem; a detach
+        // under a live guest is data loss.
+        if let state = virtualMachine?.state, state != .stopped, state != .error {
+            MSLLog.line("vault",
+                        "\(configuration.name): not closing its container - the VM is still \(state.rawValue)")
+            return
+        }
+        vaultLock.lock()
+        let mount = vaultMount
+        vaultMount = nil
+        vaultLock.unlock()
+        guard mount != nil,
+              case .valid(let identity) = InstanceIdentityStore.verdict(
+                  for: configuration.name, appSupport: appSupportDir) else { return }
+        do {
+            try InstanceVault.detach(identity)
+            MSLLog.line("vault", "\(configuration.name): container closed")
+        } catch {
+            // Logged, not thrown: a container that will not detach is a
+            // tidiness problem, and failing a stop over it would leave the
+            // instance in a worse state than the stray mount does.
+            MSLLog.line("vault", "\(configuration.name): container would not close - \(error)")
+        }
     }
 
     public init(configuration: VMConfiguration) {
@@ -283,6 +413,30 @@ public final class VMManager: NSObject, @unchecked Sendable {
                 // silently waited that long would look hung.
                 if maintenanceInProgress {
                     continuation.resume(throwing: VMManagerError.maintenanceInProgress)
+                    return
+                }
+
+                // **Provenance, and it has to be HERE.** The obvious place
+                // is `DaemonServer.ensureRunningWithinCap`, and two paths
+                // reach this method without passing through it:
+                // `FileOpsClient` waking a guest because Finder touched
+                // the WebDAV mount, and `SystemResilienceMonitor`
+                // restoring after a power event. An instance that Finder
+                // can wake is not refused.
+                //
+                // **After the maintenance check on purpose.** A maintenance
+                // boot must stay available precisely so a refused instance
+                // can be repaired - that check returns above, so it never
+                // reaches this.
+                //
+                // Before the already-running fast path, so a refusal is
+                // not skipped for a guest that is already up: the decision
+                // can change under a running instance when a policy
+                // arrives, and the next thing to ask for it should hear so.
+                if case .refuse(let why) = InstanceAdmission.decide(
+                    instance: configuration.name, appSupport: appSupportDir) {
+                    MSLLog.line("identity", "\(configuration.name): \(why)")
+                    continuation.resume(throwing: VMManagerError.identityRefused(why))
                     return
                 }
 
@@ -545,6 +699,9 @@ public final class VMManager: NSObject, @unchecked Sendable {
         // Every start builds a new socket device, so the listener is
         // rebuilt with it rather than kept.
         startHostOpenService()
+        startPeripheralBridge()
+        startGPUBridge()
+        startUSBBridge()
 
         ActivityLog.shared.record(.lifecycle, instance: configuration.name, "Virtual machine running")
 
@@ -602,6 +759,19 @@ public final class VMManager: NSObject, @unchecked Sendable {
     /// succeeding, so a missing Finder mount is a degraded-but-usable
     /// state, not a broken instance.
     private func startFileSandbox() {
+        // MSLAP, before the bridge exists rather than before it is mounted.
+        // Skipping only `NetFSMountURLSync` would leave a WebDAV server
+        // listening on loopback that anything on this Mac could mount by
+        // hand, which is not a refusal - it is the same mount with one
+        // extra step. Nothing is started at all, and the reason is logged
+        // because a Finder mount that silently never appears is the kind of
+        // thing people spend an afternoon on.
+        guard MSLAPGate.allows("sharing.webdav", instance: configuration.name) else {
+            let why = MSLAPGate.reason("sharing.webdav", instance: configuration.name)
+                ?? "the MSL Admin Portal does not allow it"
+            FileHandle.standardError.write("VMManager[\(configuration.name)]: no Finder mount - \(why). The shell and MSL Files are unaffected.\n".data(using: .utf8)!)
+            return
+        }
         webdavLock.lock()
         if webdavServer != nil || webdavStarting {
             webdavLock.unlock()
@@ -726,8 +896,202 @@ public final class VMManager: NSObject, @unchecked Sendable {
         displayBridge = nil
         x11Server?.stop()
         x11Server = nil
+        x11ServerDevice = nil
         hostOpenService?.stop()
         hostOpenService = nil
+        peripheralBridge?.stop()
+        peripheralBridge = nil
+        gpuBridge?.stop()
+        gpuBridge = nil
+        // Tearing the USB bridge down resets every captured device and
+        // lets macOS's own drivers match them again, so stopping a guest
+        // gives the Mac its hardware back.
+        usbBridge?.stop()
+        usbBridge = nil
+        usbBridgeDevice = nil
+    }
+
+    /// mslps: sound (and later the microphone and camera) for Linux
+    /// applications, on the Mac's hardware. Started with the VM and stopped
+    /// with it, like the other per-instance services.
+    ///
+    /// Must be called on `vmQueue`.
+    private func startPeripheralBridge() {
+        peripheralBridge?.stop()
+        peripheralBridge = nil
+        guard let vm = virtualMachine, let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else { return }
+        let bridge = PeripheralBridge(socketDevice: socketDevice, instance: configuration.name)
+        bridge.start()
+        peripheralBridge = bridge
+    }
+
+    /// The Mac's GPU for Linux GL apps, when the experimental flag is on
+    /// and a renderer is installed. See `GPUBridge`.
+    ///
+    /// Must be called on `vmQueue`.
+    private func startGPUBridge() {
+        gpuBridge?.stop()
+        gpuBridge = nil
+        // Whenever a renderer is installed, not only with the Experimental
+        // switch on: one app can be set to the GPU on its own (right-click >
+        // Graphics), and the launcher can't start a bridge from its own
+        // process. An idle bridge is just a vsock listener - a renderer is
+        // only spawned when a guest app actually connects, which it does
+        // only when told to use the GPU.
+        guard GPUBridge.locateRenderer() != nil else { return }
+        guard let vm = virtualMachine, let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else { return }
+        let bridge = GPUBridge(socketDevice: socketDevice, instance: configuration.name)
+        bridge.start()
+        gpuBridge = bridge
+    }
+
+    /// USB devices from the Mac, for this guest. See `USBBridge`.
+    ///
+    /// Always started, like the peripheral bridge: an idle bridge is one
+    /// vsock listener with an empty queue, and nothing crosses it until
+    /// somebody actually attaches a device. Starting it lazily would mean
+    /// the first attach had to race the listener's registration.
+    ///
+    /// **Kept across a resume, unlike the other bridges.** They are all
+    /// called from `resumeAfterVMUp`, which a plain resume from paused
+    /// reaches as well as a cold boot - and on that path the socket device
+    /// is the *same object*, not a new one. The others hold nothing but a
+    /// listener, so rebuilding them is free; this one holds live USB/IP
+    /// servers, and tearing those down would release every passed-through
+    /// device on an ordinary suspend/resume (measured: two attached test
+    /// devices vanished from the guest, both vhci ports back to free). So a
+    /// rebuild happens only when the device really is new.
+    ///
+    /// Must be called on `vmQueue`.
+    private func startUSBBridge() {
+        guard let vm = virtualMachine, let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else {
+            usbBridge?.stop()
+            usbBridge = nil
+            usbBridgeDevice = nil
+            return
+        }
+        if usbBridge != nil, usbBridgeDevice === socketDevice { return }
+        usbBridge?.stop()
+        let bridge = USBBridge(socketDevice: socketDevice, instance: configuration.name)
+        bridge.start()
+        usbBridge = bridge
+        usbBridgeDevice = socketDevice
+    }
+
+    /// Whether this instance is holding a passed-through USB device, which
+    /// counts as activity against the idle timer. See
+    /// `USBBridge.hasLiveAttachments`.
+    public var hasUSBAttachments: Bool {
+        var result = false
+        let done = DispatchSemaphore(value: 0)
+        vmQueue.async { result = self.usbBridge?.hasLiveAttachments ?? false; done.signal() }
+        // The idle timer runs on its own queue and can afford to wait; a
+        // timeout keeps a wedged `vmQueue` from stalling it anyway.
+        _ = done.wait(timeout: .now() + 2)
+        return result
+    }
+
+    /// Everything this guest is holding over USB/IP.
+    public func usbAttachments() -> [USBAttachment] {
+        var result: [USBAttachment] = []
+        let done = DispatchSemaphore(value: 0)
+        vmQueue.async { result = self.usbBridge?.attachments ?? []; done.signal() }
+        _ = done.wait(timeout: .now() + 2)
+        return result
+    }
+
+    /// Takes a device back from this guest.
+    @discardableResult
+    public func detachUSB(device: String) -> USBAttachment? {
+        var result: USBAttachment?
+        let done = DispatchSemaphore(value: 0)
+        vmQueue.async { result = self.usbBridge?.detach(device: device); done.signal() }
+        _ = done.wait(timeout: .now() + 5)
+        return result
+    }
+
+    /// Opens a one-shot socket for a root helper to serve a captured device
+    /// on, and returns its path for the caller to hand to `sudo`.
+    ///
+    /// mslhd cannot capture a device itself (it runs as the user), so for
+    /// anything macOS has a driver for the privileged half happens in a
+    /// separate `msl-usbd` process. This sets up the meeting point and then
+    /// waits for it **in the background**, because the caller has to get the
+    /// path back before it can start the helper that connects to it.
+    public func prepareUSBRelay(attachment: USBAttachment, speed: UInt32) -> String? {
+        let bridge = {
+            var found: USBBridge?
+            let done = DispatchSemaphore(value: 0)
+            vmQueue.async { found = self.usbBridge; done.signal() }
+            _ = done.wait(timeout: .now() + 2)
+            return found
+        }()
+        guard let bridge else { return nil }
+        guard let relay = USBRootRelay() else { return nil }
+
+        Thread { [weak self] in
+            // Blocks until the helper dials in and proves it is root, or
+            // until the person abandons the password prompt.
+            guard let helperFD = relay.waitForHelper() else {
+                self?.log("no root helper arrived for \(attachment.displayName) - nothing attached")
+                return
+            }
+            guard let self else { close(helperFD); return }
+            bridge.enqueueRelay(fd: helperFD, attachment: attachment, speed: speed)
+            // Only now is there anything for the guest to collect.
+            guard let command = USBBridge.attachCommand(speed: speed) else {
+                _ = bridge.detach(device: attachment.device)
+                return
+            }
+            // This thread exists only to wait, so blocking on the guest
+            // round trip is exactly what it is for.
+            let semaphore = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var result: (exitCode: Int32, output: String) = (-1, "")
+            Task.detached {
+                result = await self.runInternalCommand(command, timeout: 90, user: "root")
+                semaphore.signal()
+            }
+            semaphore.wait()
+            if result.exitCode != 0 {
+                self.log("the guest refused \(attachment.displayName): "
+                    + result.output.trimmingCharacters(in: .whitespacesAndNewlines))
+                _ = bridge.detach(device: attachment.device)
+            }
+        }.start()
+        return relay.path
+    }
+
+    private func log(_ message: String) {
+        FileHandle.standardError.write("[mslusb \(configuration.name)] \(message)\n".data(using: .utf8)!)
+    }
+
+    /// Hands a Mac USB device to this guest.
+    ///
+    /// Two halves that must both succeed: the device is promised to the
+    /// bridge, then the guest is told to come and collect it. If the guest
+    /// side fails - no compiler, no `vhci_hcd`, a guest that is not really
+    /// up - the promise is withdrawn and the device released, rather than
+    /// left claimed by a Mac-side queue nobody will ever drain.
+    public func attachUSB(_ backend: USBIPDeviceBackend) async -> (ok: Bool, message: String) {
+        let bridge = await withCheckedContinuation { (continuation: CheckedContinuation<USBBridge?, Never>) in
+            vmQueue.async { continuation.resume(returning: self.usbBridge) }
+        }
+        guard let bridge else {
+            backend.teardown()
+            return (false, "\(configuration.name) is not running")
+        }
+        let speed = bridge.enqueue(backend)
+        guard let command = USBBridge.attachCommand(speed: speed) else {
+            bridge.cancelPending(backend)
+            return (false, "MSL.app's guest kit is missing usbattach.c - cannot attach")
+        }
+        let result = await runInternalCommand(command, timeout: 90, user: "root")
+        guard result.exitCode == 0 else {
+            bridge.cancelPending(backend)
+            let detail = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            return (false, detail.isEmpty ? "the guest refused the attach" : detail)
+        }
+        return (true, "\(backend.displayName) attached to \(configuration.name)")
     }
 
     /// Must be called on `vmQueue`.
@@ -745,6 +1109,11 @@ public final class VMManager: NSObject, @unchecked Sendable {
             readGuestFile: { path, maxBytes in try Self.readWhole(path, maxBytes: maxBytes, using: fileOps) })
         service.start()
         hostOpenService = service
+        // An instance is up, so something in it may ask for a file. Getting
+        // MSL Files running now is what makes that answer instant instead of
+        // a cold launch the asking app has to sit through - see
+        // `MSLFilesPrewarm`.
+        MSLFilesPrewarm.ensureReady()
     }
 
     /// Reads a guest file through `fileopsd`, refusing anything over
@@ -848,18 +1217,31 @@ public final class VMManager: NSObject, @unchecked Sendable {
     public func startX11Server() async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             vmQueue.async { [self] in
-                guard x11Server == nil else {
-                    continuation.resume()
-                    return
-                }
                 guard let vm = virtualMachine, let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else {
                     continuation.resume(throwing: VMManagerError.notRunning)
                     return
                 }
+                // "Already started" has to mean started FOR THIS virtual
+                // machine. Every start - and every restore from a saved
+                // state - builds a fresh socket device, and a server still
+                // holding a listener on the old one answers "already
+                // running" while every X client it should be serving gets a
+                // connection that closes on it: "could not connect to
+                // display :1" with a tunnel plainly listening in the guest
+                // (2026-09-22). Comparing the device rather than clearing
+                // the server when a VM starts, because a launch in flight
+                // can create one between the two and clearing would throw
+                // away a server that was perfectly good.
+                if x11Server != nil, x11ServerDevice === socketDevice {
+                    continuation.resume()
+                    return
+                }
+                x11Server?.stop()
                 let server = X11Server(socketDevice: socketDevice, port: configuration.mslgdVsockPort,
                                        instance: configuration.name)
                 server.start()
                 x11Server = server
+                x11ServerDevice = socketDevice
                 continuation.resume()
             }
         }
@@ -970,6 +1352,7 @@ public final class VMManager: NSObject, @unchecked Sendable {
         if policy.displayServerDisabled {
             x11Server?.stop()
             x11Server = nil
+            x11ServerDevice = nil
         }
         // Turning the display server back ON is deliberately not done here:
         // `startX11Server()` is opt-in per session and has its own
@@ -1000,6 +1383,7 @@ public final class VMManager: NSObject, @unchecked Sendable {
         vmQueue.async { [self] in
             x11Server?.stop()
             x11Server = nil
+            x11ServerDevice = nil
         }
     }
 
@@ -1418,6 +1802,10 @@ public final class VMManager: NSObject, @unchecked Sendable {
                 case .paused, .stopped:
                     continuation.resume(returning: true)
                 case .running where vm.canPause:
+                    // As `suspendLight` and `hibernate` do: a governor left
+                    // polling a frozen guest only times out, and
+                    // `resumeAfterVMUp` starts a fresh one.
+                    stopBalloonGovernor()
                     vm.pause { result in
                         if case .failure(let error) = result {
                             self.note("couldn't pause for a host power event: \(error)")
@@ -1523,6 +1911,44 @@ public final class VMManager: NSObject, @unchecked Sendable {
     /// TLS certificate validation, makes `make` rebuild or skip everything,
     /// and confuses `git` - all of which surface as unrelated-looking errors
     /// long after the sleep that caused them.
+    /// Keeps an "Automatic" guest resolving through the NAT gateway, which
+    /// follows the Mac's current network - see `GuestDNS.automaticScript`.
+    /// mslhd calls it after every start, after a wake and whenever the Mac's
+    /// network changes. Quiet unless it actually changed something.
+    public func refreshGuestDNS(reason: String) async {
+        guard currentState() == .running else { return }
+        // Straight after a start the guest can still be settling (the first
+        // live run failed right after a cold boot and passed on wake), so a
+        // failed check gets two more tries before it's reported.
+        // Before the resolver itself: a guest that prefers IPv6 to a
+        // network that cannot carry it spends every lookup waiting for a
+        // timeout, whatever its nameserver is. See
+        // `GuestDNS.preferIPv4Script`.
+        _ = await runInternalCommand(GuestDNS.preferIPv4Script, timeout: 10)
+        var result = await runInternalCommand(GuestDNS.automaticScript, timeout: 10)
+        for _ in 0..<2 where !GuestDNS.succeeded(result.output) {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard currentState() == .running else { return }
+            result = await runInternalCommand(GuestDNS.automaticScript, timeout: 10)
+        }
+        if let line = result.output.split(whereSeparator: \.isNewline)
+            .first(where: { $0.hasPrefix("MSL-DNS-GATEWAY ") }) {
+            note("DNS (\(reason)): guest now resolves via \(line.dropFirst("MSL-DNS-GATEWAY ".count))")
+        } else if !GuestDNS.succeeded(result.output) {
+            note("DNS (\(reason)): couldn't check the guest's resolver (exit \(result.exitCode)): \(result.output.prefix(200))")
+        }
+    }
+
+    /// Gives every Linux home a `~/Mac` link to the Mac's home folder - see
+    /// `GuestHomeLinks`. mslhd calls it after every start.
+    public func linkMacHomes() async {
+        guard currentState() == .running else { return }
+        let result = await runInternalCommand(GuestHomeLinks.script, timeout: 10)
+        let made = result.output.split(whereSeparator: \.isNewline)
+            .filter { $0.hasPrefix("MSL-MACLINK /") }.map { $0.dropFirst("MSL-MACLINK ".count) }
+        if !made.isEmpty { note("linked the Mac home into \(made.joined(separator: ", "))") }
+    }
+
     public func resyncGuestClock() async {
         guard currentState() == .running else { return }
         // The same code the Maintenance card's "Sync clock" button runs - see
@@ -1582,11 +2008,21 @@ public final class VMManager: NSObject, @unchecked Sendable {
 
                 guard let vm = virtualMachine, vm.state != .stopped else {
                     virtualMachine = nil
+                    // Already down, so the container can go.
+                    closeVaultIfOpen()
                     continuation.resume()
                     return
                 }
                 vm.stop { error in
                     self.virtualMachine = nil
+                    // **Inside the completion handler, not after
+                    // `vm.stop` returns.** `stop` is asynchronous: closing
+                    // the container on the line after the call would
+                    // detach it while the guest was still winding down,
+                    // which is the corruption case this is all arranged to
+                    // avoid. The handler runs on `vmQueue`, which is where
+                    // `closeVaultIfOpen` requires to be.
+                    self.closeVaultIfOpen()
                     if let error {
                         continuation.resume(throwing: error)
                     } else {
@@ -1741,8 +2177,86 @@ public final class VMManager: NSObject, @unchecked Sendable {
     /// Lists named snapshots on disk for this instance (not the implicit
     /// hibernate slot). Pure filesystem listing - no VM state involved, so
     /// this doesn't need to go through `vmQueue`.
+    /// Whether this instance has memory saved by `hibernate()`.
+    ///
+    /// Static as well as instance-side, because the daemon has to be able
+    /// to ask about an instance it has never built a `VMManager` for - a
+    /// cold daemon after a reboot knows nothing about any of them, and that
+    /// is exactly when a hibernated instance is most likely to be sitting
+    /// there.
+    public func hasSavedState() -> Bool {
+        FileManager.default.fileExists(atPath: snapshotURL.path)
+    }
+
+    public static func hasSavedState(instance: String,
+                                     appSupport: URL = MSLPaths.appSupport) -> Bool {
+        if FileManager.default.fileExists(
+            atPath: appSupport.appendingPathComponent("vm-\(instance).state").path) {
+            return true
+        }
+        // **And inside the container, for a protected instance.** Saved
+        // memory lives in there, so a check that only looked at
+        // Application Support would report none - and `InstanceRename`
+        // would then allow a rename that invalidates it. The guest's
+        // address is derived from its name, and macOS refuses to restore a
+        // saved VM whose address changed, so that stale state would come
+        // back as `VZErrorDomain Code=12` on the next start.
+        return withProtectedState(instance: instance, appSupport: appSupport) { directory in
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent("vm-\(instance).state").path)
+        } ?? false
+    }
+
+    /// Runs `body` against the directory a protected instance's saved
+    /// state lives in, opening its container if that is needed and
+    /// closing it again afterwards.
+    ///
+    /// Returns nil when the instance has no container, so a caller can
+    /// tell "nothing to look in" from "looked and found nothing".
+    ///
+    /// **Opens and closes rather than guessing**, because the alternatives
+    /// are both wrong: assuming a closed container holds nothing would let
+    /// a rename strand saved memory, and leaving it open afterwards would
+    /// defeat the encryption for as long as the Mac stayed up.
+    static func withProtectedState<T>(instance: String, appSupport: URL,
+                                      _ body: (URL) -> T) -> T? {
+        guard case .valid(let identity) = InstanceIdentityStore.verdict(
+            for: instance, appSupport: appSupport),
+              InstanceVault.exists(serial: identity.serial) else { return nil }
+        let wasOpen = InstanceVault.mountPoint(for: identity) != nil
+        guard let mount = try? InstanceVault.attach(identity) else { return nil }
+        let result = body(URL(fileURLWithPath: mount))
+        // Left as it was found: a container somebody else opened - a
+        // running instance - must not be closed underneath them.
+        if !wasOpen { try? InstanceVault.detach(identity) }
+        return result
+    }
+
+    /// The named snapshots of an instance, without needing a `VMManager`.
+    /// Mirrors `snapshotList()`, which is the same scan.
+    public static func snapshotNames(instance: String,
+                                     appSupport: URL = MSLPaths.appSupport) -> [String] {
+        let prefix = "vm-\(instance)-"
+        let suffix = ".state"
+        func scan(_ directory: URL) -> [String] {
+            guard let files = try? FileManager.default
+                .contentsOfDirectory(atPath: directory.path) else { return [] }
+            return files.compactMap { file in
+                guard file.hasPrefix(prefix), file.hasSuffix(suffix) else { return nil }
+                return String(file.dropFirst(prefix.count).dropLast(suffix.count))
+            }
+        }
+        // Both homes, for the same reason as `hasSavedState`.
+        let inside = withProtectedState(instance: instance, appSupport: appSupport, scan) ?? []
+        return Array(Set(scan(appSupport) + inside)).sorted()
+    }
+
     public func snapshotList() -> [String] {
-        let dir = appSupportDir
+        // `stateDirectory`, so a protected instance's snapshots are found
+        // where they actually are. While its container is closed this
+        // reports none - which is honest: they are not reachable, and
+        // listing names nothing can restore would be worse.
+        let dir = stateDirectory
         let prefix = "vm-\(configuration.name)-"
         let suffix = ".state"
         guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { return [] }
@@ -1775,6 +2289,10 @@ public final class VMManager: NSObject, @unchecked Sendable {
                 stopFileSandbox()
 
                 func cleanupFiles() {
+                    // Before the files go, and while the VM is provably
+                    // down - the `vm.stop` below this function's callers
+                    // has already completed.
+                    closeVaultIfOpen()
                     try? FileManager.default.removeItem(at: snapshotURL)
                     try? FileManager.default.removeItem(at: machineIdentifierURL)
                     for name in snapshotList() {
@@ -1802,9 +2320,12 @@ public final class VMManager: NSObject, @unchecked Sendable {
     /// the connection object closes its own fd on deallocation, and a
     /// manual close() racing that would risk closing an unrelated fd number
     /// that got reused in between.
-    public func openShellConnection() async throws -> Int32 {
+    /// `port` is the shell listener by default. A **detachable session**
+    /// also listens on a port of its own, reported in its `SESSION` frame,
+    /// and reattaching dials that instead - see `ShellProtocol`.
+    public func openShellConnection(port: UInt32? = nil) async throws -> Int32 {
         do {
-            return try await openConnection(port: configuration.shellVsockPort)
+            return try await openConnection(port: port ?? configuration.shellVsockPort)
         } catch {
             // Translate the symptom into the cause when the console says
             // what it was.
@@ -1837,8 +2358,11 @@ public final class VMManager: NSObject, @unchecked Sendable {
 
     /// One line to stderr, matching this file's existing `VMManager[name]:`
     /// convention - mslhd's stderr is its log file.
+    /// Stamped - see `MSLLog`. These are the lines that say when a guest
+    /// started, was restored or had its clock set, which is what an incident
+    /// report has to be lined up against.
     private func note(_ message: String) {
-        FileHandle.standardError.write("VMManager[\(configuration.name)]: \(message)\n".data(using: .utf8)!)
+        MSLLog.line("VMManager[\(configuration.name)]", message)
     }
 
     /// Runs one command in the guest and returns its output, using this
@@ -1855,14 +2379,15 @@ public final class VMManager: NSObject, @unchecked Sendable {
     /// half-closed - see `LinuxAppLauncher` for why that distinction
     /// matters so much.
     @discardableResult
-    public func runInternalCommand(_ command: String, timeout: TimeInterval = 60) async -> (exitCode: Int32, output: String) {
+    public func runInternalCommand(_ command: String, timeout: TimeInterval = 60,
+                                   user: String = "") async -> (exitCode: Int32, output: String) {
         guard let fd = try? await openShellConnection() else { return (-1, "") }
         defer { releaseConnection(fd: fd) }
 
         var deadline = timeval(tv_sec: Int(timeout), tv_usec: 0)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &deadline, socklen_t(MemoryLayout<timeval>.size))
 
-        let request = ShellProtocol.encodeExec(command: command, rows: 24, cols: 80, user: "")
+        let request = ShellProtocol.encodeExec(command: command, rows: 24, cols: 80, user: user)
         var sent = 0
         request.withUnsafeBytes { buffer in
             while sent < buffer.count {
@@ -1899,7 +2424,9 @@ public final class VMManager: NSObject, @unchecked Sendable {
             case .exit:
                 exitCode = Int32(payload.first ?? 1)
                 return (exitCode, String(decoding: collected, as: UTF8.self))
-            case .exec, .resize: break
+            // This path runs one-shot commands with no session id, so a
+            // detachable session's hello never arrives here.
+            case .exec, .resize, .session, .attach, .detach: break
             }
         }
         return (exitCode, String(decoding: collected, as: UTF8.self))
@@ -1913,7 +2440,10 @@ public final class VMManager: NSObject, @unchecked Sendable {
     /// running guest, and the usage sample is only meaningful once the
     /// filesystem is mounted.
     public func applyPendingStorageChanges() async {
-        guard let imagePath = configuration.diskImagePath else { return }
+        // The accessor, not the configuration: for a protected instance
+        // the image is inside the container, and this runs after a start
+        // so the container is already open.
+        guard let imagePath = diskImagePath else { return }
         let imageName = configuration.diskStorageKey ?? (imagePath as NSString).lastPathComponent
 
         if DiskStorage.filesystemResizeIsPending(forImageNamed: imageName) {
@@ -2070,6 +2600,15 @@ public final class VMManager: NSObject, @unchecked Sendable {
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             vmQueue.async { [self] in
                 maintenanceInProgress = false
+                // The container goes with the maintenance that opened it,
+                // so a check or repair does not leave a protected
+                // instance's disk readable afterwards - which would undo
+                // the point of it for however long the Mac stays up.
+                //
+                // On `vmQueue`, which `closeVaultIfOpen` requires, and
+                // after a maintenance run that has by definition stopped
+                // whatever VM it built.
+                closeVaultIfOpen()
                 continuation.resume()
             }
         }
@@ -2081,7 +2620,13 @@ public final class VMManager: NSObject, @unchecked Sendable {
     /// it: a real disk can take minutes, and holding the queue that long
     /// would stall every status query for this instance along with it.
     public func runFilesystemMaintenance(mode: FsckMode) async throws -> FsckRun {
-        guard let imagePath = configuration.diskImagePath else { throw VMManagerError.noDiskImage }
+        // **Maintenance runs on a STOPPED instance, so unlike the boot
+        // path it has to open the container itself.** `e2fsck` is given a
+        // real path and cannot be told about a container.
+        guard openVaultIfNeeded() else {
+            throw VMManagerError.vaultUnavailable(configuration.name)
+        }
+        guard let imagePath = diskImagePath else { throw VMManagerError.noDiskImage }
         guard let e2fsck = E2fsck.locate() else { throw VMManagerError.e2fsckUnavailable }
         try await beginMaintenance()
         let run = await Task.detached(priority: .userInitiated) {
@@ -2098,7 +2643,7 @@ public final class VMManager: NSObject, @unchecked Sendable {
     /// Discards the pre-repair backup. Refused while maintenance holds the
     /// disk, since a repair in flight may be about to rely on it.
     public func discardRepairBackup() async throws {
-        guard let imagePath = configuration.diskImagePath else { throw VMManagerError.noDiskImage }
+        guard let imagePath = diskImagePath else { throw VMManagerError.noDiskImage }
         try await beginMaintenance()
         ImageBackup.discard(for: imagePath)
         await endMaintenance()
@@ -2107,7 +2652,7 @@ public final class VMManager: NSObject, @unchecked Sendable {
     /// Puts the pre-repair backup back. Needs a stopped instance for the same
     /// reason a repair does.
     public func restoreRepairBackup() async throws {
-        guard let imagePath = configuration.diskImagePath else { throw VMManagerError.noDiskImage }
+        guard let imagePath = diskImagePath else { throw VMManagerError.noDiskImage }
         try await beginMaintenance()
         defer { Task { await self.endMaintenance() } }
         try ImageBackup.restore(for: imagePath)
@@ -2159,7 +2704,7 @@ public final class VMManager: NSObject, @unchecked Sendable {
             // of the disk before e2fsck is let near it. The clone is taken on
             // the Mac, so it works whether or not e2fsprogs is installed - and
             // if it can't be made, the repair doesn't happen.
-            if action == .fsckRepair, let imagePath = configuration.diskImagePath {
+            if action == .fsckRepair, let imagePath = diskImagePath {
                 try ImageBackup.make(for: imagePath)
             }
             let report = try await performMaintenanceBoot(action, timeout: timeout)
@@ -2250,7 +2795,7 @@ public final class VMManager: NSObject, @unchecked Sendable {
             vmQueue.async { [self] in continuation.resume(returning: maintenanceInProgress) }
         }
         let e2fsck = E2fsck.locate()
-        let imagePath = configuration.diskImagePath
+        let imagePath = diskImagePath
         let running = isRunning
         let saved = hasSavedSession
         var status = MaintenanceStatus(
@@ -2397,7 +2942,15 @@ public final class VMManager: NSObject, @unchecked Sendable {
         config.cpuCount = configuration.cpuCount
         config.memorySize = configuration.memorySize
 
-        if let diskImagePath = configuration.diskImagePath {
+        // The container, before anything resolves or opens the image.
+        // `VZDiskImageStorageDeviceAttachment` reads the file where it is
+        // constructed, so a container opened after this point would be
+        // attached to nothing - and the path below would still point at
+        // whatever plaintext disk was left under the old name.
+        guard openVaultIfNeeded() else {
+            throw VMManagerError.vaultUnavailable(configuration.name)
+        }
+        if let diskImagePath = diskImagePath {
             // Before anything opens the image - the attachment below and the
             // resize both come after. See `checkFilesystemBeforeBootIfEnabled`.
             try checkFilesystemBeforeBootIfEnabled(
@@ -2526,10 +3079,22 @@ public final class VMManager: NSObject, @unchecked Sendable {
         shares.append(contentsOf: configuration.sharedFolders.map {
             (tag: $0.tag, path: URL(fileURLWithPath: $0.hostPath), readOnly: $0.readOnly)
         })
-        config.directorySharingDevices = shares.map { share in
+        // MSLAP can withhold the Mac's home folder from a guest. Applied
+        // when the VM is CONFIGURED, so the share is never attached at all
+        // rather than attached and then revoked - a guest that never sees
+        // the device cannot race to read it during boot.
+        //
+        // `mac_home` is the whole home directory, so this is the single
+        // most consequential thing a policy can take away.
+        let homeAllowed = MSLAPGate.allows("sharing.macHome", instance: configuration.name)
+        config.directorySharingDevices = shares.compactMap { share in
+            if !homeAllowed, share.tag == "mac_home" { return nil }
             let fsDevice = VZVirtioFileSystemDeviceConfiguration(tag: share.tag)
             fsDevice.share = VZSingleDirectoryShare(directory: VZSharedDirectory(url: share.path, readOnly: share.readOnly))
             return fsDevice
+        }
+        if !homeAllowed {
+            MSLLog.line("mslap", "\(configuration.name): mac_home share withheld by policy")
         }
 
         if configuration.rosettaEnabled, VZLinuxRosettaDirectoryShare.availability == .installed {
@@ -2562,6 +3127,16 @@ public enum VMManagerError: Error, CustomStringConvertible {
     case e2fsckUnavailable
     case noDiskImage
     case filesystemCheckFailed(String)
+    /// The instance's provenance does not satisfy the policy in force.
+    /// Carries the whole explanation, because a managed Mac that will not
+    /// say why it refused is the thing people hate most about managed Macs.
+    case identityRefused(String)
+    /// A protected instance's encrypted container could not be opened.
+    ///
+    /// Stops the boot rather than falling back: carrying on would mean
+    /// booting whatever plaintext disk is still under the old path, which
+    /// is the one outcome worse than not starting.
+    case vaultUnavailable(String)
 
     public var description: String {
         switch self {
@@ -2577,6 +3152,14 @@ public enum VMManagerError: Error, CustomStringConvertible {
         case .e2fsckUnavailable: return "e2fsck isn't installed on this Mac - install e2fsprogs (`brew install e2fsprogs`), or use Maintenance Boot instead"
         case .noDiskImage: return "this instance has no disk image to check"
         case .filesystemCheckFailed(let reason): return "didn't start: the filesystem check at start found a problem - \(reason)"
+        // Passed through whole, unprefixed: the message is already a
+        // complete sentence naming the capability, the reason and the
+        // issuer, and wrapping it in "didn't start:" would bury that.
+        case .identityRefused(let why): return why
+        case .vaultUnavailable(let instance):
+            return "didn't start: \(instance) keeps its disk in an encrypted container and MSL "
+                 + "could not open it. Nothing was started from an unencrypted copy. "
+                 + "~/Library/Logs/MSL/mslhd.log says why."
         }
     }
 }

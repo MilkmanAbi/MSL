@@ -41,7 +41,9 @@ enum CLIHelp {
         let summaryWidth = max(30, width - indent - column - 2)
 
         var out = "\(bold)MSL\(reset) - Mac Subsystem for Linux \(dim)\(MSLVersion.marketing)\(reset)\n\n"
-        out += "\(bold)Usage\(reset)\n  msl [instance] [command...]\n"
+        out += "\(bold)Usage\(reset)\n  msl <command> [arguments...]\n"
+        out += "  msl run <instance> [command...]\n"
+        out += "  msl <instance> [command...]\(dim)   - the short form of run\(reset)\n"
         for section in sections {
             out += "\n\(bold)\(section.title)\(reset)\n"
             for entry in section.entries {

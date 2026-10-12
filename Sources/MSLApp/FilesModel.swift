@@ -27,8 +27,20 @@ struct FileRoot: Identifiable, Hashable {
         case directory
         case tag(String)
         case recents
+        /// The MSL dashboard - not a directory at all, but a panel about the
+        /// project's own storage. The one root the detail pane draws itself
+        /// rather than as a file listing.
+        case dashboard
 
-        var isQuery: Bool { self != .directory }
+        /// A Spotlight-backed listing (tags, recents), as opposed to a real
+        /// directory or the dashboard. Drives whether the browser runs a
+        /// query and disables writing.
+        var isQuery: Bool {
+            switch self {
+            case .tag, .recents: return true
+            case .directory, .dashboard: return false
+            }
+        }
     }
 
     enum Section: String, CaseIterable {
@@ -118,8 +130,9 @@ private struct NavigationStep: Equatable {
 /// `.sheet(item:)` requires, and retroactively conforming a Foundation type
 /// would apply app-wide for the benefit of one sheet.
 struct QuickLookTarget: Identifiable, Equatable {
-    let url: URL
-    var id: String { url.path }
+    let item: MSLFileItem
+    var url: URL { URL(fileURLWithPath: item.path) }
+    var id: String { item.path }
 }
 
 /// Small typed wrapper over `UserDefaults` for the view preferences.
@@ -152,17 +165,61 @@ enum Defaults {
 @MainActor
 final class FilesModel: ObservableObject {
     @Published var roots: [FileRoot] = []
-    @Published var selectedRoot: FileRoot?
+    @Published var selectedRoot: FileRoot? {
+        // Every path that changes the root (the sidebar, Go, back/forward,
+        // reveal) runs through here, so the guest disk line is refreshed in
+        // exactly one place.
+        didSet {
+            if selectedRoot?.id != oldValue?.id { refreshGuestDiskSummary(for: selectedRoot) }
+        }
+    }
     @Published var path: [String] = []
-    @Published var items: [MSLFileItem] = []
+    @Published var items: [MSLFileItem] = [] {
+        // A monotonic stamp so `visibleItems`/`groupedItems` can tell "same
+        // listing" from "new listing" in O(1) instead of comparing arrays -
+        // see the memoization below. Bumped on every assignment, which is the
+        // only way `items` changes.
+        didSet { itemsVersion &+= 1 }
+    }
+    private var itemsVersion = 0
     @Published var selection: Set<String> = []
-    @Published var showHidden = false
+    /// The *real* Linux `st_mode` for the current directory's rows, keyed by
+    /// host path - permissions and file type the WebDAV mount fakes (it
+    /// reports the mounter's own uid and a made-up `rwx------`). Filled by
+    /// `overlayGuestModes()` from mslhd's `fileopsd` relay after each listing,
+    /// and empty for Mac roots or when the relay is unavailable, in which case
+    /// the UI simply shows no Linux mode rather than a wrong one.
+    @Published var guestModes: [String: UInt32] = [:]
+    /// Git state for the folders in the current listing, keyed by host path.
+    @Published var gitBadges: [String: Git.Badge] = [:]
+    private var gitBadgeToken: UUID?
+    /// Guards against a slow overlay landing after the user has already moved
+    /// on: only the newest request's result is applied.
+    private var overlayToken = UUID()
+
+    /// True while a text field (the toolbar search field, an inline rename,
+    /// the Go-to-Folder sheet) is being edited. The bare-key file shortcuts -
+    /// ⌘C, ⌘V, Space, Return - disable themselves against this so they don't
+    /// steal a keystroke that belongs to the field. It only flips on the first
+    /// *edit*, not on focus, so ⌘C and ⌘V also forward to the field editor at
+    /// action time (see `FilesView.shortcuts`) to cover the focus-before-edit
+    /// gap.
+    @Published var isEditingText = false
+    /// Remembered between launches: someone who works in dotfiles should not
+    /// have to switch this on every time they open the window.
+    @Published var showHidden = UserDefaults.standard.bool(forKey: "MSLFilesShowHidden") {
+        didSet { UserDefaults.standard.set(showHidden, forKey: "MSLFilesShowHidden") }
+    }
     @Published var search = ""
     @Published var loading = false
     @Published var errorMessage: String?
     @Published var renaming: String?
     @Published var quickLookTarget: QuickLookTarget?
+    /// The file open in the text editor, if any.
+    @Published var editorTarget: FileTextEditorTarget?
     @Published var infoTarget: MSLFileItem?
+    /// The folder whose git panel is open, if any.
+    @Published var gitTarget: GitPanelTarget?
     /// Items the volume could not move to the Trash, awaiting the user's
     /// decision to delete them for good.
     @Published var pendingPermanentDelete: Set<String> = []
@@ -242,10 +299,51 @@ final class FilesModel: ObservableObject {
         didSet { Defaults.save("files.grouping", grouping) }
     }
 
+    /// The highlight layer. Cosmetic only - see `FilesTheme`.
+    @Published var theme: FilesTheme = FilesTheme.load() {
+        didSet { theme.save() }
+    }
+
+    /// The base the highlight sits on: System, Light, Dark or Darker.
+    @Published var appearance: FilesAppearance = FilesAppearance.load() {
+        didSet { appearance.save() }
+    }
+
+    /// Carries a duller version of the highlight into the folder area.
+    @Published var tintFolderArea = Defaults.bool("files.tintFolderArea", false) {
+        didSet { UserDefaults.standard.set(tintFolderArea, forKey: "files.tintFolderArea") }
+    }
+
+    /// Whether the file views should show the window's backdrop instead of
+    /// their own opaque background.
+    var usesCustomBackdrop: Bool { appearance == .darker || tintFolderArea }
+
+    /// The MSL dashboard is selected: the detail pane shows the project's
+    /// storage panel instead of a file listing.
+    var isShowingDashboard: Bool { selectedRoot?.kind == .dashboard }
+
+    /// The live instance list, kept so a guest root can find its distro (and
+    /// thus its disk image) for the real used/free figures.
+    private(set) var instances: [Instance] = []
+    /// The selected guest root's disk line for the status bar - "X used · Y
+    /// free · Dynamic". `nil` on a Mac root, where the volume's own free space
+    /// is shown instead.
+    @Published private(set) var guestDiskSummary: String?
+
     /// `visibleItems` split into Finder's group headings. A single unnamed
     /// group when grouping is off, so the views can render one shape rather
     /// than branching.
     var groupedItems: [(title: String, items: [MSLFileItem])] {
+        let sig = visibleSignature
+        if let cache = groupedCache, cache.sig == sig, cache.grouping == grouping {
+            return cache.value
+        }
+        let value = computeGrouped()
+        groupedCache = (sig, grouping, value)
+        return value
+    }
+
+    private func computeGrouped() -> [(title: String, items: [MSLFileItem])] {
         let items = visibleItems
         guard grouping != .none else { return [("", items)] }
 
@@ -322,7 +420,10 @@ final class FilesModel: ObservableObject {
     /// selection moves would be a round trip per keystroke on the guest.
     /// Invalidated wholesale on any mutation, which is cheap and cannot go
     /// stale in a way the user would see.
-    @Published private var directoryCache: [String: [MSLFileItem]] = [:]
+    @Published private var directoryCache: [String: [MSLFileItem]] = [:] {
+        didSet { directoryCacheVersion &+= 1 }
+    }
+    private var directoryCacheVersion = 0
 
     /// Held for its lifetime: `NSMetadataQuery` is notification-driven and
     /// silently never fires if it is released.
@@ -332,6 +433,9 @@ final class FilesModel: ObservableObject {
     private var forward: [NavigationStep] = []
 
     private var provider: LocalFileProvider? { selectedRoot?.provider }
+    /// The provider for the current root, for views that need to list on their
+    /// own (the Quick Look folder count). Same object `reload` uses.
+    var currentProvider: LocalFileProvider? { provider }
 
     var currentPath: String { path.last ?? selectedRoot?.path ?? NSHomeDirectory() }
 
@@ -368,12 +472,47 @@ final class FilesModel: ObservableObject {
         return items.first { $0.path == path }
     }
 
+    /// Everything that changes what `visibleItems` produces, in one cheap-to-
+    /// compare value. `itemsVersion` stands in for the array (comparing the
+    /// listing element-by-element on every access would defeat the point).
+    private struct VisibleSignature: Equatable {
+        let itemsVersion: Int
+        let showHidden: Bool
+        let search: String
+        let sortKey: FileSortKey
+        let sortAscending: Bool
+        let foldersOnTop: Bool
+        let isQuery: Bool
+    }
+    private var visibleSignature: VisibleSignature {
+        VisibleSignature(itemsVersion: itemsVersion, showHidden: showHidden, search: search,
+                         sortKey: sortKey, sortAscending: sortAscending,
+                         foldersOnTop: foldersOnTop, isQuery: isShowingQueryResults)
+    }
+    private var visibleCache: (sig: VisibleSignature, value: [MSLFileItem])?
+    private var groupedCache: (sig: VisibleSignature, grouping: FileGrouping,
+                               value: [(title: String, items: [MSLFileItem])])?
+
+    /// The rows on screen: hidden files filtered, search applied, sorted.
+    ///
+    /// Memoized. This used to filter and `localizedStandardCompare`-sort the
+    /// whole directory *on every access*, and a single redraw reads it four to
+    /// six times (each view body, `groupedItems`, the item count, the empty
+    /// check, the Tags menu) - so a 2000-entry folder paid for half a dozen
+    /// full locale-aware sorts per frame, which was the lag. Now it recomputes
+    /// only when something in `VisibleSignature` actually changes; a plain
+    /// re-render (selection, hover, the permissions overlay landing) reuses the
+    /// cached array.
     var visibleItems: [MSLFileItem] {
+        let sig = visibleSignature
+        if let cache = visibleCache, cache.sig == sig { return cache.value }
         var result = showHidden ? items : items.filter { !$0.isHidden }
         if !search.isEmpty {
             result = result.filter { $0.name.localizedCaseInsensitiveContains(search) }
         }
-        return sorted(result)
+        let value = sorted(result)
+        visibleCache = (sig, value)
+        return value
     }
 
     /// Applies the user's sort. Ties always break on name so the order is
@@ -446,7 +585,29 @@ final class FilesModel: ObservableObject {
     /// second presentation of the same navigation state, not its own state -
     /// keeping a parallel array would let the columns and the breadcrumbs
     /// disagree, which is the classic way this feature breaks.
+    private struct ColumnSignature: Equatable {
+        let sig: VisibleSignature
+        let cacheVersion: Int
+        let path: [String]
+        let selection: String?
+    }
+    private var columnCache: (sig: ColumnSignature,
+                              value: [(path: String, items: [MSLFileItem], selected: String?)])?
+
+    /// Memoized like `visibleItems`: column view is the mode where the cost
+    /// bit hardest - it filters and `localizedStandardCompare`-sorts *every*
+    /// column on every render, not just the current directory. Recomputed only
+    /// when the listing, the path, the selection or the sort actually change.
     var columnChain: [(path: String, items: [MSLFileItem], selected: String?)] {
+        let signature = ColumnSignature(sig: visibleSignature, cacheVersion: directoryCacheVersion,
+                                        path: path, selection: selection.first)
+        if let cache = columnCache, cache.sig == signature { return cache.value }
+        let value = computeColumnChain()
+        columnCache = (signature, value)
+        return value
+    }
+
+    private func computeColumnChain() -> [(path: String, items: [MSLFileItem], selected: String?)] {
         let deepest = breadcrumbs.count - 1
         return breadcrumbs.enumerated().map { index, crumb in
             // Search narrows the directory being looked at, not the path
@@ -489,8 +650,14 @@ final class FilesModel: ObservableObject {
     // MARK: - Roots
 
     func rebuildRoots(from instances: [Instance]) {
+        self.instances = instances
         let home = NSHomeDirectory()
         var built: [FileRoot] = [
+            // The MSL dashboard sits at the very top - it's what makes this a
+            // window into the project, not just another file browser.
+            FileRoot(id: "msl-dashboard", name: "MSL", subtitle: "Storage & shortcuts",
+                     symbol: "cube.transparent", path: home, isGuest: false,
+                     readOnly: true, section: .top, kind: .dashboard),
             FileRoot(id: "recents", name: "Recents", subtitle: "Recently used",
                      symbol: "clock", path: home, isGuest: false, readOnly: true,
                      section: .top, kind: .recents),
@@ -507,7 +674,13 @@ final class FilesModel: ObservableObject {
             ("Applications", "square.grid.3x3", .applicationDirectory),
         ]
         for (name, symbol, directory) in favorites {
-            guard let url = FileManager.default.urls(for: directory, in: .userDomainMask).first
+            // Applications means the *system* /Applications, where apps
+            // actually are. `.userDomainMask` resolves to ~/Applications,
+            // which is almost always empty - so the sidebar entry looked
+            // broken. Everything else stays user-domain, as Finder has it.
+            let searchDomain: FileManager.SearchPathDomainMask =
+                directory == .applicationDirectory ? .localDomainMask : .userDomainMask
+            guard let url = FileManager.default.urls(for: directory, in: searchDomain).first
                     ?? (directory == .applicationDirectory
                         ? URL(fileURLWithPath: "/Applications") : nil),
                   FileManager.default.fileExists(atPath: url.path) else { continue }
@@ -524,6 +697,18 @@ final class FilesModel: ObservableObject {
 
         for instance in instances {
             guard let mount = instance.sandboxMountPath else { continue }
+            // `sharing.files` - MSL's own browser stops offering the
+            // instance at all.
+            //
+            // **And it is honest about what that is worth.** The listing
+            // underneath comes from the WebDAV mount, not from MSL, so
+            // Finder can still reach the same files unless `sharing.webdav`
+            // is denied too. What this refusal does close is MSL Files, and
+            // the daemon separately refuses the `fileList`/`fileChmod`
+            // requests, so the real Linux permissions and "Make
+            // Executable" go with it. The catalogue entry says all three
+            // parts - see README 30 section 10.2.
+            guard MSLAPGate.allows("sharing.files", instance: instance.name) else { continue }
             built.append(FileRoot(
                 id: "guest-\(instance.name)",
                 // The mount itself is named after a loopback address, which
@@ -580,12 +765,14 @@ final class FilesModel: ObservableObject {
     /// A place a Linux app asked to show, waiting for its instance's root.
     private var pendingReveal: (instance: String, path: String, select: Bool)?
 
-    /// Handles `msl://files?instance=<name>&path=<guest path>[&select=1]`.
+    /// Handles `msl-files://files?instance=<name>&path=<guest path>[&select=1]`
+    /// (and the pre-split `msl://files?...`, which MSL.app forwards here).
     /// Returns whether the URL was one; the path is shown now if the
     /// instance's root exists, or as soon as it appears.
     @discardableResult
     func reveal(_ url: URL) -> Bool {
-        guard url.scheme == "msl", url.host == "files",
+        guard url.scheme == MSLFilesIdentity.urlScheme || url.scheme == MSLFilesIdentity.legacyScheme,
+              url.host == "files",
               let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
               let instance = items.first(where: { $0.name == "instance" })?.value,
               let path = items.first(where: { $0.name == "path" })?.value, path.hasPrefix("/")
@@ -617,6 +804,20 @@ final class FilesModel: ObservableObject {
 
     // MARK: - Navigation
 
+    /// Re-clicking the sidebar root you are already inside returns you to its
+    /// top, exactly as Finder does. `List(selection:)` never fires its setter
+    /// for a row that is already selected - so `select(_:)` above never even
+    /// runs on a re-click - which is why the sidebar drives this from a
+    /// `.simultaneousGesture` instead. A no-op unless we have actually
+    /// descended somewhere below the root.
+    func returnToTop(_ root: FileRoot) {
+        guard root.id == selectedRoot?.id, !path.isEmpty else { return }
+        pushHistory()
+        path = []
+        selection = []
+        Task { await reload() }
+    }
+
     func select(_ root: FileRoot?) {
         guard root?.id != selectedRoot?.id else { return }
         pushHistory()
@@ -631,8 +832,39 @@ final class FilesModel: ObservableObject {
         Task { await reload() }
     }
 
+    /// Loads the guest disk line for a root, off the main actor, newest-wins.
+    /// Cleared immediately for a Mac root so a stale guest figure never shows.
+    private func refreshGuestDiskSummary(for root: FileRoot?) {
+        guard let root, root.isGuest,
+              let instance = instances.first(where: { $0.name == root.name }) else {
+            guestDiskSummary = nil
+            return
+        }
+        guestDiskSummary = nil
+        Task {
+            let info = await MSLStorageInfo.guestDisk(for: instance)
+            if selectedRoot?.id == root.id { guestDiskSummary = info?.summary }
+        }
+    }
+
+    /// When set, activating a file means "choose this one" rather than
+    /// "open it on the Mac" - the file picker sets it, so double-clicking a
+    /// row in a Linux app's Open dialog returns that path to the app instead
+    /// of launching a Mac app on it (or expanding an archive in place).
+    /// Folders still descend normally; a picker is still a browser.
+    var chooseFile: ((MSLFileItem) -> Void)?
+
     func open(_ item: MSLFileItem) {
+        if !item.isBrowsableDirectory, let chooseFile {
+            chooseFile(item)
+            return
+        }
         guard item.isBrowsableDirectory else {
+            // An archive expands where it sits, the way double-clicking one
+            // in Finder does. Handing a .zip to `NSWorkspace` would work
+            // (Archive Utility owns it) but a .tar.gz opens in whatever
+            // claims it and a .7z has no handler at all, so nothing happened.
+            if beginExtracting(item) { return }
             NSWorkspace.shared.open(URL(fileURLWithPath: item.path))
             return
         }
@@ -640,6 +872,111 @@ final class FilesModel: ObservableObject {
         path.append(item.path)
         selection = []
         Task { await reload() }
+    }
+
+    /// Archives this can expand with tools every Mac has, by the suffix the
+    /// file actually ends with. Order matters: `.tar.gz` must be tested
+    /// before `.gz`, or a tarball would be merely decompressed into a `.tar`.
+    private static let archiveKinds: [(suffix: String, tool: ArchiveTool)] = [
+        (".tar.gz", .tar), (".tgz", .tar), (".tar.bz2", .tar), (".tbz", .tar), (".tbz2", .tar),
+        (".tar.xz", .tar), (".txz", .tar), (".tar.zst", .tar), (".tar", .tar),
+        (".zip", .ditto), (".gz", .gunzip),
+    ]
+
+    private enum ArchiveTool { case tar, ditto, gunzip }
+
+    /// Starts expanding `item` if it is an archive. `false` means "not one of
+    /// ours" and the caller should fall back to opening it normally.
+    ///
+    /// 7-Zip and RAR are deliberately not here: macOS ships nothing that
+    /// reads them, so the honest answer is to say so rather than to fail
+    /// silently, which is what double-clicking one used to do.
+    private func beginExtracting(_ item: MSLFileItem) -> Bool {
+        let lower = item.name.lowercased()
+        if lower.hasSuffix(".7z") || lower.hasSuffix(".rar") {
+            errorMessage = "macOS can't open \u{201C}\(item.name)\u{201D} on its own. "
+                + "Install something like Keka or The Unarchiver, or expand it inside a Linux instance."
+            return true
+        }
+        guard let kind = Self.archiveKinds.first(where: { lower.hasSuffix($0.suffix) }) else { return false }
+        let source = URL(fileURLWithPath: item.path)
+        let parent = source.deletingLastPathComponent()
+        guard canWrite else {
+            errorMessage = "\u{201C}\(item.name)\u{201D} can't be expanded here - this location is read-only."
+            return true
+        }
+        let base = String(item.name.dropLast(kind.suffix.count))
+        Task { await extract(source, tool: kind.tool, into: parent, named: base) }
+        return true
+    }
+
+    /// Runs the expansion off the main actor and then shows the result.
+    ///
+    /// Everything lands in a folder beside the archive (Finder's behaviour),
+    /// uniquified rather than overwriting - expanding the same download twice
+    /// must never silently replace what the first one produced. A lone `.gz`
+    /// is one compressed file, not an archive, so it decompresses to a file.
+    private func extract(_ source: URL, tool: ArchiveTool, into parent: URL, named base: String) async {
+        let destination = Self.uniqueURL(in: parent, name: base, isDirectory: tool != .gunzip)
+        let result: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
+            do {
+                if tool != .gunzip {
+                    try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+                }
+                let process = Process()
+                switch tool {
+                case .tar:
+                    process.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+                    process.arguments = ["-xf", source.path, "-C", destination.path]
+                case .ditto:
+                    // `ditto -x -k` is what Archive Utility itself uses, and
+                    // unlike `unzip` it keeps resource forks and permissions.
+                    process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+                    process.arguments = ["-x", "-k", source.path, destination.path]
+                case .gunzip:
+                    process.executableURL = URL(fileURLWithPath: "/usr/bin/gunzip")
+                    process.arguments = ["-c", source.path]
+                    process.standardOutput = try FileHandle(forWritingTo: {
+                        FileManager.default.createFile(atPath: destination.path, contents: nil)
+                        return destination
+                    }())
+                }
+                let errors = Pipe()
+                process.standardError = errors
+                try process.run()
+                let message = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                process.waitUntilExit()
+                guard process.terminationStatus == 0 else {
+                    throw NSError(domain: "MSLFiles", code: Int(process.terminationStatus), userInfo: [
+                        NSLocalizedDescriptionKey: message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? "the expander exited with status \(process.terminationStatus)"
+                            : message.trimmingCharacters(in: .whitespacesAndNewlines),
+                    ])
+                }
+                return .success(())
+            } catch {
+                try? FileManager.default.removeItem(at: destination)
+                return .failure(error)
+            }
+        }.value
+        switch result {
+        case .success:
+            await reload()
+            selection = [destination.path]
+        case .failure(let error):
+            errorMessage = "Couldn't expand \u{201C}\(source.lastPathComponent)\u{201D} - \(error.localizedDescription)"
+        }
+    }
+
+    /// `name`, or `name 2`, `name 3`... - never overwriting what is there.
+    static func uniqueURL(in parent: URL, name: String, isDirectory: Bool) -> URL {
+        var candidate = parent.appendingPathComponent(name)
+        var index = 2
+        while FileManager.default.fileExists(atPath: candidate.path), index < 1000 {
+            candidate = parent.appendingPathComponent("\(name) \(index)")
+            index += 1
+        }
+        return candidate
     }
 
     func goTo(_ target: String) {
@@ -702,6 +1039,8 @@ final class FilesModel: ObservableObject {
     // MARK: - Loading
 
     func reload() async {
+        // The dashboard has no directory to list; it draws itself.
+        if isShowingDashboard { items = []; return }
         if isShowingQueryResults, let kind = selectedRoot?.kind {
             await runQuery(kind)
             return
@@ -719,8 +1058,143 @@ final class FilesModel: ObservableObject {
             items = []
             errorMessage = error.localizedDescription
         }
+        // Overlay the real Linux mode onto what the mount just gave us. The
+        // rows are already on screen; this fills the permissions in after.
+        overlayGuestModes(for: target)
+        overlayGitBadges(for: target)
         // Column view needs every ancestor, not just the current directory.
         if viewMode == .column { await loadAncestors() }
+    }
+
+    /// Fetches the real Linux `st_mode` for a guest directory's rows from the
+    /// `fileopsd` relay and merges it into `guestModes`, keyed by host path.
+    ///
+    /// Off the main actor (a socket round trip), newest-wins (an old
+    /// directory's slow answer never clobbers the current one), and silent on
+    /// failure: no relay, an old mslhd or a stopped instance just leaves the
+    /// mode unknown, and the UI shows the mount listing without it. Cleared up
+    /// front so a previous directory's permissions never linger on these rows.
+    private func overlayGuestModes(for hostDir: String) {
+        guestModes = [:]
+        guard selectedRoot?.isGuest == true,
+              case .guestFilesystem(let instance, let guestPath) =
+                GuestPathMapper.map(hostPath: hostDir, guestMounts: guestMounts) else { return }
+        let token = UUID()
+        overlayToken = token
+        let base = hostDir
+        Task.detached(priority: .utility) {
+            let entries = DaemonClient.guestList(instance: instance, guestPath: guestPath)
+            guard let entries else { return }
+            let modes = Dictionary(entries.map { ("\(base)/\($0.name)", $0.mode) },
+                                   uniquingKeysWith: { first, _ in first })
+            await MainActor.run {
+                guard self.overlayToken == token else { return }
+                self.guestModes = modes
+            }
+        }
+    }
+
+    /// Reads every git repository among this directory's subfolders, for the
+    /// dots in the listing.
+    ///
+    /// Modelled on `overlayGuestModes`: off the main actor, newest-wins so a
+    /// previous directory's slow answer never decorates these rows, cleared
+    /// up front, and silent on failure - a folder MSL could not read simply
+    /// has no dot.
+    ///
+    /// **One command for the whole directory**, not one per folder: this runs
+    /// every time a directory is opened, so what matters is the number of
+    /// round trips rather than the work inside one.
+    private func overlayGitBadges(for hostDir: String) {
+        gitBadges = [:]
+        let token = UUID()
+        gitBadgeToken = token
+        let base = hostDir
+        let mapped = GuestPathMapper.map(hostPath: hostDir, guestMounts: guestMounts)
+        let isGuestRoot = selectedRoot?.isGuest == true
+
+        Task.detached(priority: .utility) {
+            var found: [String: Git.Badge] = [:]
+            if case .guestFilesystem(let instance, let guestPath) = mapped {
+                if case .success(let output) = DaemonClient.guestGit(
+                    instance: instance, guestPath: guestPath, operation: .badges) {
+                    found = Git.parseBadges(output)
+                }
+            } else if !isGuestRoot {
+                found = GitService.badges(inDirectory: base)
+            }
+            guard !found.isEmpty else { return }
+            let keyed = Dictionary(found.map { ("\(base)/\($0.key)", $0.value) },
+                                   uniquingKeysWith: { first, _ in first })
+            await MainActor.run {
+                guard self.gitBadgeToken == token else { return }
+                self.gitBadges = keyed
+            }
+        }
+    }
+
+    /// The git dot for a row, if this directory's pass found one.
+    func gitBadge(for item: MSLFileItem) -> Git.Badge? {
+        item.isBrowsableDirectory ? gitBadges[item.path] : nil
+    }
+
+    /// Re-reads the dots for the folder on screen.
+    ///
+    /// Editing a file *inside* a repository does not change the listing that
+    /// contains it, so nothing about navigating would notice. This is called
+    /// when the window comes forward and after the Git panel closes, which
+    /// between them cover how the state actually changes - somebody worked in
+    /// a terminal, or in an editor, and came back.
+    func refreshGitBadges() {
+        guard !currentPath.isEmpty else { return }
+        overlayGitBadges(for: currentPath)
+    }
+
+    /// The real Linux mode for a row, if the overlay has it.
+    func linuxMode(for item: MSLFileItem) -> UInt32? { guestModes[item.path] }
+
+    /// A guest regular file that isn't already executable - what "Make
+    /// Executable" offers itself for. Unknown mode (relay not answered yet)
+    /// counts as eligible: the worst case is a harmless no-op chmod.
+    func canMakeExecutable(_ paths: Set<String>) -> Bool {
+        paths.contains { host in
+            guard guestPath(forHostPath: host) != nil else { return false }
+            // Only when the real mode is known: acting on an unknown mode would
+            // have to guess the other permission bits, and guessing wide (0o755
+            // over a private 0o600 file) would quietly world-read a secret.
+            guard let mode = guestModes[host] else { return false }
+            return LinuxFileMode.isRegularFile(mode) && !LinuxFileMode.isExecutable(mode)
+        }
+    }
+
+    /// Sets the execute bits on guest files through the `fileopsd` relay -
+    /// `chmod +x`, the "I downloaded a script and it won't run" fix that a
+    /// WebDAV `PROPPATCH` can't do because its POSIX bits never reach Linux.
+    func makeExecutable(_ paths: Set<String>) {
+        let targets: [(instance: String, guestPath: String, mode: UInt32)] = paths.compactMap { host in
+            // Only a guest's *own* filesystem: chmod'ing a Mac-home file
+            // (`/mnt/mac`) would change it on the Mac, which isn't the intent.
+            guard case .guestFilesystem(let instance, let guestPath) =
+                    GuestPathMapper.map(hostPath: host, guestMounts: guestMounts) else { return nil }
+            // Only files whose real mode we know: preserve every other bit and
+            // add execute, never invent a mode (see `canMakeExecutable`).
+            guard let current = guestModes[host] else { return nil }
+            let mode = (current & 0o7777) | 0o111
+            return (instance, guestPath, mode)
+        }
+        guard !targets.isEmpty else { return }
+        Task.detached(priority: .userInitiated) {
+            let anyFailed = targets.contains { target in
+                !DaemonClient.guestChmod(instance: target.instance,
+                                         guestPath: target.guestPath, mode: target.mode)
+            }
+            await MainActor.run {
+                if anyFailed {
+                    self.errorMessage = "Couldn't change permissions - the instance may be stopped or its image too old."
+                }
+                Task { await self.reload() }
+            }
+        }
     }
 
     private func runQuery(_ kind: FileRoot.Kind) async {
@@ -730,7 +1204,7 @@ final class FilesModel: ObservableObject {
         switch kind {
         case .tag(let name): scope = .tag(name)
         case .recents: scope = .recents
-        case .directory: return
+        case .directory, .dashboard: return
         }
         let results: [MSLFileItem] = await withCheckedContinuation { continuation in
             spotlight.run(scope) { continuation.resume(returning: $0) }
@@ -767,6 +1241,44 @@ final class FilesModel: ObservableObject {
         renaming = nil
         guard newName != item.name else { return }
         run { provider in try await provider.rename(item.path, to: newName) }
+    }
+
+    // MARK: - Power Rename
+
+    /// The paths the Power Rename sheet is open for, sorted so the numbering in
+    /// the preview matches the order they'll be renamed. Empty means closed.
+    @Published var powerRenameTargets: [String] = []
+
+    /// The names already in the current directory - what a Power Rename preview
+    /// checks new names against for collisions.
+    var currentDirectoryNames: Set<String> { Set(items.map(\.name)) }
+
+    func beginPowerRename(_ paths: Set<String>) {
+        guard canWrite else { return }
+        powerRenameTargets = paths.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
+    /// Applies a computed Power Rename. Renames in two passes - everything to a
+    /// unique temporary name first, then to its final name - so a batch that
+    /// shuffles names among itself (a->b, b->c) can't have one step clobber a
+    /// file another step still needs. Only rows that actually change and carry
+    /// no problem are touched.
+    func applyPowerRename(_ previews: [PowerRename.Preview]) {
+        let changes = previews.filter { $0.changed && $0.problem == nil }
+        powerRenameTargets = []
+        guard !changes.isEmpty else { return }
+        run { provider in
+            var staged: [(tempPath: String, finalName: String)] = []
+            for change in changes {
+                let dir = (change.id as NSString).deletingLastPathComponent
+                let tempName = ".msl-rename-\(UUID().uuidString)"
+                try await provider.rename(change.id, to: tempName)
+                staged.append(((dir as NSString).appendingPathComponent(tempName), change.newName))
+            }
+            for item in staged {
+                try await provider.rename(item.tempPath, to: item.finalName)
+            }
+        }
     }
 
     /// Moves to the Trash where the volume has one, and asks first where it
@@ -815,8 +1327,13 @@ final class FilesModel: ObservableObject {
             resolved = (resolved as NSString).deletingLastPathComponent
         }
 
+        // Only real directory roots are navigation targets. The query roots
+        // (Recents, tags) and the MSL dashboard aren't places - and the
+        // dashboard's path is the home directory, so before this it tied with
+        // Home and could win, landing a shortcut back on the dashboard instead
+        // of opening the folder.
         let candidates = roots.filter {
-            !$0.kind.isQuery
+            $0.kind == .directory
                 && (resolved == $0.path || resolved.hasPrefix($0.path == "/" ? "/" : $0.path + "/"))
         }
         guard let root = candidates.max(by: { $0.path.count < $1.path.count }) else {
@@ -866,9 +1383,18 @@ final class FilesModel: ObservableObject {
     }
 
     func quickLookSelection() {
-        if let path = selection.first {
-            quickLookTarget = QuickLookTarget(url: URL(fileURLWithPath: path))
-        }
+        if let path = selection.first { quickLook(path: path) }
+    }
+
+    /// Opens Quick Look for a path, resolving it to the row we already know so
+    /// the peek can show that row's kind, size and Linux mode. Falls back to a
+    /// bare item if the path isn't in the current listing (it always is today,
+    /// but a synthesized item still previews correctly).
+    func quickLook(path: String) {
+        let item = items.first { $0.path == path }
+            ?? MSLFileItem(path: path, name: (path as NSString).lastPathComponent,
+                           isDirectory: false, size: 0, modified: nil)
+        quickLookTarget = QuickLookTarget(item: item)
     }
 
     func copyPathOfSelection() { copyPaths(selection) }
@@ -884,6 +1410,97 @@ final class FilesModel: ObservableObject {
         guard !paths.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(paths.sorted().joined(separator: "\n"), forType: .string)
+    }
+
+    /// Sniffed once per path: reading the leading bytes over the mount is a
+    /// round trip, and the context menu that asks this is rebuilt often.
+    private var textSniffCache: [String: Bool] = [:]
+
+    /// Whether to offer "Edit as Text…" and a text preview for this row.
+    ///
+    /// The name decides it for the common Linux files (`fstab`, `.bashrc`, a
+    /// unit file) with no read at all. For everything else that isn't a
+    /// directory or a bundle and is small enough - the extensionless build
+    /// script, the odd-suffix config - the leading bytes decide, so a text
+    /// file MSL Files has never seen the name of still opens, and a binary
+    /// with a text-shaped name doesn't pretend it can.
+    func canEditAsText(_ item: MSLFileItem) -> Bool {
+        guard !item.isDirectory, !item.isBundle else { return false }
+        if TextFileKind.looksEditable(name: item.name) { return true }
+        // A *declared* extension already answers the question without a read:
+        // `.png`/`.so`/`.gz` are text-or-not by definition. Only files with no
+        // extension, or one macOS doesn't recognise, reach the byte sniff -
+        // which matters because that read is synchronous and, on a guest root,
+        // goes over the WebDAV mount (a paused instance would wake mid-read).
+        let ext = (item.name as NSString).pathExtension.lowercased()
+        if !ext.isEmpty, let type = UTType(filenameExtension: ext), type.isDeclared {
+            return type.conforms(to: .text)
+        }
+        guard item.size <= UInt64(TextFileKind.editableByteLimit) else { return false }
+        if let cached = textSniffCache[item.path] { return cached }
+        // A short, bounded read of the head of the file - not the whole thing.
+        let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: item.path))
+        let sample = (try? handle?.read(upToCount: TextFileKind.sniffByteCount)) ?? nil
+        try? handle?.close()
+        let verdict = sample.map(TextFileKind.looksTextual(sample:)) ?? false
+        textSniffCache[item.path] = verdict
+        return verdict
+    }
+
+    /// The Linux path a host path has *inside a guest*, if any guest can see
+    /// it - the item's own path, not its enclosing folder (unlike
+    /// `guestMapping`, which a shell needs a directory for).
+    /// Opens the git panel on whichever folder the person means: a selected
+    /// folder, or the one being browsed.
+    func showGitForSelectionOrCurrentFolder() {
+        if let item = focusedItem, item.isBrowsableDirectory {
+            gitTarget = GitPanelTarget(path: item.path, name: item.name)
+            return
+        }
+        let path = currentPath
+        let name = (path as NSString).lastPathComponent
+        gitTarget = GitPanelTarget(path: path, name: name.isEmpty ? path : name)
+    }
+
+    /// Which instance a Mac path actually lives inside, or nil for an
+    /// ordinary Mac folder.
+    ///
+    /// Note that the Mac's own home directory is shared *into* every
+    /// instance, so a path there maps to a guest path without belonging to
+    /// any one instance - which is why this returns nil for that case while
+    /// `guestPath(forHostPath:)` returns a path. Anything that must run
+    /// inside a particular guest needs this one.
+    func instanceOwning(hostPath: String) -> String? {
+        switch GuestPathMapper.map(hostPath: hostPath, guestMounts: guestMounts) {
+        case .guestFilesystem(let instance, _): return instance
+        case .macHomeShare, .unreachable: return nil
+        }
+    }
+
+    func guestPath(forHostPath hostPath: String) -> String? {
+        switch GuestPathMapper.map(hostPath: hostPath, guestMounts: guestMounts) {
+        case .guestFilesystem(_, let guestPath), .macHomeShare(let guestPath):
+            return guestPath
+        case .unreachable:
+            return nil
+        }
+    }
+
+    /// Whether any of these rows maps to a Linux path - what "Copy Linux Path"
+    /// checks before offering itself. A folder deep in the Mac filesystem, or
+    /// on another volume, has no guest path at all.
+    func hasLinuxPath(_ paths: Set<String>) -> Bool {
+        paths.contains { guestPath(forHostPath: $0) != nil }
+    }
+
+    /// The Linux path(s) for these rows, one per line - the path your guest
+    /// shell, a Dockerfile `COPY`, or a config file wants, not the
+    /// `/Volumes/127.0.0.1/...` the Mac sees.
+    func copyLinuxPaths(_ paths: Set<String>) {
+        let mapped = paths.sorted().compactMap { guestPath(forHostPath: $0) }
+        guard !mapped.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(mapped.joined(separator: "\n"), forType: .string)
     }
 
     func revealSelectionInFinder() {
@@ -927,8 +1544,10 @@ final class FilesModel: ObservableObject {
     }
 
     /// Opens Terminal.app on the Mac side, at this row's folder.
-    func openInTerminal(_ item: MSLFileItem) {
-        let directory = shellDirectory(for: item)
+    /// `nil` means the folder being shown, which is what the background
+    /// menu asks for; an item means that row's folder (or its parent).
+    func openInTerminal(_ item: MSLFileItem?) {
+        let directory = item.map { shellDirectory(for: $0) } ?? currentPath
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
         process.arguments = ["-a", "Terminal", directory]
@@ -995,6 +1614,58 @@ final class FilesModel: ObservableObject {
             .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
+    /// Opens Terminal.app running a deep disk report inside `instance` - the
+    /// authoritative guest view of the disk, in one click. Starts the instance
+    /// if it isn't running (any `msl <instance>` session boots it), so it
+    /// works from a stopped instance too.
+    ///
+    /// The report is a script written to the Mac-home share (`/mnt/mac`),
+    /// never an inline `sh -c`: the guest's shell drops the quotes on a
+    /// one-liner passed through `msl` and the command hangs (a scar this
+    /// project already carries). Running `sh <path>` hands the guest one
+    /// argument - a path - and sidesteps all of it.
+    func analyzeGuestDisk(instance: String) {
+        // Written to a no-space path under home, so the guest reaches it at a
+        // predictable /mnt/mac path with nothing to quote.
+        let hostScript = NSHomeDirectory() + "/.msl-disk-analysis.sh"
+        let guestScript = GuestPathMapper.macHomeMountPoint + "/.msl-disk-analysis.sh"
+        let report = """
+        #!/bin/sh
+        echo '===== Disk usage (df -h) ====='; df -h
+        echo; echo '===== Root filesystem ====='; df -h /
+        echo; echo '===== Inodes (df -i) ====='; df -i
+        echo; echo '===== Largest directories under / (this can take a moment) ====='
+        du -xh --max-depth=1 / 2>/dev/null | sort -rh | head -20
+        echo; echo '===== Mounts ====='; mount | grep -v -e cgroup -e /sys -e /proc
+        echo; echo '(disk report complete)'
+        """
+        do {
+            try report.write(toFile: hostScript, atomically: true, encoding: .utf8)
+        } catch {
+            errorMessage = "Couldn't prepare the disk report. (\(error.localizedDescription))"
+            return
+        }
+        // `msl <instance> -u root sh <script>` - instance boots if stopped,
+        // runs as root so `du /` can read everything, output stays on screen.
+        let line = [MSLPaths.tool("msl").path, instance, "-u", "root", "sh", guestScript]
+            .map(DesktopEntry.shellQuote)
+            .joined(separator: " ")
+        let script = """
+        tell application "Terminal"
+            activate
+            do script "clear; echo 'Analyzing \(appleScriptLiteral(instance))…'; \(appleScriptLiteral(line))"
+        end tell
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        do {
+            try process.run()
+        } catch {
+            errorMessage = "Couldn't open the disk report. (\(error.localizedDescription))"
+        }
+    }
+
     func selectAll() {
         selection = Set(visibleItems.map(\.path))
     }
@@ -1021,8 +1692,8 @@ final class FilesModel: ObservableObject {
                 selection.remove(item.path)
             } else {
                 selection.insert(item.path)
-                selectionAnchor = item.path
             }
+            setAnchor(item.path)
             return
         }
         if modifiers.contains(.shift), let anchor = selectionAnchor {
@@ -1030,12 +1701,53 @@ final class FilesModel: ObservableObject {
             if let start = ordered.firstIndex(of: anchor),
                let end = ordered.firstIndex(of: item.path) {
                 let range = start <= end ? start...end : end...start
-                selection = Set(ordered[range])
+                selection = rangeBase.union(ordered[range])
+                selectionCursor = item.path
                 return
             }
         }
         selection = [item.path]
-        selectionAnchor = item.path
+        setAnchor(item.path)
+    }
+
+    /// What was selected besides the range when the anchor was set. A shift
+    /// range is added on top of it, which is AppKit's rule: items picked with
+    /// ⌘ survive a later shift-click, and shift-clicking back toward the anchor
+    /// shrinks the range instead of only ever growing it.
+    private var rangeBase: Set<String> = []
+
+    private func setAnchor(_ path: String) {
+        selectionAnchor = path
+        selectionCursor = path
+        rangeBase = selection.subtracting([path])
+    }
+
+    /// Where the arrow keys move from: the last item clicked or arrived at.
+    private var selectionCursor: String?
+
+    /// Arrow-key navigation, the same in every view mode now that selection
+    /// lives in the model rather than in a `List`. `extend` (shift) grows the
+    /// selection from the anchor, as Finder does.
+    func moveSelection(by delta: Int, extend: Bool) {
+        let ordered = visibleItems.map(\.path)
+        guard !ordered.isEmpty else { return }
+        let from = selectionCursor.flatMap { ordered.firstIndex(of: $0) }
+            ?? selection.compactMap { ordered.firstIndex(of: $0) }.max()
+        let target: Int
+        if let from {
+            target = min(max(from + delta, 0), ordered.count - 1)
+        } else {
+            target = delta >= 0 ? 0 : ordered.count - 1
+        }
+        let path = ordered[target]
+        if extend, let anchor = selectionAnchor, let start = ordered.firstIndex(of: anchor) {
+            let range = start <= target ? start...target : target...start
+            selection = rangeBase.union(ordered[range])
+            selectionCursor = path
+        } else {
+            selection = [path]
+            setAnchor(path)
+        }
     }
 
     /// Applies or removes a tag across the selection.
@@ -1184,13 +1896,130 @@ final class FilesModel: ObservableObject {
     /// unless a folder was the drop target).
     func receive(_ urls: [URL], into directory: String? = nil) {
         let destination = directory ?? currentPath
+        // Read now, on the main actor, while the drop is still happening -
+        // by the time the work below runs the key may be back up.
+        let forceCopy = NSEvent.modifierFlags.contains(.option)
         run { provider in
             for url in urls {
+                if !forceCopy, Self.sameFilesystem(url.path, destination) {
+                    try Self.move(url.path, into: destination)
+                    continue
+                }
                 // Dropping a folder is a recursive copy; `copyItem` already
                 // does that, so nothing special is needed beyond letting it.
                 try await provider.importFile(from: url, into: destination)
+                await self.restoreExecutableBits(from: url, landingIn: destination)
             }
         }
+    }
+
+    /// Whether a row's path is a folder files can be dropped into, for the
+    /// AppKit drop destination resolving what is under the cursor.
+    func dropFolder(at path: String) -> String? {
+        guard canWrite,
+              let item = visibleItems.first(where: { $0.path == path }),
+              item.isBrowsableDirectory
+        else { return nil }
+        return item.path
+    }
+
+    /// Whether a drag within this pair of paths should move rather than copy.
+    ///
+    /// Finder's rule, and what people mean by "proper" drag and drop: within
+    /// one volume a drag moves, across volumes it copies, and holding option
+    /// always copies. Dragging a file into a sibling folder and finding two
+    /// of it is the thing that makes a file browser feel wrong.
+    ///
+    /// The test is the device number rather than anything about MSL,
+    /// because that is exactly the condition under which a move is possible
+    /// at all: `rename(2)` cannot cross a filesystem. It also lands the
+    /// Mac/Linux question on the right answer without having to ask it -
+    /// an instance's mount is its own device, so Mac to Linux and between
+    /// two instances both copy.
+    nonisolated static func sameFilesystem(_ source: String, _ destination: String) -> Bool {
+        var a = stat(), b = stat()
+        guard stat(source, &a) == 0, stat(destination, &b) == 0 else { return false }
+        return a.st_dev == b.st_dev
+    }
+
+    /// Moves, refusing to clobber and refusing to swallow a folder into
+    /// itself - which `rename(2)` would otherwise report as a baffling
+    /// EINVAL after the row had already disappeared.
+    nonisolated static func move(_ source: String, into directory: String) throws {
+        let name = (source as NSString).lastPathComponent
+        let target = (directory as NSString).appendingPathComponent(name)
+        guard target != source else { return }
+        guard !directory.hasPrefix(source + "/") else {
+            throw MSLFileError.alreadyExists(name)
+        }
+        guard !FileManager.default.fileExists(atPath: target) else {
+            throw MSLFileError.alreadyExists(name)
+        }
+        try FileManager.default.moveItem(atPath: source, toPath: target)
+    }
+
+    /// Puts back the executable bit that the WebDAV mount drops on the way
+    /// into an instance.
+    ///
+    /// **A dragged script arrives unrunnable otherwise.** The mount does not
+    /// carry POSIX modes through to the real Linux inode - which is why
+    /// "Make Executable" exists as a separate daemon round trip at all - so
+    /// a `-rwxr-xr-x` file on the Mac lands as `-rw-r--r--` in the guest,
+    /// and the person who dragged it over gets "permission denied" from a
+    /// file they can see is theirs.
+    ///
+    /// **The mount lies in both directions, which is why neither mode here
+    /// comes from it.** Asked about a file that is really `644` inside the
+    /// instance, the mount reports `700`. Trusting it would make every
+    /// drag between two Linux folders mark its file executable and flatten
+    /// the group and other bits on the way past - a worse bug than the one
+    /// being fixed. So the source mode is read from the instance when the
+    /// source is itself inside one, and only the executable bits are ever
+    /// taken from it; everything else about the landed file's mode is left
+    /// exactly as the instance already has it.
+    private func restoreExecutableBits(from source: URL, landingIn directory: String) async {
+        let landed = (directory as NSString)
+            .appendingPathComponent(source.lastPathComponent)
+        guard let instance = instanceOwning(hostPath: landed),
+              let landedGuestPath = guestPath(forHostPath: landed) else { return }
+
+        guard let executable = await executableBits(of: source), executable != 0 else { return }
+
+        // The landed file's real mode, from the instance rather than the
+        // mount, so the bits that are not ours to touch survive.
+        let parent = (landedGuestPath as NSString).deletingLastPathComponent
+        let name = (landedGuestPath as NSString).lastPathComponent
+        let landedMode = await Task.detached(priority: .utility) {
+            DaemonClient.guestList(instance: instance, guestPath: parent)?
+                .first { $0.name == name }?.mode
+        }.value
+        guard let landedMode else { return }
+
+        let wanted = (landedMode & 0o7777) | executable
+        guard wanted != (landedMode & 0o7777) else { return }
+        _ = await Task.detached(priority: .utility) {
+            DaemonClient.guestChmod(instance: instance, guestPath: landedGuestPath, mode: wanted)
+        }.value
+    }
+
+    /// The executable bits of the file being dropped, from whichever side of
+    /// the line actually knows them.
+    private func executableBits(of source: URL) async -> UInt32? {
+        // A source inside an instance: ask the instance, because the mount
+        // would answer 700 whatever the truth is.
+        if let sourceInstance = instanceOwning(hostPath: source.path),
+           let sourceGuestPath = guestPath(forHostPath: source.path) {
+            let parent = (sourceGuestPath as NSString).deletingLastPathComponent
+            let name = (sourceGuestPath as NSString).lastPathComponent
+            let mode = await Task.detached(priority: .utility) {
+                DaemonClient.guestList(instance: sourceInstance, guestPath: parent)?
+                    .first { $0.name == name }?.mode
+            }.value
+            return mode.map { $0 & 0o111 }
+        }
+        // An ordinary Mac file, where the mode means what it says.
+        let attributes = try? FileManager.default.attributesOfItem(atPath: source.path)
+        return (attributes?[.posixPermissions] as? NSNumber).map { $0.uint32Value & 0o111 }
     }
 
     private func run(_ work: @escaping (LocalFileProvider) async throws -> Void) {

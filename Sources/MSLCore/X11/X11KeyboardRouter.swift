@@ -11,7 +11,7 @@ import AppKit
 /// A local event monitor sees every key event before any of that happens.
 /// It forwards Command-key events to the focused canvas and consumes them,
 /// except for the few shortcuts that belong to the Mac: quitting, hiding,
-/// minimizing and cycling windows. Those must keep working exactly as in
+/// minimizing, cycling windows, and the Emoji & Symbols palette. Those must keep working exactly as in
 /// any other app, or the Linux windows stop behaving like Mac windows.
 enum X11KeyboardRouter {
     private static var monitor: Any?
@@ -37,6 +37,14 @@ enum X11KeyboardRouter {
 
     static func isReservedForMac(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> Bool {
         let mods = flags.intersection([.command, .option, .control, .shift])
+        // **Control+Command belongs to macOS, whatever the key.** ⌃⌘F is
+        // full screen, ⌃⌘Q locks the screen, ⌃⌘Space is the character
+        // picker - all system-wide window and session commands with no
+        // Linux meaning. Without this the shortcut remapper turned ⌃⌘F into
+        // a plain Ctrl+F and full screen stopped working inside Linux
+        // windows. Checked before the per-key list so it covers the ones
+        // nobody has thought of yet.
+        if mods.contains([.command, .control]) { return true }
         switch keyCode {
         case 0x0C: return mods == [.command] // Cmd+Q
         case 0x04: return mods == [.command] || mods == [.command, .option] // Cmd+H, Hide Others

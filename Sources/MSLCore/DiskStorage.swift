@@ -412,12 +412,40 @@ public enum DiskStorage {
         loadPolicies()[name]
     }
 
-    public static func setPolicy(_ policy: StoragePolicy, forImageNamed name: String) {
+    /// Returns false when a policy refused the change, or the write failed.
+    ///
+    /// **`resources.disk` is enforced here, and it has to be here.** The
+    /// obvious place looked like `setCapacity`, which is what actually
+    /// grows the file - but `prepareForBoot` reads the STORED policy and
+    /// applies it at every start, inside mslhd. A gate on `setCapacity`
+    /// alone would therefore be bypassed by its own bookkeeping: the
+    /// refused size would sit in `storage.json` and the next boot would
+    /// quietly carry it out. Refusing the recorded intent closes both.
+    ///
+    /// Only a change to a policy someone already saved is an edit. The
+    /// first write establishes the disk - it comes from installing a distro
+    /// (`DistroInstaller`), creating an instance (`InstanceSetup`) or
+    /// migrating to per-instance disks (`InstanceLayoutMigration`) - and
+    /// denying `resources.disk` restricts resizing, not having a disk at
+    /// all. Same rule, for the same reason, as `ResourcePolicyStore.save`.
+    @discardableResult
+    public static func setPolicy(_ policy: StoragePolicy, forImageNamed name: String) -> Bool {
         var policies = loadPolicies()
+        if let current = policies[name], current != policy {
+            // A legacy per-distro key belongs to no one instance, so it is
+            // scoped app-wide rather than attributed to a guess.
+            let instance = InstanceDisk.instanceName(forStorageKey: name)
+            // `resources.edit` is the broader switch over all three dials,
+            // and it does NOT cover this one by prefix - "resources.edit"
+            // is a sibling of "resources.disk", not an ancestor - so it is
+            // asked for explicitly, exactly as the memory and CPU dials do.
+            guard MSLAPGate.allows("resources.edit", instance: instance),
+                  MSLAPGate.allows("resources.disk", instance: instance) else { return false }
+        }
         policies[name] = policy
         MSLPaths.ensureDirectory(MSLPaths.appSupport)
-        guard let data = try? JSONEncoder().encode(policies) else { return }
-        try? data.write(to: policyFile, options: .atomic)
+        guard let data = try? JSONEncoder().encode(policies) else { return false }
+        return (try? data.write(to: policyFile, options: .atomic)) != nil
     }
 
     /// Forgets everything recorded about an image - policy, usage sample and

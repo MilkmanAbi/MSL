@@ -1,37 +1,45 @@
 # Code of Conduct
 
-MSL is a small open-source project, and everyone here should be treated with respect.
+MSL is a small project that a lot of care went into, and the people around it deserve the same. This is how we treat each other here: in issues, pull requests, discussions, and anywhere else you're speaking as part of the MSL community.
 
-Please be kind, assume good faith, and remember that there is a person behind every issue, pull request, and comment.
+## The short version
 
-## Please
+Be kind. Assume good faith. Remember that there's a person on the other end, often one who built the thing you're talking about in their free time, and often one whose first language isn't English. Disagree with ideas, never with people. ( ´ ▽ ` )
 
-* Be respectful, even when you disagree.
-* Give constructive feedback.
-* Ask questions rather than making assumptions.
-* Help newcomers when you can.
-* Keep discussions focused on the project.
+## What we want
 
-## Not okay
+- Being welcoming to people of every background, identity and level of experience, including people who have never filed a bug report before.
+- Giving feedback that's specific, useful and gentle, and taking feedback the same way.
+- Owning mistakes, apologising to the people they affected, and learning from them.
+- Asking before assuming, and explaining before dismissing.
+- Keeping the focus on what's best for MSL and the people who use it.
 
-* Harassment, discrimination, or personal attacks.
-* Slurs or derogatory comments.
-* Unwanted sexual comments or attention.
-* Trolling or deliberately disruptive behaviour.
-* Sharing someone's private information without permission.
+## What we don't accept
+
+- Harassment of any kind, in public or in private.
+- Insults, slurs, personal attacks, and comments about anyone's identity, appearance or ability.
+- Sexualised language or imagery, and unwelcome attention of any kind.
+- Trolling, deliberately derailing conversations, and bad-faith arguments.
+- Publishing anyone's private information, such as a real name, address or email, without their explicit permission.
+- Anything else a reasonable person would consider inappropriate in a friendly, professional space.
+
+## Where this applies
+
+Everywhere in the MSL repositories and their issues, pull requests and discussions, and anywhere else someone is representing the project, such as posting from an account or talking about MSL in an official capacity.
 
 ## Reporting
 
-If someone is making you uncomfortable or you see behaviour that violates this code, please contact the maintainer, Abi ([@MilkmanAbi](https://github.com/MilkmanAbi)).
+If someone's behaviour makes you uncomfortable, or you see something that breaks this code, tell the maintainer, Abi ([@MilkmanAbi](https://github.com/MilkmanAbi) on GitHub). Reports are read privately, handled promptly, and the person who reported is protected. You don't need to be sure it's serious enough; if it bothered you, that's reason enough to say something.
 
-Reports will be handled privately and in good faith. You do not need to be certain that something is serious enough to report. If something feels wrong, it is okay to say so.
+## What happens next
 
-## Enforcement
+The maintainer decides what's appropriate, which might be:
 
-The maintainer may take whatever action is appropriate, including asking someone to stop, issuing a warning, restricting participation, or banning someone from the project.
-
-The goal is to keep MSL a friendly place to build, learn, and occasionally argue about extremely stupid bugs.
+1. **A private word**, explaining what happened and why it wasn't okay.
+2. **A warning**, with clear consequences if it continues.
+3. **A temporary ban** from interacting with the project.
+4. **A permanent ban**, for sustained or serious harm.
 
 ## Credit
 
-This Code of Conduct is adapted from the [Contributor Covenant](https://www.contributor-covenant.org/), version 2.1, licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+This code is adapted from the [Contributor Covenant](https://www.contributor-covenant.org), version 2.1, which is available under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

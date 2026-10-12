@@ -1,0 +1,10 @@
+{
+ "_doc": "Errors a replay may get that are NOT mslgd bugs. Keys are xreplay's 'where -> Error'. Anything else is a FAIL; BadImplementation/BadRequest/BadLength never belong here.",
+ "*": {},
+ "firefox-esr": {
+  "core 3 -> BadWindow": "a window id learned from a reply (another client's window) that does not exist in the replay",
+  "core 14 -> BadDrawable": "same id, GetGeometry"
+ },
+ "gimp": {"core 3 -> BadWindow": "as firefox-esr", "core 14 -> BadDrawable": "as firefox-esr"},
+ "mousepad": {"core 3 -> BadWindow": "as firefox-esr", "core 14 -> BadDrawable": "as firefox-esr"}
+}

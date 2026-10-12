@@ -152,8 +152,31 @@ public final class InstanceRegistry {
         }
         entries[name] = distro.rawValue
         try save(entries)
+        // **The identity is issued HERE, not at the daemon's CREATE.**
+        //
+        // That request's own comment claims to be "the one place every
+        // caller comes through", and it is not: `msl new` calls this method
+        // directly, so an instance made that way was never issued one.
+        // Found by running it - a brand-new instance reported "no identity
+        // recorded". This IS the single chokepoint for registration, and
+        // only on the path that creates a NEW entry, so an existing
+        // instance is never re-issued.
+        //
+        // Best-effort on purpose: a failure leaves the instance
+        // `unidentified`, which the acceptance rules answer for. Being
+        // unable to record provenance must never stop an instance existing.
+        InstanceIdentityStore.issueFresh(for: name, appSupport: appSupportDirectory)
         return name
     }
+
+    /// Where the rest of MSL's state lives, derived from this registry's
+    /// own file rather than from `MSLPaths`.
+    ///
+    /// `instances.json` sits in Application Support, so its parent *is*
+    /// that directory - and taking it from here means a registry pointed at
+    /// a temporary directory in a test keeps its side effects there too,
+    /// instead of writing identities into the real installation.
+    var appSupportDirectory: URL { path.deletingLastPathComponent() }
 
     public func remove(_ name: String) throws {
         var entries = try loadRaw()

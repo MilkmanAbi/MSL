@@ -51,6 +51,20 @@ public enum DistroCatalog {
 
     /// The manifest, or nil if it can't be had within `timeout` seconds - this
     /// is for a hint, and a hint must never hang a terminal.
+    /// The first source that answers.
+    ///
+    /// Used by `msl` with nothing installed, which prints what can be
+    /// downloaded. A short timeout each: this is a listing, and someone
+    /// typing `msl` should not wait on a host that is down - the next one is
+    /// a second away.
+    public static func fetch(from sources: [DistroInstaller.ImageSource],
+                             timeout: Int = 6) -> DistroInstaller.Manifest? {
+        for source in sources {
+            if let manifest = fetch(from: source.manifestURL, timeout: timeout) { return manifest }
+        }
+        return nil
+    }
+
     public static func fetch(from urlString: String, timeout: Int = 6) -> DistroInstaller.Manifest? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/curl")

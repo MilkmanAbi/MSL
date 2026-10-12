@@ -153,7 +153,10 @@ final class HelpGuideTests: XCTestCase {
             ("sudo", ["linux-users", "first-start"]),
             ("wireshark", ["traffic-monitor"]),
             ("snapshot", ["snapshots"]),
-            ("xquartz", ["how-it-works", "linux-windows"]),
+            // "mslgd" too: its first paragraph is the answer someone
+            // searching this wants - that MSL has its own display server and
+            // XQuartz is not needed.
+            ("xquartz", ["how-it-works", "linux-windows", "mslgd"]),
             ("clock wrong", ["trouble-clock", "guest-utilities"]),
             ("vscode", ["ssh", "trouble-ssh"]),
             ("hibernate", ["stopping-instances"]),
@@ -172,6 +175,22 @@ final class HelpGuideTests: XCTestCase {
             ("memroy", ["memory", "memory-dynamic", "trouble-memory"]),
             ("forgot password", ["linux-users"]),
             ("sudo password", ["linux-users", "first-start"]),
+            // The Admin Portal and the instance-management chapters. People
+            // search for the thing that refused them, or for the verb.
+            ("admin portal", ["mslap", "mslap-setup"]),
+            ("mslap", ["mslap", "mslap-setup", "mslap-capabilities"]),
+            ("refused", ["mslap-refusals", "mslap", "mslap-capabilities"]),
+            ("not allowed", ["mslap-refusals", "mslap-capabilities", "mslap"]),
+            ("lock down", ["mslap", "mslap-capabilities", "mslap-setup"]),
+            ("admin password", ["mslap-setup", "mslap", "linux-users"]),
+            ("clone instance", ["instances-rename", "instances-identity"]),
+            ("rename", ["instances-rename"]),
+            ("port forward", ["instances-forward"]),
+            ("localhost", ["instances-forward"]),
+            ("encrypt", ["instances-protect"]),
+            ("custom launch command", ["instances-custom-command", "app-menu"]),
+            ("where did this come from", ["instances-identity"]),
+            ("revoke", ["mslap-lineage", "instances-identity"]),
         ]
         for (query, acceptable) in expectations {
             let top = Array(HelpGuide.index.search(query).prefix(3)).map(\.articleID)

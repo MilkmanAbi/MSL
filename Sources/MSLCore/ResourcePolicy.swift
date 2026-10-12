@@ -208,6 +208,33 @@ public enum ResourcePolicyStore {
     @discardableResult
     public static func save(_ policy: ResourcePolicy, instance: String) -> Bool {
         let url = file(for: instance)
+        // MSLAP, at the one place all three writers pass through - the
+        // Resources card, `InstanceSetup` and shipment import. Enforcing in
+        // the card alone would leave the other two open.
+        //
+        // Only a CHANGE is an edit: the first write establishes an
+        // instance's allocation and is part of creating it, so denying
+        // `resources.edit` restricts what someone may alter rather than
+        // preventing instances existing at all.
+        if FileManager.default.fileExists(atPath: url.path) {
+            guard MSLAPGate.allows("resources.edit", instance: instance) else { return false }
+            // And the individual dials, so a policy can allow resizing a
+            // disk while refusing more CPUs. Only a FIELD THAT CHANGED is
+            // checked - otherwise denying `resources.cpu` would block a
+            // memory change that happened to be saved alongside it.
+            let current = load(instance: instance)
+            let changes: [(String, Bool)] = [
+                ("resources.memory", policy.memory?.configuredBytes != current.memory?.configuredBytes),
+                ("resources.cpu", policy.cpuCount != current.cpuCount),
+                // Fixed versus dynamic is its own choice, separate from
+                // how much memory is assigned.
+                ("resources.balloon", policy.memory?.isDynamic != current.memory?.isDynamic),
+            ]
+            for (capability, changed) in changes
+            where changed && !MSLAPGate.allows(capability, instance: instance) {
+                return false
+            }
+        }
         guard MSLPaths.ensureDirectory(url.deletingLastPathComponent()) else { return false }
         guard let data = try? JSONEncoder().encode(policy) else { return false }
         return (try? data.write(to: url, options: .atomic)) != nil

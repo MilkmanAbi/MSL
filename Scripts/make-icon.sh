@@ -10,11 +10,14 @@
 #   Scripts/make-icon.sh [--force]
 #
 # Regenerates when the PNG is newer than the .icns, or on --force.
+#
+# MSL_ICON_SOURCE / MSL_ICON_TARGET / MSL_ICON_SCALE build a different icon
+# from the same pipeline - build-app.sh uses them for MSL Files' melon folder.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-SOURCE="Sources/MSLApp/Resources/App_Logo.png"
-TARGET="Resources/MSLApp/MSL.icns"
+SOURCE="${MSL_ICON_SOURCE:-Sources/MSLApp/Resources/App_Logo.png}"
+TARGET="${MSL_ICON_TARGET:-Resources/MSLApp/MSL.icns}"
 
 [ -f "$SOURCE" ] || { echo "make-icon: missing $SOURCE" >&2; exit 1; }
 

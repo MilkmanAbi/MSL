@@ -7,8 +7,9 @@ extension HelpChapter {
     static let tools = HelpChapter(
         id: "tools", title: "Tools Tab", symbol: "wrench.and.screwdriver", tint: .orange,
         blurb: "The background service, snapshots, stopping and removing, and disk check and repair.",
-        articles: [.toolsTab, .backgroundService, .generatedApps, .snapshots, .stoppingInstances, .removingInstances, .uninstallingMSL,
-                   .maintenance, .diskCheck, .diskRepair, .checkAtStart, .maintenanceBoot, .guestUtilities])
+        articles: [.toolsTab, .shipments, .backgroundService, .generatedApps, .snapshots, .stoppingInstances, .removingInstances, .uninstallingMSL,
+                   .maintenance, .diskCheck, .diskRepair, .checkAtStart, .maintenanceBoot, .guestUtilities,
+                   .usbDevices])
 }
 
 extension HelpArticle {
@@ -25,6 +26,183 @@ extension HelpArticle {
         | **Snapshots** | Saved machine states, to go back to. | [Snapshots](help:snapshots) |
         | **Maintenance** | Disk check and repair, maintenance boot, and fix-it utilities. | [Maintenance](help:maintenance) |
         | **Instance** | Suspend, Hibernate, Shut Down, Remove…. | [Stopping](help:stopping-instances), [Removing](help:removing-instances) |
+        """#)
+
+    static let usbDevices = HelpArticle(
+        id: "usb-devices", title: "USB devices", symbol: "cable.connector",
+        summary: "Hand a USB device on your Mac to a Linux instance - including hardware macOS has no driver for.",
+        keywords: ["usb", "device", "passthrough", "driver", "serial", "ftdi", "arduino",
+                   "dev board", "programmer", "dongle", "hardware", "attach", "detach", "vhci", "usbip"],
+        related: ["tools-tab", "cli-help", "experiments"],
+        body: #"""
+        Some devices macOS simply has no driver for: a development board, a
+        programmer, a vendor-specific dongle, a piece of lab equipment whose
+        manufacturer only ever shipped a Linux driver. Plug one into a Mac and
+        nothing happens. Linux, very often, knows exactly what it is.
+
+        MSL can hand the device over. It carries it into the instance over
+        USB/IP, which has been part of Linux since 2008 and is built into every
+        image MSL ships - so there is nothing to install on the Linux side and
+        no driver to find.
+
+        ## Seeing what is there
+
+            msl usb list
+
+        | Column | What it tells you |
+        |---|---|
+        | `LOCATION` | The device's location ID, which is what you pass to attach. It is the port it is plugged into, so it changes if you move it. |
+        | `ID` | Vendor and product, as `vendor:product`. You can use this instead of the location ID. |
+        | `macOS DRIVER` | Which of macOS's own drivers is holding it, or `none - native`. |
+        | `ATTACHED TO` | Which instance has it, if any. |
+
+        That third column is the one that matters, because it decides which of
+        two quite different things happens next.
+
+        ## A device macOS does not know
+
+            msl usb attach 00100000 work
+
+        This is the case MSL is built for. Nothing on your Mac has claimed the
+        device, so MSL opens it and serves it to the instance directly. No
+        password, no approval, nothing to grant. It appears in the guest a
+        moment later and `lsusb` lists it like any other device.
+
+        ## A device macOS does know
+
+        Most things you own are in this group: anything speaking USB serial
+        (macOS ships drivers for the FTDI, CH34x, CP210x and Prolific chips),
+        anything CDC-ACM, and every flash drive. macOS has already claimed it,
+        so MSL has to **take** it, and taking hardware away from the system
+        needs an administrator password.
+
+        MSL asks for it with a prompt that says what it is for, and only a
+        small helper program runs with those privileges - never the whole app,
+        and never anything between one attach and the next. The attachment
+        lasts as long as that command: press Ctrl-C, or close the window, and
+        the device goes back.
+
+        > Note: a disk in this group is unmounted the hard way when it is
+        > taken. Eject it in Finder first, or anything still writing to it
+        > loses whatever it had not flushed. MSL warns you before asking for
+        > the password.
+
+        ## Giving it back
+
+            msl usb detach 00100000 work
+
+        macOS picks the device up again by itself. So does stopping or
+        hibernating the instance - nothing is left stranded, and you never have
+        to unplug something physically to get it back.
+
+        An instance holding a device will not be paused or hibernated by the
+        idle timer, because a paused machine cannot answer the device and it
+        would appear to die.
+
+        ## Checking it works, with nothing plugged in
+
+            msl usb test work
+
+        This attaches a device MSL makes up: it has no hardware behind it, and
+        exists so the whole path - the connection into the guest, the kernel
+        attach, the protocol - can be checked on a Mac with nothing connected.
+        If it appears in the instance, passthrough itself is working, and
+        anything that then fails is about that particular device.
+        """#)
+
+    static let shipments = HelpArticle(
+        id: "shipments", title: "Shipments", symbol: "shippingbox",
+        summary: "A whole instance in one file, for carrying to another Mac.",
+        keywords: ["shipment", "mslship", "export", "import", "share", "docker", "image", "portable", "backup"],
+        related: ["tools-tab", "removing-instances", "experiments"],
+        body: #"""
+        A **shipment** is one instance packed into a single file. Everything it
+        has goes with it: the applications you installed, your files, your Linux
+        account, how much disk and memory it was given, and which experimental
+        features it was running. Someone else's MSL can install that file and
+        get a working machine - even if their Mac has never downloaded that
+        distribution.
+
+        It is, honestly, MSL's weirder and worse version of what Docker does.
+        There are no layers, no registry, no build file, and nothing clever
+        about it: it is one machine, copied whole. Docker is a better tool for
+        almost everything a shipment could be used for. What a shipment is good
+        at is the thing Docker makes awkward - handing a colleague the *exact*
+        environment you are sitting in, graphical applications and all, and
+        having them open it on their Mac without learning anything first.
+
+        ## Making one
+
+        From the app, in the **Tools** tab, or from the menu beside the Terminal
+        button: **Create Shipment…**. From a terminal:
+
+            msl work --shipment
+            msl work --shipment -o ~/Desktop/work.mslship
+
+        The instance has to be **shut down** first. A shipment taken from a
+        running machine catches its filesystem halfway through a write, which
+        makes a file that looks fine and is not.
+
+        Expect it to take a few minutes and produce a file a few hundred
+        megabytes to a gigabyte or so, depending on how much is in the instance.
+        Most of that time is compression.
+
+        ## Installing one
+
+        **New Instance → Install MSL Shipment…**, or:
+
+            msl shipment install work.mslship
+            msl shipment install work.mslship --name borrowed
+
+        If the name inside is already taken, MSL picks a free one rather than
+        writing over the instance you have. To see what is in a file before
+        committing to it:
+
+            msl shipment info work.mslship
+
+        That reads only the small manifest at the front of the file, so it
+        answers immediately even for a very large shipment.
+
+        ## What travels, and what it does on arrival
+
+        | | |
+        |---|---|
+        | The filesystem | Everything - applications, files, configuration |
+        | Your Linux account | The one you log in as, so the instance opens as you |
+        | CPUs, memory, disk size | Applied to the new instance |
+        | Sandbox seals | Applied, but see below |
+        | Experimental features | Applied **to that instance only** |
+
+        **Experiments do not change your MSL.** The settings in a shipment are
+        recorded as overrides for the instance it created and nothing else, so
+        installing a shipment from someone who runs MSL differently from you
+        leaves your own switches exactly as they were. Only the differences are
+        stored, so an instance is not frozen against settings its author never
+        touched.
+
+        Some things cannot be reproduced on every Mac. If a shipment wanted GPU
+        acceleration and this Mac has no renderer installed, that one is
+        skipped, and MSL says which and why rather than pretending.
+
+        **Seals only travel in the safe direction.** A sealed shipment installs
+        sealed. An open one does not unseal anything - it leaves your defaults
+        alone.
+
+        ## Before you install someone else's
+
+        A shipment is a complete Linux system somebody else assembled. It can
+        contain anything they put in it, and installing one is closer to running
+        their computer than to opening their document. Install shipments from
+        people you trust.
+
+        The checksum inside a shipment is there to catch a damaged or truncated
+        file. It is not a signature, and it says nothing about who made it.
+
+        ## Where the file goes
+
+        A `.mslship` is a plain zip. You can look inside with Archive Utility or
+        `unzip -l` and find two things: `msl.json`, which is the manifest above,
+        and the compressed disk. Nothing is hidden or encrypted.
         """#)
 
     static let backgroundService = HelpArticle(
@@ -78,6 +256,14 @@ extension HelpArticle {
         - **Show in Finder** — opens it.
         - **Open Logs** — opens `~/Library/Logs/MSL`. A Mac app started from the Dock has no terminal to report
           problems in, so it writes them here instead.
+
+        The **MSL** panel in MSL Files has an *MSL itself* card showing how much the logs have grown, with
+        **Show** and **Clear**. Clearing empties them in place rather than deleting the files, because MSL's
+        background service holds them open while it runs — a deleted log would leave it writing somewhere
+        nothing can read, until it next restarted.
+
+        MSL's record of what instances were started, stopped and changed is kept separately and is not touched
+        by clearing the logs.
 
         They're ordinary Mac apps: deleting one in Finder is exactly the same as **Remove from Applications**.
         """#)
@@ -222,11 +408,14 @@ extension HelpArticle {
         id: "uninstalling-msl", title: "Uninstalling MSL", symbol: "arrow.down.left.circle",
         summary: "Remove MSL and keep every instance and image - or remove all of it.",
         keywords: ["uninstall", "remove msl", "delete msl", "upgrade", "update", "reinstall", "clean install"],
-        related: ["background-service", "generated-apps", "removing-instances"],
+        related: ["background-service", "generated-apps", "mslap-capabilities"],
         body: #"""
-        **Permissions & Startup ▸ Uninstall**, or `msl uninstall` in a terminal. Both run the same thing: the app
-        shows you the list and then hands the job to the command in a Terminal window, because MSL can't delete
-        itself while it's the one doing the deleting.
+        **Window ▸ Remove MSL…**, or `msl uninstall` in a terminal. Both build the same itemised list and remove the
+        same things, so the two can never disagree about what MSL leaves behind.
+
+        The window shows the choice first — **Keep my Linux** or **Remove everything** — then every item with its
+        size, and removes nothing until you have read it. Deleting your Linux asks again, with the instance count
+        and the total.
 
         > [!IMPORTANT] Your Linux is kept by default
         > Uninstalling removes MSL, not the Linux you installed with it. Every instance, disk image, custom image,
@@ -240,6 +429,20 @@ extension HelpArticle {
         - The Mac apps made for your Linux apps, in `~/Applications/MSL`.
         - MSL's caches, logs and saved window state.
         - The `msl`, `mslhd`, `mslgui` and `msl-applauncher` programs.
+        - The Admin Portal's password and signing keys, and any encrypted containers, in
+          `/Users/Shared/MSL`. Those are MSL's own records about who administers this Mac, not your Linux, so they
+          go in both modes.
+        - An enrolled policy in `/Library/Application Support/MSL`.
+        - Things that are not files: Dock tiles for your Linux apps, the app's registration with macOS so it stops
+          appearing in Spotlight and Launchpad, and the installer's receipt so a reinstall does its own work.
+
+        A few of those belong to the system, so macOS asks for your password once at the end. MSL finishes the job
+        itself rather than printing a `sudo rm -rf` for you to paste — an uninstaller that stops and hands you a
+        command has not finished.
+
+        If an instance is in an encrypted container and you are keeping your Linux, its disk is taken back out
+        first. The key lives in `/Users/Shared/MSL`, which is about to go, and leaving a disk inside would make it
+        permanently unreadable — see [Protecting an image](help:instances-protect).
 
         Running instances are shut down properly first - not hibernated, because a saved session with no MSL to
         restore it is worse than a clean power-off. Anything mounted in Finder is unmounted before that.
@@ -250,6 +453,12 @@ extension HelpArticle {
         - Your instances, the accounts you made, and each instance's storage settings.
         - Your custom images, in `Custom Images`.
         - MSL's own settings, so a reinstall doesn't switch something back on that you switched off.
+
+        ## Under a policy {#policy}
+
+        An administrator can deny `system.uninstall`. The menu item is still there and the refusal says who decided
+        and why, because hiding it would leave you hunting for something that is not there — see
+        [Reading a refusal](help:mslap-refusals).
 
         ## Upgrading is not uninstalling {#upgrading}
 

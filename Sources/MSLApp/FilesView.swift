@@ -54,7 +54,11 @@ struct FilesView: View {
     private var isPicker: Bool { accessory != nil }
 
     /// Takes the pending link, if this window is the one that gets it.
-    private func consumeLink() {
+    /// Whether this window has been on screen before. A link held for a new
+    /// window is only ever given to a window appearing for the first time.
+    @State private var hasAppearedBefore = false
+
+    private func consumeLink(firstAppearance: Bool = false) {
         // Never in a picker: a reveal meant for a real MSL Files window must
         // not be swallowed by a dialog that is about to close, which would
         // lose it entirely.
@@ -64,7 +68,7 @@ struct FilesView: View {
         // navigate invisibly, leaving the window that opened a moment later
         // on the MSL tab. See `NSWindow.isWithdrawnPrewarm`.
         if hostWindow.window?.isWithdrawnPrewarm == true { return }
-        guard let url = MSLFilesLink.take() else { return }
+        guard let url = MSLFilesLink.take(firstAppearance: firstAppearance) else { return }
         if files.reveal(url) { Task { await model.refresh() } }
     }
 
@@ -106,7 +110,14 @@ struct FilesView: View {
         // them through SwiftUI opened a second window on a cold launch. The
         // instance's mount may be newer than this window's list of roots, so
         // the reveal waits for the refresh if it has to.
-        .onAppear { consumeLink() }
+        .onAppear {
+            // Only the first appearance counts as a new window: SwiftUI
+            // calls this again when a window comes back to the front, and a
+            // window being re-shown must not take a link meant for a new one.
+            let isNew = !hasAppearedBefore
+            hasAppearedBefore = true
+            consumeLink(firstAppearance: isNew)
+        }
         .onReceive(NotificationCenter.default.publisher(for: MSLFilesLink.didArrive)) { _ in consumeLink() }
         .onChange(of: model.instances) { _, new in files.rebuildRoots(from: new) }
         .sheet(item: $files.quickLookTarget) { target in

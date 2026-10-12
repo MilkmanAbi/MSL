@@ -147,23 +147,28 @@ final class MSLFilesAppDelegate: NSObject, NSApplicationDelegate {
             MSLFilesLink.deliver(url)
         }
         guard picks.isEmpty else { return }
-        // A link that arrives while the app is running with **no window** has
-        // nobody to consume it: `deliver` posts a notification and every
-        // listener is a window that no longer exists. That is the same
-        // "nothing happens" symptom as the Dock tile, by a second route - so
-        // make a window, which then takes the pending link on appear.
-        if !MSLWindowReopen.hasRealWindow {
-            MSLWindowReopen.reopen()
-            // Announce it again once that window exists. `reopen` may make a
-            // new window - whose `onAppear` takes the link - or bring back the
-            // one prewarming hid, which has already appeared once and will not
-            // appear again. In that second case nothing would ever consume the
-            // link, so "show this folder" did nothing at all. Re-posting is
-            // safe either way: a listener that finds nothing pending does
-            // nothing, because `take()` returns nil.
-            DispatchQueue.main.async {
-                NotificationCenter.default.post(name: MSLFilesLink.didArrive, object: nil)
-            }
+
+        // **Every browser link gets its own window**, whether or not MSL
+        // Files is already open. The three ways in are different things and
+        // must not fight over one window: opened from the Dock it is a file
+        // browser the person is using; opened from an instance in MSL it is
+        // "show me this instance's files", which should not take over
+        // whatever they were looking at; and a pick is its own window
+        // already, handled above.
+        //
+        // On a cold launch there is nothing registered to reopen, `reopen()`
+        // says so, and the window the launch is already making takes the link
+        // on its first appearance - which is why this does not produce the
+        // two windows SwiftUI's own URL routing used to.
+        MSLWindowReopen.reopen()
+
+        // The safety net. `reopen` may instead revive the window prewarming
+        // hid, which has already appeared once and will not appear again, so
+        // nothing would consume the link. If it is still sitting there a
+        // moment later, give it to whatever is on screen rather than let
+        // "show this folder" do nothing.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            MSLFilesLink.releaseToAnyWindow()
         }
     }
 
@@ -205,15 +210,50 @@ enum MSLFilesLink {
         return token
     }
 
-    static func deliver(_ url: URL) {
+    /// Set while a link is waiting for a window that does not exist yet.
+    ///
+    /// **A link gets a window of its own.** Opening an instance's files from
+    /// MSL used to post this as a broadcast, so whichever window answered
+    /// first took it - meaning a second instance's folder hijacked the
+    /// window somebody was already working in, and which window that was
+    /// depended on the order listeners happened to fire in. Holding the link
+    /// for a window that has not appeared yet makes it deterministic: the
+    /// new window takes it on first appearance, and windows already on
+    /// screen leave it alone.
+    private static var wantsOwnWindow = false
+
+    static func deliver(_ url: URL, toNewWindow: Bool = true) {
         pending = url
-        NotificationCenter.default.post(name: didArrive, object: nil)
+        wantsOwnWindow = toNewWindow
+        // Deliberately no broadcast here when the link wants its own window:
+        // posting it would hand the link to a window already on screen,
+        // which is the behaviour being fixed.
+        if !toNewWindow { NotificationCenter.default.post(name: didArrive, object: nil) }
     }
 
     /// The link waiting to be handled, if any. Taking it consumes it.
-    static func take() -> URL? {
-        defer { pending = nil }
+    ///
+    /// `firstAppearance` is the window saying it has just come into
+    /// existence. A link held for a new window is given only to such a
+    /// window; one that is already on screen asking again gets nothing.
+    static func take(firstAppearance: Bool = false) -> URL? {
+        guard pending != nil else { return nil }
+        guard !wantsOwnWindow || firstAppearance else { return nil }
+        defer { pending = nil; wantsOwnWindow = false }
         return pending
+    }
+
+    /// Hands a link that nobody took to whatever window is on screen.
+    ///
+    /// The safety net for the one case the rule above cannot cover: when
+    /// `reopen()` revives the window prewarming hid rather than making a
+    /// new one, that window has already appeared and will not appear again,
+    /// so nothing would ever consume the link and "show this folder" would
+    /// do nothing at all.
+    static func releaseToAnyWindow() {
+        guard pending != nil else { return }
+        wantsOwnWindow = false
+        NotificationCenter.default.post(name: didArrive, object: nil)
     }
 }
 

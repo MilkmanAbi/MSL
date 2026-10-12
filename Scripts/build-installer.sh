@@ -65,6 +65,28 @@ if [ ! -d "$FILES_APP" ]; then
 fi
 cp -R "$FILES_APP" "$STAGE/MSL Files.app"
 
+# Strip extended attributes from the staged copy. Resources copied into the
+# bundle carry whatever the file had on disk - `com.apple.quarantine` among
+# them, from anything that was ever downloaded - and installing files that
+# arrive already quarantined is a Gatekeeper prompt waiting to happen. The
+# staging is a copy, so this touches nothing that was signed: both bundles
+# are re-verified below.
+xattr -cr "$STAGE" 2>/dev/null || true
+for staged in "$STAGE/MSL.app" "$STAGE/MSL Files.app"; do
+    if ! codesign -v "$staged" 2>/dev/null; then
+        echo "build-installer: $staged lost its signature while staging" >&2
+        exit 1
+    fi
+done
+# The one that fails silently if it goes missing: an mslhd without the
+# virtualization entitlement starts fine and then cannot create a VM.
+if ! codesign -d --entitlements - --xml "$STAGE/MSL.app" 2>/dev/null \
+     | grep -q virtualization; then
+    echo "build-installer: MSL.app has no virtualization entitlement" >&2
+    exit 1
+fi
+echo "    signatures and entitlement verified on the staged copy"
+
 # Runs as root, BEFORE anything is replaced. This is where an upgrade saves
 # the user's work: MSL's own app used to try to do it from a script in
 # Terminal, which was a lot of machinery to duplicate what the installer is

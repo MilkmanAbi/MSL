@@ -111,38 +111,46 @@ final class GuestSessionWaitTests: XCTestCase {
                       "with no client to ask, trust the socket as before")
     }
 
-    // MARK: - Dollars through systemd
+    // MARK: - Dollars and systemd
 
-    /// **systemd expands `$` in the command line itself.** `systemd-run`
-    /// makes a transient unit whose `ExecStart` gets systemd's own
-    /// substitution before the program runs, so `$HOME` was mangled by
-    /// systemd rather than expanded by the shell it was written for.
+    /// **There is no spelling of a dollar that works on every systemd.**
+    /// Measured on two guests with the same command: systemd 262 (Arch)
+    /// parses `$HOME/...` greedily and refuses it - "Invalid environment
+    /// variable name evaluates to an empty string" - while systemd 257
+    /// (Alma) passes `$$HOME` straight through, so the shell reads `$$` as
+    /// its own pid and runs `5132HOME/...`. Escaping for one breaks the
+    /// other, which is what happened: Arch was fixed and Alma broke
+    /// identically a week later.
     ///
-    /// It only showed on one distro, which is what made it confusing: the
-    /// systemd branch is taken only where `systemd-run --user` works. Alpine
-    /// has no systemd; on Fedora the user scope bus was unavailable; both
-    /// fell through to running the command directly and were fine. On Arch
-    /// it worked, and the dollar was eaten:
-    ///
-    ///     Invalid environment variable name evaluates to an empty string:
-    ///     HOME/.local/share/msl-integration/bin/msl-open dir
-    func testDollarsAreDoubledForSystemd() {
-        XCTAssertEqual(GuestIntegration.systemdLiteralForTesting("$HOME/bin/msl-open dir"),
-                       "$$HOME/bin/msl-open dir")
-        XCTAssertEqual(GuestIntegration.systemdLiteralForTesting("a $B c $D"), "a $$B c $$D")
-        XCTAssertEqual(GuestIntegration.systemdLiteralForTesting("no dollars here"),
-                       "no dollars here")
-    }
-
-    /// The command handed to `systemd-run` carries the doubled form; the
-    /// fallback that runs it directly must not, or the shell would see `$$`
-    /// and expand it to a process id.
-    func testOnlyTheSystemdBranchDoublesThem() {
+    /// So a command with a dollar in it skips the systemd scope and is run
+    /// directly, where one shell does the expanding and the answer does not
+    /// depend on anybody's systemd version.
+    func testACommandWithADollarNeverReachesSystemd() {
         let script = GuestIntegration.launchCommand("$HOME/bin/thing", instance: "x",
                                                     settings: MSLExperimentalSettings())
-        XCTAssertTrue(script.contains("sh -c '$$HOME/bin/thing'"),
-                      "the systemd-run branch needs the literal form")
+        XCTAssertFalse(script.contains("systemd-run"),
+                       "a dollar must not be handed to systemd at all")
         XCTAssertTrue(script.hasSuffix("$HOME/bin/thing"),
-                      "the direct fallback must keep the ordinary one")
+                      "it still runs, directly, where the shell expands it")
+    }
+
+    /// An ordinary command keeps the scope - that is what it is for, so
+    /// snap's cgroup check passes.
+    func testACommandWithoutADollarStillGetsTheScope() {
+        let script = GuestIntegration.launchCommand("krita", instance: "x",
+                                                    settings: MSLExperimentalSettings())
+        XCTAssertTrue(script.contains("systemd-run --user --scope"))
+        XCTAssertTrue(script.contains("sh -c 'krita'"))
+    }
+
+    /// Which is why MSL's own tile has no dollar in it: it resolves on the
+    /// PATH every launch exports, so it keeps the scope on every distro.
+    func testMSLsOwnCommandIsDollarFree() {
+        let command = LinuxApp.mslFiles().command
+        XCTAssertFalse(command.contains("$"), "MSL's own command must not need expanding")
+        XCTAssertEqual(command, "msl-open dir")
+        let script = GuestIntegration.launchCommand(command, instance: "x",
+                                                    settings: MSLExperimentalSettings())
+        XCTAssertTrue(script.contains("systemd-run --user --scope"))
     }
 }

@@ -67,7 +67,12 @@ public struct LinuxApp: Identifiable, Codable, Hashable {
         LinuxApp(
             desktopPath: mslFilesPath,
             name: "MSL Files",
-            command: "$HOME/\(GuestIntegration.directory)/bin/msl-open dir",
+            // **No `$HOME`, deliberately.** The kit's bin directory is on the
+            // PATH every launch exports, and PATH is handed into the systemd
+            // scope by name - so a bare command resolves without anything
+            // having to expand a variable. A path with `$HOME` in it does not
+            // survive systemd reliably: see `GuestIntegration.launchCommand`.
+            command: "msl-open dir",
             comment: "Browse this instance's files, and your Mac's, in MSL Files",
             source: .system)
     }

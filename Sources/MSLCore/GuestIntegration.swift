@@ -513,6 +513,34 @@ public enum GuestIntegration {
         // refuses. A transient user scope puts the app where a desktop
         // session would have put it. Nothing else depends on it, so a guest
         // without systemd simply runs the command as before.
+        // **A command containing `$` never goes through systemd.**
+        //
+        // systemd substitutes variables in a transient unit's command line,
+        // and what it does with a dollar depends on the version. Measured on
+        // two guests, same command:
+        //
+        //     Arch,  systemd 262   `$HOME/...`  -> systemd parses the name
+        //                                          greedily and refuses:
+        //                                          "Invalid environment
+        //                                          variable name evaluates to
+        //                                          an empty string"
+        //     Alma,  systemd 257   `$$HOME`     -> passed through untouched,
+        //                                          so the shell read `$$` as
+        //                                          its own pid: `5132HOME`
+        //
+        // So there is no spelling of a dollar that is correct on both: 262
+        // wants it escaped, 257 wants it raw. Escaping for one breaks the
+        // other, which is exactly what happened - Arch was fixed and Alma
+        // broke in the same way a week apart.
+        //
+        // The systemd scope is a nice-to-have: it exists so snap's cgroup
+        // check passes, and running the command directly is the ordinary
+        // path for every guest without systemd. So a command with a dollar
+        // in it simply takes that path, where one shell does the expanding
+        // and the result does not depend on anybody's systemd version.
+        // MSL's own commands have no dollar in them precisely so they keep
+        // the scope.
+        if !command.contains("$") {
         lines.append(#"""
         if command -v systemd-run >/dev/null 2>&1 \
            && [ -S "${XDG_RUNTIME_DIR-}/bus" ] \
@@ -535,9 +563,10 @@ public enum GuestIntegration {
                 XDG_CONFIG_DIRS="${XDG_CONFIG_DIRS-}" \
                 GTK_MODULES="${GTK_MODULES-}" \
                 UBUNTU_MENUPROXY="${UBUNTU_MENUPROXY-}" \
-                sh -c \#(shellQuoted(systemdLiteral(command)))
+                sh -c \#(shellQuoted(command))
         fi
         """#)
+        }
         lines.append(command)
         return lines.joined(separator: "\n")
     }
@@ -1102,37 +1131,6 @@ public enum GuestIntegration {
         "'" + string.replacingOccurrences(of: "'", with: #"'\''"#) + "'"
     }
 
-    /// A command going through `systemd-run`, with its dollars protected.
-    ///
-    /// **systemd expands `$` in the command line itself.** `systemd-run`
-    /// makes a transient unit, and that unit's `ExecStart` gets systemd's own
-    /// variable substitution before the program ever runs - so a command
-    /// containing `$HOME` is mangled by systemd rather than expanded by the
-    /// shell it was written for. systemd's documented escape for a literal
-    /// dollar is `$$`.
-    ///
-    /// This is why it broke on one distro and not the others, which is the
-    /// confusing part. The systemd branch is only taken when
-    /// `systemd-run --user` actually works: Alpine has no systemd at all, and
-    /// on Fedora here the user scope bus is unavailable, so both fall through
-    /// to running the command directly, where the shell expands `$HOME`
-    /// correctly. On Arch it works, the branch is taken, and systemd ate the
-    /// dollar:
-    ///
-    ///     Invalid environment variable name evaluates to an empty string:
-    ///     HOME/.local/share/msl-integration/bin/msl-open dir
-    ///     sh: -c: option requires an argument
-    ///
-    /// Doubling the dollars puts a literal `$` back in front of the inner
-    /// `sh -c`, which then expands it as intended - the same result the other
-    /// distros were already getting by never reaching systemd at all.
-    static func systemdLiteral(_ command: String) -> String {
-        command.replacingOccurrences(of: "$", with: "$$")
-    }
-
-    public static func systemdLiteralForTesting(_ command: String) -> String {
-        systemdLiteral(command)
-    }
 
     // MARK: - Handlers
 

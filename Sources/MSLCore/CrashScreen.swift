@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import Security
 
 /// A signal handler is a plain C function pointer, so it can capture
 /// nothing - which is why everything it needs is static on `CrashScreen`.
@@ -44,18 +45,99 @@ public enum CrashScreen {
 
     /// A stop code in the spirit of the thing: readable, specific enough to
     /// grep the logs for, and not pretending to be a diagnosis.
-    public static func stopCode(signal: Int32) -> String {
-        let name: String
-        switch signal {
-        case SIGSEGV: name = "WENT_SOMEWHERE_IT_SHOULDNT"
-        case SIGBUS:  name = "BUS_TOOK_A_WRONG_TURN"
-        case SIGILL:  name = "INSTRUCTION_MAKES_NO_SENSE"
-        case SIGFPE:  name = "MATHS_HAPPENED"
-        case SIGABRT: name = "GAVE_UP_ON_ITSELF"
-        case SIGTRAP: name = "TRIPPED_OVER_A_TRAP"
-        default:      name = "SIGNAL_\(signal)"
+    /// One named way MSL can stop dead.
+    ///
+    /// **A stop code is a promise, not a label.** The number is stable and
+    /// is never reused for a different condition, because the whole point is
+    /// that somebody can paste it into an issue - or search it - and find
+    /// the same thing every time. Rename the text freely; never renumber.
+    ///
+    /// `next` is what the person can actually do. It is `nil` for the
+    /// unanticipated ones, and that absence is honest: when MSL does not
+    /// know what went wrong it must not invent advice.
+    public struct StopCode: Equatable, Sendable {
+        public let number: UInt32
+        public let name: String
+        public let happened: String
+        public let next: String?
+
+        public init(number: UInt32, name: String, happened: String, next: String? = nil) {
+            self.number = number
+            self.name = name
+            self.happened = happened
+            self.next = next
         }
-        return name
+
+        /// `0x00000010`, the form that goes on screen and into a search box.
+        public var printed: String { String(format: "0x%08X", number) }
+    }
+
+    /// Every code, which is also how `code(named:)` finds one.
+    public static let allStopCodes: [StopCode] = [
+        .wentSomewhereItShouldnt, .busTookAWrongTurn, .instructionMakesNoSense,
+        .mathsHappened, .gaveUpOnItself, .trippedOverATrap,
+        .serviceCannotListen, .signingKeyUnreadable, .keyStoreUnprotected,
+        .virtualizationRefused,
+    ]
+
+    /// The code a recorded name belongs to, for the window to show more than
+    /// the name. An uncaught exception has no fixed name - it carries the
+    /// exception's own - so this answers nil and the window shows what it has.
+    public static func code(named name: String) -> StopCode? {
+        allStopCodes.first { $0.name == name }
+    }
+
+    /// Whether this process is allowed to create virtual machines.
+    ///
+    /// **Only a definite "no" counts.** `SecTaskCopyValueForEntitlement`
+    /// answers nil both for an entitlement that is absent and for a task it
+    /// could not read, and crash-screening a Mac because the second happened
+    /// would be far worse than the bug being caught. So this returns false
+    /// only when the task was readable and the entitlement was not there.
+    ///
+    /// Verified both ways before being relied on: the same test binary
+    /// reports absent unsigned, and present after `codesign --entitlements`
+    /// with `com.apple.security.virtualization`.
+    public static func canCreateVirtualMachines() -> Bool {
+        guard let task = SecTaskCreateFromSelf(nil) else { return true }
+        // A signing identifier proves the task is readable; without one,
+        // nothing can be concluded from a nil entitlement.
+        guard SecTaskCopyValueForEntitlement(task, "com.apple.security.virtualization" as CFString,
+                                             nil) == nil else { return true }
+        guard SecTaskCopySigningIdentifier(task, nil) != nil else { return true }
+        return false
+    }
+
+    /// Stops MSL on purpose, with a code that says why.
+    ///
+    /// Unlike the signal path this is not running inside a signal handler,
+    /// so it can use Foundation freely - but it keeps the same on-disk note
+    /// format, because the window reads one thing.
+    public static func stop(_ code: StopCode, detail: String = "") -> Never {
+        note(stopCode: code.name, detail: detail.isEmpty ? code.happened : detail)
+        present()
+        // Out, rather than carrying on in a state MSL has just said it
+        // cannot work in.
+        exit(EXIT_FAILURE)
+    }
+
+    /// The code for a signal, taken from the one table rather than a second
+    /// list - two switches over the same thing is how a name ends up with
+    /// one number here and another on screen.
+    public static func stop(signal: Int32) -> StopCode? {
+        switch signal {
+        case SIGSEGV: return .wentSomewhereItShouldnt
+        case SIGBUS:  return .busTookAWrongTurn
+        case SIGILL:  return .instructionMakesNoSense
+        case SIGFPE:  return .mathsHappened
+        case SIGABRT: return .gaveUpOnItself
+        case SIGTRAP: return .trippedOverATrap
+        default:      return nil
+        }
+    }
+
+    public static func stopCode(signal: Int32) -> String {
+        stop(signal: signal)?.name ?? "SIGNAL_\(signal)"
     }
 
     public static func stopCode(exception name: String) -> String {
@@ -170,4 +252,83 @@ public enum CrashScreen {
     public static func clearReport() {
         try? FileManager.default.removeItem(at: reportURL)
     }
+}
+
+/// The codes themselves, on the type they belong to, so a call site can
+/// say `.serviceCannotListen` and read as the sentence it is.
+extension CrashScreen.StopCode {
+    // MARK: - The unanticipated ones
+    //
+    // MSL did not see these coming and has nothing to suggest. They keep
+    // their original names: the numbers were added later, and changing a
+    // name people may already have searched for would be worse than a
+    // slightly odd one.
+
+    public static let wentSomewhereItShouldnt = Self(
+        number: 0x01, name: "WENT_SOMEWHERE_IT_SHOULDNT",
+        happened: "MSL read or wrote memory that was not its own.")
+    public static let busTookAWrongTurn = Self(
+        number: 0x02, name: "BUS_TOOK_A_WRONG_TURN",
+        happened: "MSL asked for memory the processor could not give it.")
+    public static let instructionMakesNoSense = Self(
+        number: 0x03, name: "INSTRUCTION_MAKES_NO_SENSE",
+        happened: "MSL tried to run something that is not an instruction.")
+    public static let mathsHappened = Self(
+        number: 0x04, name: "MATHS_HAPPENED",
+        happened: "An arithmetic operation had no answer MSL could use.")
+    public static let gaveUpOnItself = Self(
+        number: 0x05, name: "GAVE_UP_ON_ITSELF",
+        happened: "MSL hit a check inside itself that it could not carry on past.")
+    public static let trippedOverATrap = Self(
+        number: 0x06, name: "TRIPPED_OVER_A_TRAP",
+        happened: "MSL ran into a trap left for a debugger.")
+
+    // MARK: - The ones MSL raises on purpose
+    //
+    // Each of these is a condition MSL **cannot continue past**, detected
+    // where it actually happens. They are not the same as the errors that
+    // get a sentence and a retry - an instance that will not start, a disk
+    // that needs checking - because those leave MSL working. These do not.
+
+    /// 0x10. `mslhd` could not serve its control socket, so nothing can
+    /// reach it: not the app, not `msl`, not a Linux app asking for a file.
+    public static let serviceCannotListen = Self(
+        number: 0x10, name: "SERVICE_CANNOT_LISTEN",
+        happened: "MSL's background service could not open the socket everything "
+                + "else talks to it on, so nothing can reach it.",
+        next: "Another copy of it may already be running. Quit MSL, open it again, "
+            + "and if that does not help, restart the Mac.")
+
+    /// 0x11. The signing key is there and cannot be read. MSL must not
+    /// generate another - that would orphan every identity on this Mac - so
+    /// there is nothing it can do but stop.
+    public static let signingKeyUnreadable = Self(
+        number: 0x11, name: "SIGNING_KEY_UNREADABLE",
+        happened: "The key MSL signs your instances with is there but cannot be read. "
+                + "MSL will not replace it: a new key would make every instance on "
+                + "this Mac unverifiable, permanently.",
+        next: "Check that /Users/Shared/MSL and the machine-key file inside it still "
+            + "belong to you and are readable.")
+
+    /// 0x12. The store that decides which policies are honoured is writable
+    /// by somebody else, so every signature check fails closed - on a Mac
+    /// that is actually managed, that means the administrator's rules have
+    /// silently stopped applying.
+    public static let keyStoreUnprotected = Self(
+        number: 0x12, name: "KEY_STORE_UNPROTECTED",
+        happened: "This Mac is managed, but the folder holding the administrator's "
+                + "keys can be written by other accounts - so signed policies no "
+                + "longer verify and the rules have stopped applying.",
+        next: "An administrator can repair it with: "
+            + "sudo chown -R root /Users/Shared/MSL && sudo chmod -R go-w /Users/Shared/MSL")
+
+    /// 0x13. macOS will not let this build create a virtual machine, so no
+    /// instance can ever start. Almost always a copy of `mslhd` that was
+    /// moved into place by hand instead of installed.
+    public static let virtualizationRefused = Self(
+        number: 0x13, name: "VIRTUALIZATION_REFUSED",
+        happened: "macOS will not let this copy of MSL's service create a virtual "
+                + "machine, so no instance can start.",
+        next: "Install MSL from its package rather than copying the files in: the "
+            + "permission is part of the signature and does not survive a plain copy.")
 }

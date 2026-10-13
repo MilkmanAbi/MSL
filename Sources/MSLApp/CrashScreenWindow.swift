@@ -34,16 +34,51 @@ struct CrashScreenView: View {
             // The one thing the picture cannot carry: what actually
             // happened, in text somebody can paste into an issue.
             if let report {
+                VStack(alignment: .leading, spacing: Design.Spacing.small) {
+                // The code first, in the form somebody can search for. A
+                // bare name told them nothing they could look up; a number
+                // that never moves does.
+                if let code = CrashScreen.code(named: report.stopCode) {
+                    Text("\(code.printed) · \(code.name)")
+                        .font(.system(.callout, design: .monospaced).weight(.semibold))
+                        .foregroundStyle(.white)
+                        .textSelection(.enabled)
+                    Text(code.happened)
+                        .font(.callout)
+                        .foregroundStyle(.white.opacity(0.85))
+                        .fixedSize(horizontal: false, vertical: true)
+                    // Only when there is something to do. For the
+                    // unanticipated ones there is not, and inventing advice
+                    // would be worse than the silence.
+                    if let next = code.next {
+                        Text(next)
+                            .font(.callout)
+                            .foregroundStyle(.white.opacity(0.85))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } else {
+                    // An uncaught exception carries its own name, so there
+                    // is no entry to look up - show what there is.
+                    Text(report.stopCode)
+                        .font(.system(.callout, design: .monospaced).weight(.semibold))
+                        .foregroundStyle(.white)
+                        .textSelection(.enabled)
+                }
                 HStack(spacing: Design.Spacing.medium) {
-                    Text("\(report.component) · \(report.stopCode)")
+                    Text(report.component)
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.75))
                         .textSelection(.enabled)
                     Spacer()
                     Button("Copy details") {
                         NSPasteboard.general.clearContents()
+                        // Everything an issue needs, including the number.
+                        let code = CrashScreen.code(named: report.stopCode)
                         NSPasteboard.general.setString(
-                            "\(report.component) \(report.stopCode)\n\(report.detail)",
+                            [code.map { "\($0.printed) \($0.name)" } ?? report.stopCode,
+                             "component: \(report.component)",
+                             MSLVersion.display,
+                             report.detail].filter { !$0.isEmpty }.joined(separator: "\n"),
                             forType: .string)
                     }
                     Button("Open the log") {
@@ -58,9 +93,11 @@ struct CrashScreenView: View {
                     }
                     Button("Quit") { NSApp.terminate(nil) }
                 }
+                }
                 .padding(.horizontal, Design.Spacing.large)
                 .padding(.vertical, Design.Spacing.medium)
-                .background(.black.opacity(0.55))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.black.opacity(0.65))
             }
         }
         .frame(minWidth: 760, minHeight: 440)

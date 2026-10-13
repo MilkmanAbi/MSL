@@ -7,7 +7,7 @@ extension HelpChapter {
         id: "troubleshooting", title: "Troubleshooting", symbol: "cross.case", tint: .watermelon,
         blurb: "Symptoms first, then what to do — and where to look when that isn't enough.",
         articles: [.troubleWontStart, .troubleService, .troubleApps, .troubleSSH, .troubleDisk, .troubleFilesystem,
-                   .troubleClock, .troubleMaintenance, .troubleMemory, .troubleNetwork, .logsAndDoctor, .reclaimSpace])
+                   .troubleClock, .troubleMaintenance, .troubleMemory, .troubleNetwork, .stopCodes, .logsAndDoctor, .reclaimSpace])
 }
 
 extension HelpArticle {
@@ -277,6 +277,64 @@ extension HelpArticle {
 
         - Raise the instance's memory (manual), or its maximum (dynamic), then restart it.
         - On dynamic memory, the live readout's **Guest stalling on memory** shows when it's struggling.
+        """#)
+
+static let stopCodes = HelpArticle(
+        id: "stop-codes", title: "The crash screen and its stop codes", symbol: "exclamationmark.octagon",
+        summary: "What MSL shows when it cannot carry on, and what each code means.",
+        keywords: ["crash", "crash screen", "stop code", "error code", "0x", "fatal",
+                   "SERVICE_CANNOT_LISTEN", "SIGNING_KEY_UNREADABLE", "KEY_STORE_UNPROTECTED",
+                   "VIRTUALIZATION_REFUSED", "quit unexpectedly"],
+        related: ["logs-and-doctor", "trouble-service", "mslap-strength"],
+        body: #"""
+        Most things that go wrong in MSL get a sentence and a way out. The crash screen is for the ones that
+        do not: MSL has stopped, and carrying on would mean pretending.
+
+        Every stop carries a **code** — a number like `0x00000010` and a name like `SERVICE_CANNOT_LISTEN`.
+        The number never changes meaning, so it is worth quoting in a bug report or searching for.
+
+        **Copy details** puts the code, the component and MSL's version on the clipboard. **Open the log**
+        opens `~/Library/Logs/MSL`, which is where a crash is actually diagnosed.
+
+        ## Codes MSL understands {#known}
+
+        These are conditions MSL recognises and can tell you what to do about.
+
+        | Code | What happened | What to do |
+        |---|---|---|
+        | `0x00000010` SERVICE_CANNOT_LISTEN | MSL's background service could not open the socket everything talks to it on | Another copy may be running. Quit MSL and open it again; failing that, restart the Mac |
+        | `0x00000011` SIGNING_KEY_UNREADABLE | The key MSL signs your instances with is there but unreadable | Check that `/Users/Shared/MSL` and `machine-key` inside it still belong to you |
+        | `0x00000012` KEY_STORE_UNPROTECTED | This Mac is managed, but the administrator's keys can be written by other accounts | An administrator repairs it — see [How strong a policy is](help:mslap-strength) |
+        | `0x00000013` VIRTUALIZATION_REFUSED | macOS will not let this copy of MSL create a virtual machine | Install MSL from its package rather than copying the files in |
+
+        > [!important]
+        > MSL will **not** replace an unreadable signing key. A new one would make every instance on this Mac
+        > unverifiable, permanently — so it stops instead, which is the recoverable outcome.
+
+        ## Codes MSL does not understand {#unknown}
+
+        These mean MSL fell over in a way it did not anticipate. They carry no advice, deliberately: inventing
+        a next step for something MSL cannot explain would be worse than admitting it.
+
+        | Code | |
+        |---|---|
+        | `0x00000001` WENT_SOMEWHERE_IT_SHOULDNT | Memory that was not MSL's own |
+        | `0x00000002` BUS_TOOK_A_WRONG_TURN | Memory the processor could not give it |
+        | `0x00000003` INSTRUCTION_MAKES_NO_SENSE | Something that is not an instruction |
+        | `0x00000004` MATHS_HAPPENED | Arithmetic with no usable answer |
+        | `0x00000005` GAVE_UP_ON_ITSELF | A check inside MSL that it could not carry on past |
+        | `0x00000006` TRIPPED_OVER_A_TRAP | A trap left for a debugger |
+
+        An uncaught error shows as `UNCAUGHT_` and the error's own name instead of a number.
+
+        ## What MSL does not trade away {#report}
+
+        macOS writes its own crash report, with a backtrace, and that file is the thing that actually makes a
+        crash like this fixable. So MSL shows the screen and then lets the process die exactly as it would
+        have. Nothing is given up for the window.
+
+        You will find that report in **Console ▸ Crash Reports**, named after the part that stopped —
+        `mslhd`, `MSLApp`, `MSLFiles` or `msl`.
         """#)
 
     static let logsAndDoctor = HelpArticle(

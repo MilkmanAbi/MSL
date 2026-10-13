@@ -1802,6 +1802,23 @@ final class DaemonServer {
             // is true.
             MSLLog.line("mslap", "WARNING: \(MSLAPKeyStore.directory.path) is not protected - "
                         + "pinned keys are being ignored and signed policies will not verify")
+            // **And on a Mac that is actually enrolled, this is fatal.**
+            // Every signature check fails closed, so the administrator's
+            // rules have stopped applying while MSL carries on looking
+            // normal - which is the worst way for a managed Mac to fail.
+            // A warning in a log nobody reads is not enough for that.
+            //
+            // Only when a policy is installed where the person cannot have
+            // written it. An unmanaged Mac with odd permissions on a shared
+            // folder is untidy, not dangerous, and keeps the warning.
+            if FileManager.default.fileExists(atPath: MSLAPPolicyStore.systemURL.path) {
+                MSLLog.line("mslap", "FATAL: this Mac is enrolled and the key store is writable "
+                            + "by other accounts - signed policies cannot verify")
+                CrashScreen.stop(.keyStoreUnprotected,
+                                 detail: "\(MSLAPKeyStore.directory.path) is group- or "
+                                       + "world-writable while \(MSLAPPolicyStore.systemURL.path) "
+                                       + "is enrolled")
+            }
         }
     }
 

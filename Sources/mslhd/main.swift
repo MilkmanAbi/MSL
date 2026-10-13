@@ -102,6 +102,25 @@ func cleanupStaleWebDAVMounts() {
 // a crash like this actually gets diagnosed.
 CrashScreen.install(for: .daemon, viewer: "/Applications/MSL.app/Contents/MacOS/MSLApp")
 
+// **Two things checked before anything is promised.**
+//
+// Both are conditions MSL cannot work around, and both used to show up
+// much later as something else: a build without the virtualization
+// entitlement starts perfectly and then fails every instance start with a
+// VZ error four levels deep, and an unreadable signing key turns into
+// "identity does not verify" on instances that are perfectly fine. Saying
+// so here, once, with a code, is the difference between a diagnosis and a
+// hunt.
+if !CrashScreen.canCreateVirtualMachines() {
+    MSLLog.line("mslhd", "FATAL: this build has no virtualization entitlement")
+    CrashScreen.stop(.virtualizationRefused,
+                     detail: "mslhd is signed without com.apple.security.virtualization")
+}
+if let why = InstanceIdentityKey.health() {
+    MSLLog.line("mslhd", "FATAL: \(why)")
+    CrashScreen.stop(.signingKeyUnreadable, detail: why)
+}
+
 cleanupStaleWebDAVMounts()
 
 let server = DaemonServer(registry: registry, makeConfiguration: makeConfiguration(instance:distro:))
@@ -121,8 +140,15 @@ Thread {
     do {
         try server.run()
     } catch {
+        // **Everything reaches mslhd through this socket.** If it cannot be
+        // served there is no degraded mode to fall back to: the app, `msl`,
+        // and every Linux app asking for a file all talk to it here. This
+        // used to exit(1) with a line on stderr that nobody ever sees - a
+        // LaunchAgent's stderr goes to a log file - so MSL simply appeared
+        // not to work.
         FileHandle.standardError.write("mslhd: DaemonServer.run() failed: \(error)\n".data(using: .utf8)!)
-        exit(1)
+        MSLLog.line("mslhd", "FATAL: control socket could not be served: \(error)")
+        CrashScreen.stop(.serviceCannotListen, detail: "\(error)")
     }
 }.start()
 

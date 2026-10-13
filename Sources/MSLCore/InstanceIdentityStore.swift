@@ -70,6 +70,22 @@ public enum InstanceIdentityKey {
         return key
     }
 
+    /// Whether the signing key can be used at all.
+    ///
+    /// Separate from `load()` because the daemon wants to ask before it has
+    /// anything to sign: a key that is there and unreadable makes every
+    /// identity on this Mac unverifiable, and MSL must not paper over that
+    /// by generating a new one. A Mac that has never had a key is fine - it
+    /// gets one on first use.
+    /// Nil when the key is usable, or the reason it is not.
+    public static func health() -> String? {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        guard let text = try? String(contentsOf: fileURL, encoding: .utf8),
+              (try? MSLAPSigning.privateKey(fromBase64: text)) != nil
+        else { return "\(fileURL.path) exists but cannot be read as a signing key" }
+        return nil
+    }
+
     /// This Mac's id, which is its machine key's id. Used as an identity's
     /// `machine` field: the Mac an instance was born on.
     public static func machineID() -> String? {

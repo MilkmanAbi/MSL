@@ -153,4 +153,40 @@ final class GuestSessionWaitTests: XCTestCase {
                                                     settings: MSLExperimentalSettings())
         XCTAssertTrue(script.contains("systemd-run --user --scope"))
     }
+
+    // MARK: - Turning the menu bar off
+
+    /// **Off has to undo, not merely stop adding.** The bridge owns
+    /// `com.canonical.AppMenu.Registrar` for as long as it runs and outlives
+    /// the app that started it, so switching the menu bar off left the
+    /// registrar owned and a toolkit looking for one still found it. Qt
+    /// decides whether to keep its own menu bar on exactly that question.
+    func testTurningTheMenuBarOffStopsARunningBridge() {
+        var off = MSLExperimentalSettings()
+        off.globalMenuBar = false
+        let script = GuestIntegration.launchCommand("krita", instance: "x", settings: off)
+        XCTAssertTrue(script.contains("msl_menubridge.py"),
+                      "off must still know how to find a bridge, in order to stop it")
+        XCTAssertTrue(script.contains("kill \"$msl_menu_pid\""))
+        XCTAssertFalse(script.contains("appmenu-gtk-module"),
+                       "and must not load the module that hides an app's own menus")
+    }
+
+    /// On still starts one.
+    func testTurningItOnStartsTheBridge() {
+        var on = MSLExperimentalSettings()
+        on.globalMenuBar = true
+        let script = GuestIntegration.launchCommand("krita", instance: "x", settings: on)
+        XCTAssertTrue(script.contains("--ready-file"), "on must start the bridge")
+    }
+
+    /// The pid file outlives its process, so the number may belong to
+    /// something else by the time this runs.
+    func testItChecksWhatItIsAboutToKill() {
+        var off = MSLExperimentalSettings()
+        off.globalMenuBar = false
+        let script = GuestIntegration.launchCommand("krita", instance: "x", settings: off)
+        XCTAssertTrue(script.contains("/proc/$msl_menu_pid/cmdline"),
+                      "a stale pid must not take an unrelated process with it")
+    }
 }

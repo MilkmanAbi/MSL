@@ -87,6 +87,26 @@ public enum X11AppRouter {
         // Fast path: a host for this app is already up.
         if X11FDChannel.send(fd: fd, payload: prefix, toSocketPath: socketPath) { return true }
 
+        // **A menu connection joins a host; it never starts one.**
+        //
+        // The two ends name the app differently and there is no making them
+        // agree: an X11 client names itself from its own `argv[0]`, while
+        // the menu bridge names it from the command in its `.desktop` file.
+        // Chromium is the standing example - the window arrives as
+        // "chromium" and the menus as "chromium-browser", which left two
+        // hosts side by side in the shim directory, one owning every window
+        // and the other owning the menus and nothing to show them on. The
+        // menus were exported, delivered, and displayed by a process with no
+        // window.
+        //
+        // Spawning for menus is wrong in itself: a host with no windows
+        // cannot show a menu bar, so the right answer when no host is found
+        // is to let the app keep its own in-window menus.
+        if prefix == X11AppIdentity.menuMagic {
+            guard let related = liveHostSocket(relatedTo: name) else { return false }
+            return X11FDChannel.send(fd: fd, payload: prefix, toSocketPath: related)
+        }
+
         // Serialized so two connections arriving together for the same new
         // app don't each start a host and race for the socket.
         spawnLock.lock()
@@ -135,6 +155,29 @@ public enum X11AppRouter {
         nextHostSlot += 1
         slotsByApp[name] = assigned
         return assigned
+    }
+
+    /// A live host whose name is the same app under another spelling.
+    ///
+    /// Matched by one name being a prefix of the other, case-insensitively -
+    /// "Chromium" against "Chromium-browser" - and **only when exactly one
+    /// host matches**. Two candidates means the guess could go to the wrong
+    /// window, and a menu bar on the wrong app is worse than none.
+    static func liveHostSocket(relatedTo name: String) -> String? {
+        let directory = shimDirectory
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: directory)
+        else { return nil }
+        let wanted = name.lowercased()
+        let matches = entries
+            .filter { $0.hasSuffix(".sock") }
+            .map { String($0.dropLast(".sock".count)) }
+            .filter { candidate in
+                let other = candidate.lowercased()
+                guard other != wanted else { return false }   // already tried exactly
+                return other.hasPrefix(wanted) || wanted.hasPrefix(other)
+            }
+        guard matches.count == 1 else { return nil }
+        return socketPath(forApp: matches[0])
     }
 
     static func socketPath(forApp name: String) -> String {

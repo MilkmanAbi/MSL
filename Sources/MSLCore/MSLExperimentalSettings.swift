@@ -107,6 +107,16 @@ public struct MSLExperimentalSettings: Codable, Equatable, Sendable {
     /// every app has been tested at.
     public var nativeScaling = false
 
+    /// Linux windows rendered at the Mac's real pixel density instead of at
+    /// one X pixel per point - see `X11DisplayScale`.
+    ///
+    /// **On by default since it was tried on real apps.** Chromium, Krita
+    /// and the rest come back as sharp as the Mac's own, which is worth the
+    /// cost: an app draws four times the pixels and every one of them
+    /// crosses the X11 connection. Takes precedence over `nativeScaling`,
+    /// which is the same question answered at lower detail and stays off.
+    public var retinaRendering = true
+
     /// Linux OpenGL apps render on the Mac's GPU instead of the guest's
     /// CPU (see `GPUBridge` and `Guest/virtual-gpu/`).
     ///
@@ -168,6 +178,7 @@ public struct MSLExperimentalSettings: Codable, Equatable, Sendable {
             ?? defaults.signInInLinuxBrowser
         omitPeripheralsPrompt = try c.decodeIfPresent(Bool.self, forKey: .omitPeripheralsPrompt) ?? defaults.omitPeripheralsPrompt
         nativeScaling = try c.decodeIfPresent(Bool.self, forKey: .nativeScaling) ?? defaults.nativeScaling
+        retinaRendering = try c.decodeIfPresent(Bool.self, forKey: .retinaRendering) ?? defaults.retinaRendering
         gpuAcceleration = try c.decodeIfPresent(Bool.self, forKey: .gpuAcceleration) ?? defaults.gpuAcceleration
         reopenAppsAfterHibernate = try c.decodeIfPresent(Bool.self, forKey: .reopenAppsAfterHibernate)
             ?? defaults.reopenAppsAfterHibernate
@@ -261,6 +272,7 @@ public enum MSLExperimentalSettingsStore {
         ("sharing.clipboard", { $0.guestClipboard }),
         ("integrations.signInBrowser", { $0.signInInLinuxBrowser }),
         ("graphics.scaling", { $0.nativeScaling }),
+        ("graphics.scaling", { $0.retinaRendering }),
         ("graphics.gpu", { $0.gpuAcceleration }),
     ]
 
@@ -307,7 +319,9 @@ extension MSLExperimentalSettingsStore {
         case "integrations.globalMenuBar": result.globalMenuBar = current.globalMenuBar
         case "sharing.clipboard": result.guestClipboard = current.guestClipboard
         case "integrations.signInBrowser": result.signInInLinuxBrowser = current.signInInLinuxBrowser
-        case "graphics.scaling": result.nativeScaling = current.nativeScaling
+        case "graphics.scaling":
+            result.nativeScaling = current.nativeScaling
+            result.retinaRendering = current.retinaRendering
         case "graphics.gpu": result.gpuAcceleration = current.gpuAcceleration
         default: break
         }

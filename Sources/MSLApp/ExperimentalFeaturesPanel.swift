@@ -84,7 +84,7 @@ final class ExperimentalFeaturesModel: ObservableObject {
          settings.openLinksOnMac, settings.preferMSLFiles, settings.globalMenuBar,
          settings.guestClipboard, settings.signInInLinuxBrowser,
          settings.omitPeripheralsPrompt, settings.nativeScaling,
-         settings.gpuAcceleration].filter { $0 }.count
+         settings.retinaRendering, settings.gpuAcceleration].filter { $0 }.count
             + (settings.optionKeyMode == .leftAltRightAltGr ? 0 : 1)
     }
 
@@ -267,6 +267,13 @@ enum FlagCatalog {
             subsystem: .mslgd, applies: .newApps,
             keywords: ["scale", "hidpi", "retina", "size", "dpi", "resolution"],
             keyPath: \.nativeScaling),
+        FlagDescriptor(
+            id: "retinaRendering",
+            title: "Retina rendering",
+            detail: "Draw Linux windows at your Mac's real pixel density, so text and icons are as sharp as the Mac's own. Each X pixel becomes one physical pixel on a Retina screen, instead of being stretched across four. \u{26A0} An app draws four times the pixels and every one crosses the X11 connection, so expect it to cost speed - most on big windows and software rendering. Wins over Native scaling when both are on.",
+            subsystem: .mslgd, applies: .newApps, defaultOn: true,
+            keywords: ["scale", "hidpi", "retina", "sharp", "crisp", "dpi", "192", "density", "resolution", "blurry"],
+            keyPath: \.retinaRendering),
         FlagDescriptor(
             id: "linuxShortcuts",
             title: "Mac shortcuts in Linux apps",

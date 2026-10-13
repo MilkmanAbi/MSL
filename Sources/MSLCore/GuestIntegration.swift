@@ -470,7 +470,11 @@ public enum GuestIntegration {
             #"  export XDG_DATA_DIRS="$MSL_D/share:/var/lib/flatpak/exports/share:$HOME/.local/share/flatpak/exports/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}""#,
             #"  export XDG_CONFIG_DIRS="$MSL_D/config:${XDG_CONFIG_DIRS:-/etc/xdg}""#,
         ]
-        if let command { lines.append(menuBridgeLines(for: command)) }
+        if let command {
+            lines.append(menuBridgeLines(for: command))
+        } else {
+            lines.append(menuBridgeStopLines)
+        }
         lines.append("fi")
         return lines
     }
@@ -1560,6 +1564,27 @@ public enum GuestIntegration {
         guard !cleaned.isEmpty, !cleaned.contains("="), cleaned != "flatpak", cleaned != "snap" else { return "" }
         return cleaned.split(separator: "/").last.map(String.init) ?? ""
     }
+
+    /// Turning the feature off has to undo it, not just stop adding to it.
+    ///
+    /// The bridge owns `com.canonical.AppMenu.Registrar` for as long as it
+    /// runs, and it outlives the app that started it - so switching the
+    /// menu bar off left the registrar owned, and a toolkit that looks for
+    /// one still found it. Qt decides whether to keep its own menu bar on
+    /// exactly that question. Leaving it there is the feature half-on,
+    /// which is the state nothing should ever be left in.
+    static let menuBridgeStopLines = #"""
+      msl_menu_pidfile="${XDG_RUNTIME_DIR:-/tmp}/msl-menubridge.pid"
+      msl_menu_pid=$(cat "$msl_menu_pidfile" 2>/dev/null)
+      if [ -n "${msl_menu_pid:-}" ] && kill -0 "$msl_menu_pid" 2>/dev/null; then
+          # Checked before killing: a pid file outlives its process, and the
+          # number may belong to something else entirely by now.
+          case "$(tr '\0' ' ' < "/proc/$msl_menu_pid/cmdline" 2>/dev/null)" in
+              *msl_menubridge.py*) kill "$msl_menu_pid" 2>/dev/null || true ;;
+          esac
+      fi
+      rm -f "$msl_menu_pidfile" 2>/dev/null || true
+    """#
 
     static func menuBridgeLines(for command: String) -> String {
         let exporterName = programName(of: command)

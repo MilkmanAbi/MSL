@@ -12,7 +12,20 @@ import Foundation
 /// drawn would size its cells wrong and either overlap or gap between
 /// characters.
 enum X11FakeFont {
-    static let pointSize: CGFloat = 13
+    /// 13 at 96 dpi, and proportionally more when the screen is denser.
+    ///
+    /// **A core font is sized in pixels, so it cannot follow the screen on
+    /// its own.** These are the old X11 bitmap fonts - `fixed` and the rest
+    /// - and a client asks for a size in pixels and lays out its window from
+    /// the metrics it gets back. xterm builds its terminal grid this way.
+    ///
+    /// With Retina rendering a pixel is half a point, so a 13-pixel font
+    /// landed at half its former physical size: xterm came up legible but
+    /// minute. Scaling here keeps it the same size on the glass and draws it
+    /// through CoreText at twice the detail, which is the entire point of
+    /// the mode. Toolkits that use Xft instead already follow the density
+    /// MSL publishes and need none of this.
+    static let pointSize: CGFloat = 13 / X11DisplayScale.factor
     static let ctFont: CTFont = CTFontCreateWithName("Menlo" as CFString, pointSize, nil)
 
     static let ascent: CGFloat = CTFontGetAscent(ctFont)

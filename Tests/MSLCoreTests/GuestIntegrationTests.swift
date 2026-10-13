@@ -241,7 +241,11 @@ final class GuestIntegrationTests: XCTestCase {
         XCTAssertTrue(command.contains(#"export XDG_DATA_DIRS="$MSL_D/share:"#))
         XCTAssertTrue(command.contains(#"export XDG_CONFIG_DIRS="$MSL_D/config:"#))
         XCTAssertTrue(command.hasSuffix("\nkrita --nosplash"))
-        XCTAssertFalse(command.contains("msl_menubridge.py"))
+        // Off does not *start* a bridge. It still names one, because
+        // turning the feature off has to stop a bridge left running from
+        // when it was on - see `testTurningTheMenuBarOffStopsARunningBridge`.
+        XCTAssertFalse(command.contains("--ready-file"), "off must not start a bridge")
+        XCTAssertFalse(command.contains("appmenu-gtk-module"))
     }
 
     /// And with the menu bar on, which is now the default, the bridge is

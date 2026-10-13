@@ -1534,11 +1534,23 @@ public enum GuestIntegration {
           setsid sh -c 'exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-; exec python3 "$0" --ready-file "$1"' \
                  "$MSL_D/bin/msl_menubridge.py" "$msl_menu_ready" \
                  </dev/null >"$msl_menu_dir/msl-menubridge.log" 2>&1 &
-          echo $! > "$msl_menu_pidfile"
+          msl_menu_started=$!
+          echo "$msl_menu_started" > "$msl_menu_pidfile"
           msl_menu_tries=0
           while [ $msl_menu_tries -lt 30 ]; do
               [ -e "$msl_menu_ready" ] && break
               msl_menu_owned && break
+              # **Stop the moment the bridge is gone.** It exits at once when
+              # another bridge already owns the name - "leaving it to that
+              # one" - and then neither the ready file nor the ownership
+              # check will ever come true, so this waited the full three
+              # seconds for a process that was already dead. On Alpine that
+              # was every single app launch: 3.42s against Fedora's 0.19s,
+              # and 3.24s of it was here.
+              #
+              # Any early exit means the same thing - a crash, a missing
+              # dependency, the name taken - so there is nothing to wait for.
+              kill -0 "$msl_menu_started" 2>/dev/null || break
               sleep 0.1
               msl_menu_tries=$((msl_menu_tries + 1))
           done

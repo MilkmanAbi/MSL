@@ -50,4 +50,34 @@ final class GuestSessionWaitTests: XCTestCase {
     func testAGuestWithoutLogindExitsAtOnce() {
         XCTAssertTrue(script.contains("command -v loginctl >/dev/null 2>&1 || { echo \"MSL-SESSION-NONE\"; exit 0; }"))
     }
+
+    // MARK: - The menu bridge wait
+
+    private var launch: String {
+        GuestIntegration.launchCommand("true", instance: "x",
+                                       settings: MSLExperimentalSettings())
+    }
+
+    /// **The one that made app launches slow, and inconsistently so.**
+    /// The bridge exits immediately when another already owns the name -
+    /// "leaving it to that one" - and then neither the ready file nor the
+    /// ownership check ever comes true, so the wait ran its full 30 x 0.1s
+    /// for a process that was already dead. Measured on Alpine: 3.42s per
+    /// launch against Fedora's 0.19s, 3.24s of it here.
+    func testTheMenuBridgeWaitEndsWhenTheBridgeDoes() {
+        XCTAssertTrue(launch.contains("kill -0 \"$msl_menu_started\" 2>/dev/null || break"),
+                      "the wait must stop once the bridge process is gone")
+    }
+
+    /// It still waits for a bridge that is genuinely coming up.
+    func testTheMenuBridgeIsStillWaitedForWhileItLives() {
+        XCTAssertTrue(launch.contains("[ -e \"$msl_menu_ready\" ] && break"))
+        XCTAssertTrue(launch.contains("msl_menu_owned && break"))
+    }
+
+    /// The pid waited on must be the bridge just started, not whatever a
+    /// stale pid file happens to hold.
+    func testTheWaitWatchesTheBridgeItStarted() {
+        XCTAssertTrue(launch.contains("msl_menu_started=$!"))
+    }
 }

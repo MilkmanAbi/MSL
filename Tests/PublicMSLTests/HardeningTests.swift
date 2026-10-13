@@ -342,6 +342,18 @@ final class KeyMigrationTests: XCTestCase {
 /// stop it.
 final class UninstallClosesTunnelsTests: XCTestCase {
 
+    /// Locations pointing at an empty temporary directory, so nothing this
+    /// test does can touch the machine it runs on.
+    static func sandbox() -> Uninstaller.Locations {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("uninstall-tunnels-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return Uninstaller.Locations(home: root.appendingPathComponent("home"),
+                                     appSupport: root.appendingPathComponent("support"),
+                                     appBundles: [root.appendingPathComponent("MSL.app")],
+                                     sharedSupport: root.appendingPathComponent("shared"))
+    }
+
     func testTheUninstallPlanClosesTunnelsBeforeAnythingElse() {
         var order: [String] = []
         var actions = Uninstaller.Actions.none
@@ -351,7 +363,15 @@ final class UninstallClosesTunnelsTests: XCTestCase {
 
         let plan = Uninstaller.Plan(mode: .everything, removing: [], keeping: [],
                                     warnings: [], instances: [])
-        _ = Uninstaller.perform(plan, dryRun: false, actions: actions)
+        // **Sandboxed, and that is not a formality.** This runs a real
+        // uninstall with `dryRun: false`; without locations of its own it
+        // used the live ones and deleted `/Users/Shared/MSL` on the
+        // developer's Mac every `swift test` - taking the signing key with
+        // it, so every instance afterwards read as "identity does not
+        // verify". `perform` requires locations now, so this cannot recur
+        // silently, but the sandbox is what makes the test honest.
+        _ = Uninstaller.perform(plan, locations: Self.sandbox(), dryRun: false,
+                                actions: actions)
 
         XCTAssertEqual(order.first, "tunnels",
                        "a published instance must stop being on the internet before anything else")
@@ -363,7 +383,8 @@ final class UninstallClosesTunnelsTests: XCTestCase {
         actions.closePublicTunnels = { closed = true }
         let plan = Uninstaller.Plan(mode: .everything, removing: [], keeping: [],
                                     warnings: [], instances: [])
-        _ = Uninstaller.perform(plan, dryRun: true, actions: actions)
+        _ = Uninstaller.perform(plan, locations: Self.sandbox(), dryRun: true,
+                                actions: actions)
         XCTAssertFalse(closed, "a dry run must not change anything, including tunnels")
     }
 }

@@ -277,6 +277,34 @@ final class UninstallerTests: XCTestCase {
         XCTAssertTrue(names(plan.removing).contains("MSL"),
                       "everything means the whole shared directory")
     }
+
+    /// **`plan` saying "kept" is worth nothing unless `perform` agrees.**
+    /// Listing the identity keys as kept while `perform` removed the whole
+    /// directory left every kept instance unverifiable anyway - the fix to
+    /// `plan` alone did not work, and this is the half that does.
+    func testPerformKeepsTheIdentityKeysWhenKeepingLinux() throws {
+        let where_ = try makeShared(["machine-key", "identity-signers.json",
+                                     "admin.json", "vault-secret"])
+        _ = Uninstaller.perform(Uninstaller.plan(mode: .keepLinux, locations: where_),
+                                locations: where_, actions: .none)
+        let shared = where_.sharedSupport!
+        let fm = FileManager.default
+        XCTAssertTrue(fm.fileExists(atPath: shared.appendingPathComponent("machine-key").path),
+                      "removing the key that signs identities orphans every kept instance")
+        XCTAssertTrue(fm.fileExists(
+            atPath: shared.appendingPathComponent("identity-signers.json").path))
+        // The administrator's own material still goes.
+        XCTAssertFalse(fm.fileExists(atPath: shared.appendingPathComponent("admin.json").path))
+        XCTAssertFalse(fm.fileExists(atPath: shared.appendingPathComponent("vault-secret").path))
+    }
+
+    /// Removing everything still takes the whole directory.
+    func testPerformRemovesTheWholeStoreWhenRemovingEverything() throws {
+        let where_ = try makeShared(["machine-key", "admin.json"])
+        _ = Uninstaller.perform(Uninstaller.plan(mode: .everything, locations: where_),
+                                locations: where_, actions: .none)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: where_.sharedSupport!.path))
+    }
 }
 
 /// Records what `perform` asked the system to do, without doing any of it.

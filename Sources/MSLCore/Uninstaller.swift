@@ -522,7 +522,16 @@ public enum Uninstaller {
     ///     gone, so deleting it here is safe - but if an earlier step fails,
     ///     the user still has a working `msl` and a working app to retry with.
     @discardableResult
-    public static func perform(_ plan: Plan, locations: Locations = .live,
+    /// **`locations` is deliberately required.** It used to default to
+    /// `.live`, and a test that called `perform(plan, dryRun: false, actions:)`
+    /// without it ran the real uninstall against this Mac on every
+    /// `swift test` - deleting `/Users/Shared/MSL`, and with it the signing
+    /// key, the pinned signers and the vault secret. Every instance then
+    /// read as "identity does not verify", which looked like an identity bug
+    /// and was really the test suite. Making it explicit removes the whole
+    /// class of mistake: there is no way to call this and quietly mean the
+    /// machine it is running on.
+    public static func perform(_ plan: Plan, locations: Locations,
                                dryRun: Bool = false, actions: Actions = .live,
                                log: ((String) -> Void)? = nil) -> Report {
         var report = Report()
@@ -662,8 +671,22 @@ public enum Uninstaller {
         // left. Outside the home folder on purpose - it has to be outside
         // the guest's /mnt/mac view - which is exactly why a sweep of the
         // home folder never found it.
+        //
+        // **And it honours the mode, which `plan` alone could not.** Listing
+        // the identity keys as kept was worth nothing while this removed the
+        // directory they are in whatever the plan said - so "keep my Linux"
+        // still left every kept instance unverifiable. The two must agree,
+        // and this is the half that actually does it.
         if let shared = locations.sharedSupport {
-            remove(shared, "the admin portal's keys and any encrypted disks")
+            if plan.mode == .everything {
+                remove(shared, "the admin portal's keys and any encrypted disks")
+            } else {
+                for name in adminOnlyEntries(in: shared) {
+                    remove(shared.appendingPathComponent(name),
+                           name == "vaults" ? "the encrypted disks"
+                                            : "the admin portal's \(name)")
+                }
+            }
         }
 
         // The enrolled policy and lineage certificates. Root-owned, so this

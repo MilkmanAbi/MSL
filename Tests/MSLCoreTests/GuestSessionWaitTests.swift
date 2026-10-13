@@ -110,4 +110,39 @@ final class GuestSessionWaitTests: XCTestCase {
         XCTAssertTrue(launch.contains("return 0"),
                       "with no client to ask, trust the socket as before")
     }
+
+    // MARK: - Dollars through systemd
+
+    /// **systemd expands `$` in the command line itself.** `systemd-run`
+    /// makes a transient unit whose `ExecStart` gets systemd's own
+    /// substitution before the program runs, so `$HOME` was mangled by
+    /// systemd rather than expanded by the shell it was written for.
+    ///
+    /// It only showed on one distro, which is what made it confusing: the
+    /// systemd branch is taken only where `systemd-run --user` works. Alpine
+    /// has no systemd; on Fedora the user scope bus was unavailable; both
+    /// fell through to running the command directly and were fine. On Arch
+    /// it worked, and the dollar was eaten:
+    ///
+    ///     Invalid environment variable name evaluates to an empty string:
+    ///     HOME/.local/share/msl-integration/bin/msl-open dir
+    func testDollarsAreDoubledForSystemd() {
+        XCTAssertEqual(GuestIntegration.systemdLiteralForTesting("$HOME/bin/msl-open dir"),
+                       "$$HOME/bin/msl-open dir")
+        XCTAssertEqual(GuestIntegration.systemdLiteralForTesting("a $B c $D"), "a $$B c $$D")
+        XCTAssertEqual(GuestIntegration.systemdLiteralForTesting("no dollars here"),
+                       "no dollars here")
+    }
+
+    /// The command handed to `systemd-run` carries the doubled form; the
+    /// fallback that runs it directly must not, or the shell would see `$$`
+    /// and expand it to a process id.
+    func testOnlyTheSystemdBranchDoublesThem() {
+        let script = GuestIntegration.launchCommand("$HOME/bin/thing", instance: "x",
+                                                    settings: MSLExperimentalSettings())
+        XCTAssertTrue(script.contains("sh -c '$$HOME/bin/thing'"),
+                      "the systemd-run branch needs the literal form")
+        XCTAssertTrue(script.hasSuffix("$HOME/bin/thing"),
+                      "the direct fallback must keep the ordinary one")
+    }
 }

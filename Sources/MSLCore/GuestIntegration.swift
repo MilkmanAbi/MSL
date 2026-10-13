@@ -535,7 +535,7 @@ public enum GuestIntegration {
                 XDG_CONFIG_DIRS="${XDG_CONFIG_DIRS-}" \
                 GTK_MODULES="${GTK_MODULES-}" \
                 UBUNTU_MENUPROXY="${UBUNTU_MENUPROXY-}" \
-                sh -c \#(shellQuoted(command))
+                sh -c \#(shellQuoted(systemdLiteral(command)))
         fi
         """#)
         lines.append(command)
@@ -1100,6 +1100,38 @@ public enum GuestIntegration {
 
     static func shellQuoted(_ string: String) -> String {
         "'" + string.replacingOccurrences(of: "'", with: #"'\''"#) + "'"
+    }
+
+    /// A command going through `systemd-run`, with its dollars protected.
+    ///
+    /// **systemd expands `$` in the command line itself.** `systemd-run`
+    /// makes a transient unit, and that unit's `ExecStart` gets systemd's own
+    /// variable substitution before the program ever runs - so a command
+    /// containing `$HOME` is mangled by systemd rather than expanded by the
+    /// shell it was written for. systemd's documented escape for a literal
+    /// dollar is `$$`.
+    ///
+    /// This is why it broke on one distro and not the others, which is the
+    /// confusing part. The systemd branch is only taken when
+    /// `systemd-run --user` actually works: Alpine has no systemd at all, and
+    /// on Fedora here the user scope bus is unavailable, so both fall through
+    /// to running the command directly, where the shell expands `$HOME`
+    /// correctly. On Arch it works, the branch is taken, and systemd ate the
+    /// dollar:
+    ///
+    ///     Invalid environment variable name evaluates to an empty string:
+    ///     HOME/.local/share/msl-integration/bin/msl-open dir
+    ///     sh: -c: option requires an argument
+    ///
+    /// Doubling the dollars puts a literal `$` back in front of the inner
+    /// `sh -c`, which then expands it as intended - the same result the other
+    /// distros were already getting by never reaching systemd at all.
+    static func systemdLiteral(_ command: String) -> String {
+        command.replacingOccurrences(of: "$", with: "$$")
+    }
+
+    public static func systemdLiteralForTesting(_ command: String) -> String {
+        systemdLiteral(command)
     }
 
     // MARK: - Handlers

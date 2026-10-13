@@ -244,7 +244,7 @@ struct UninstallWindow: View {
         running = true
         steps = []
         Task.detached(priority: .userInitiated) {
-            let report = Uninstaller.perform(plan) { line in
+            let report = Uninstaller.perform(plan, locations: .live) { line in
                 Task { @MainActor in steps.append(line) }
             }
             // The privileged tail, only if there is one. macOS shows its

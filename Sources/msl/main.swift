@@ -4234,7 +4234,8 @@ case "uninstall":
     }
 
     print("")
-    let uninstallReport = Uninstaller.perform(uninstallPlan, dryRun: uninstallDryRun,
+    let uninstallReport = Uninstaller.perform(uninstallPlan, locations: .live,
+                                              dryRun: uninstallDryRun,
                                               log: { print("msl: \($0)") })
     // One command for everything the package installed as root, plus its
     // receipt - so the Mac really is back to never having had MSL.

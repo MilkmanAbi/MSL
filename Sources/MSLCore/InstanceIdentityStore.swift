@@ -32,10 +32,31 @@ public enum InstanceIdentityKey {
     /// *tamper-evident* and accident-proof, not unforgeable. The
     /// unforgeable tier is an admin-signed lineage certificate, signed off
     /// the machine - see `READMES/31-INSTANCE-IDENTITY.md` §1.
+    /// Why a key is only ever generated when there is **no** key file.
+    ///
+    /// This used to generate one whenever the read failed for any reason at
+    /// all. A key that cannot be read for a moment - a permission, an
+    /// interrupted write, a file owned by the other process - is not the
+    /// same as a Mac that has never had one, and treating them alike mints a
+    /// brand new signing authority and orphans every identity this Mac ever
+    /// issued. `msl doctor` then says, for every instance:
+    ///
+    ///     BAD  <name>'s identity does not verify
+    ///          issued by key <old>, which this Mac does not accept
+    ///
+    /// and there is no way back, because refusing to re-sign an identity is
+    /// the entire point of the scheme. Seen here twice, with two different
+    /// keys, after the file was replaced underneath.
+    ///
+    /// So a missing file means a first run and a new key. A file that is
+    /// there and unreadable is an error, said out loud.
     public static func load() throws -> Curve25519.Signing.PrivateKey {
         if let text = try? String(contentsOf: fileURL, encoding: .utf8),
            let key = try? MSLAPSigning.privateKey(fromBase64: text) {
             return key
+        }
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            throw IdentityKeyError.unreadable(fileURL.path)
         }
         let key = Curve25519.Signing.PrivateKey()
         try FileManager.default.createDirectory(
@@ -99,6 +120,21 @@ public enum InstanceIdentityKey {
 /// nothing else that matters - everything is inside the token, so the file
 /// is a container rather than a second source of truth that could disagree
 /// with it.
+/// Why this Mac's signing key could not be used. Deliberately not a silent
+/// fallback: everything downstream treats a new key as a new authority.
+public enum IdentityKeyError: Error, CustomStringConvertible {
+    case unreadable(String)
+
+    public var description: String {
+        switch self {
+        case .unreadable(let path):
+            return "MSL's signing key at \(path) is there but cannot be read. "
+                 + "It has not been replaced - doing that would make every instance "
+                 + "on this Mac unverifiable. Check the file's permissions."
+        }
+    }
+}
+
 public enum InstanceIdentityStore {
 
     public static func directory(appSupport: URL = MSLPaths.appSupport) -> URL {

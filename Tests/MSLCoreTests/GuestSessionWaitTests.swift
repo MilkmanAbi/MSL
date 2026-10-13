@@ -80,4 +80,34 @@ final class GuestSessionWaitTests: XCTestCase {
     func testTheWaitWatchesTheBridgeItStarted() {
         XCTAssertTrue(launch.contains("msl_menu_started=$!"))
     }
+
+    // MARK: - A session bus that has died
+
+    /// **A socket file outlives the daemon that made it.** `-S` says only
+    /// that the path is a socket, not that anything is listening - so an
+    /// instance whose bus died left the address file behind, and every
+    /// launch afterwards adopted an address answering "Connection refused".
+    /// Observed on Alpine: portals, snap and the menu bridge all failing
+    /// quietly, the bridge respawned and dying on every app launch.
+    func testADeadSessionBusAddressIsNotAdopted() {
+        XCTAssertTrue(launch.contains("msl_bus_answers \"$msl_bus\""),
+                      "the cached bus address must be proved live before use")
+        XCTAssertFalse(launch.contains("[ -S \"$msl_sock\" ] && export DBUS_SESSION_BUS_ADDRESS"),
+                       "a socket file existing is not a bus answering")
+    }
+
+    /// And the stale file is cleared, so the next step starts a fresh daemon
+    /// rather than meeting the same corpse again.
+    func testAStaleBusAddressIsThrownAway() {
+        XCTAssertTrue(launch.contains("rm -f \"$msl_bus_file\""))
+    }
+
+    /// The probe must not become a new dependency: a guest with neither
+    /// client behaves as it always did.
+    func testAGuestWithNoDBusClientStillWorks() {
+        XCTAssertTrue(launch.contains("command -v gdbus"))
+        XCTAssertTrue(launch.contains("command -v dbus-send"))
+        XCTAssertTrue(launch.contains("return 0"),
+                      "with no client to ask, trust the socket as before")
+    }
 }

@@ -751,12 +751,44 @@ public enum GuestIntegration {
     if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -S "/run/user/$(id -u 2>/dev/null || echo 0)/bus" ]; then
         export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
     fi
+    # Whether a session bus address actually answers. Uses whichever client
+    # the guest has; with neither, it falls back to trusting the socket file,
+    # which is what every guest did before this existed.
+    msl_bus_answers() {
+      if command -v gdbus >/dev/null 2>&1; then
+        DBUS_SESSION_BUS_ADDRESS="$1" gdbus call --session \
+          --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+          --method org.freedesktop.DBus.GetId >/dev/null 2>&1
+      elif command -v dbus-send >/dev/null 2>&1; then
+        DBUS_SESSION_BUS_ADDRESS="$1" dbus-send --session \
+          --dest=org.freedesktop.DBus --print-reply \
+          /org/freedesktop/DBus org.freedesktop.DBus.GetId >/dev/null 2>&1
+      else
+        return 0
+      fi
+    }
     msl_bus_file="${XDG_RUNTIME_DIR:-/tmp}/msl-dbus-$(id -u 2>/dev/null || echo 0)"
     if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && [ -s "$msl_bus_file" ]; then
       msl_bus=$(cat "$msl_bus_file" 2>/dev/null)
       msl_sock=${msl_bus#unix:path=}
       msl_sock=${msl_sock%%,*}
-      [ -S "$msl_sock" ] && export DBUS_SESSION_BUS_ADDRESS="$msl_bus"
+      # **A socket file outlives the daemon that made it.** `-S` says only
+      # that the path is a socket, not that anything is listening - so an
+      # instance that was suspended, or whose bus died, left this file
+      # behind and every launch afterwards adopted an address that answers
+      # "Connection refused". Everything built on the session bus then
+      # quietly failed: portals, snap, and the menu bridge, which was
+      # respawned and died on every single app launch. Same trap as the X11
+      # display socket, which can exist, look listening, and refuse
+      # everything.
+      #
+      # So the bus is asked whether it is really there. If it is not, the
+      # stale address is thrown away and a fresh daemon is started below.
+      if [ -S "$msl_sock" ] && msl_bus_answers "$msl_bus"; then
+        export DBUS_SESSION_BUS_ADDRESS="$msl_bus"
+      else
+        rm -f "$msl_bus_file" 2>/dev/null
+      fi
     fi
     if [ -z "${DBUS_SESSION_BUS_ADDRESS-}" ] && command -v dbus-daemon >/dev/null 2>&1; then
       msl_bus=$(dbus-daemon --session --fork --print-address 2>/dev/null)

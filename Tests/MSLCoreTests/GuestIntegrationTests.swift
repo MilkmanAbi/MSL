@@ -653,7 +653,12 @@ extension GuestIntegrationTests {
         let command = GuestIntegration.userSessionCommand(user: "abinaash")
         XCTAssertTrue(command.contains("loginctl enable-linger \"$msl_user\""))
         XCTAssertTrue(command.contains("msl_user='abinaash'"))
-        XCTAssertTrue(command.contains("/run/user/$msl_uid/bus"))
+        // It waits for the runtime directory, not for a session bus socket
+        // inside it: Fedora makes the directory and never that socket, so
+        // waiting for one cost five seconds per guest command and bought
+        // nothing. See `GuestSessionWaitTests`.
+        XCTAssertTrue(command.contains("/run/user/$msl_uid"))
+        XCTAssertFalse(command.contains("-S \"/run/user/$msl_uid/bus\""))
         XCTAssertTrue(command.contains("MSL-SESSION-NONE"), "a guest without logind must not fail")
     }
 

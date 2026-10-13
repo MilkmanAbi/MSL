@@ -1256,6 +1256,15 @@ final class DaemonServer {
                 } catch {
                     respond(clientFD, ok: false, "\(error)")
                 }
+            case .localNetworkProbe(let host):
+                // **The point is the attempt, not the answer.** macOS grants
+                // Local Network per binary, and it is this process that
+                // connects to an instance - so trying from here is what
+                // raises the prompt against the right one. Asking from
+                // MSL.app prompted for MSL.app, the person allowed it, and
+                // the daemon was still refused.
+                let reachable = PortForwarder.canReach(host: host, port: 22, timeout: 3)
+                respond(clientFD, ok: true, reachable ? "reachable" : "unreachable")
             case .gitQuery(let instance, let guestPath, let operation, let argument):
                 // Same rule as the other file operations: an already-running,
                 // known instance only. A file browser must never boot a VM to

@@ -424,6 +424,7 @@ private struct SSHCard: View {
     @EnvironmentObject private var model: AppModel
     let instance: Instance
     @State private var copied: String?
+    @State private var askingLocalNetwork = false
 
     var body: some View {
         Card(title: "Connect over SSH", footnote: footnote) {
@@ -511,6 +512,14 @@ private struct SSHCard: View {
                 .buttonStyle(.link).font(.caption)
                 Button("Set up again") { model.setUpSSH(instance) }
                     .buttonStyle(.link).font(.caption)
+                // Only when the thing it fixes is what is wrong.
+                if !result.reachable {
+                    Button(askingLocalNetwork ? "Asking…" : "Allow Local Network…") {
+                        askLocalNetwork(host: result.host)
+                    }
+                    .buttonStyle(.link).font(.caption)
+                    .disabled(askingLocalNetwork)
+                }
                 Spacer()
             }
             .padding(.top, 2)
@@ -564,11 +573,41 @@ private struct SSHCard: View {
         // grant survives a rebuild - but it still has to be given once, and
         // this is where somebody finds out that is what is missing.
         return "Set up, but \(result.host) isn't answering on port 22. Most often that is "
-             + "MSL not having Local Network permission - macOS asks once, and `ssh` from "
-             + "Terminal keeps working either way, which is what makes it confusing. "
-             + "Permissions & Startup has it. Failing that, the Sandbox tab's Network gate "
-             + "detaches the network card while leaving vsock alone, which is why "
-             + "`msl \(instance.name)` still works."
+             + "macOS not letting MSL's background service onto the local network - and it "
+             + "is asked for separately from MSL itself, which is why this can appear even "
+             + "when you have allowed everything. `ssh` from Terminal keeps working either "
+             + "way, because Terminal has its own permission, which is what makes it "
+             + "confusing. Use Allow Local Network below. Failing that, the Sandbox tab's "
+             + "Network gate detaches the network card while leaving vsock alone, which is "
+             + "why `msl \(instance.name)` still works."
+    }
+
+    /// Asks macOS for Local Network permission, for the process that needs
+    /// it, and then shows the person where to grant it.
+    ///
+    /// **It has to be the daemon that asks.** macOS grants this per binary,
+    /// and the process that connects to an instance is `mslhd`, not MSL.app -
+    /// so a probe made from here raised the prompt for the app, the person
+    /// allowed it, and the daemon was refused exactly as before. That is why
+    /// this kept coming back for people who had already allowed everything.
+    ///
+    /// There is no API to grant it, so this does the two things that can be
+    /// done: make the attempt that raises the prompt, and open the pane with
+    /// the switch on it. If the prompt was answered long ago - or dismissed -
+    /// it will not come again, and the pane is the only way back.
+    private func askLocalNetwork(host: String) {
+        askingLocalNetwork = true
+        Task {
+            let reached = await Task.detached(priority: .userInitiated) {
+                DaemonClient.probeLocalNetwork(host: host)
+            }.value
+            askingLocalNetwork = false
+            guard !reached else {
+                model.setUpSSH(instance)   // it works now; refresh the card
+                return
+            }
+            NSWorkspace.shared.open(MacPermissions.Pane.localNetwork.url)
+        }
     }
 
     private func copy(_ text: String, as token: String) {

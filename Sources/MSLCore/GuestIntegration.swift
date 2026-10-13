@@ -600,12 +600,27 @@ public enum GuestIntegration {
         command -v loginctl >/dev/null 2>&1 || { echo "MSL-SESSION-NONE"; exit 0; }
         id -u "$msl_user" >/dev/null 2>&1 || { echo "MSL-SESSION-NONE"; exit 0; }
         msl_uid=$(id -u "$msl_user")
-        [ -d "/run/user/$msl_uid" ] || loginctl enable-linger "$msl_user" >/dev/null 2>&1 || true
-        msl_i=0
-        while [ $msl_i -lt 25 ] && [ ! -S "/run/user/$msl_uid/bus" ]; do
-            sleep 0.2
-            msl_i=$((msl_i + 1))
-        done
+        # **Wait for the thing success is judged on.** This used to wait for
+        # the session bus socket at /run/user/$uid/bus while deciding the
+        # outcome from the directory, and the two do not agree: Fedora makes
+        # the directory and never that socket - it has dbus-1/ and MSL's own
+        # msl-dbus-1001 instead - so every single guest command sat here for
+        # the full five seconds and then succeeded anyway. Measured on this
+        # Mac: 5.25s per command on Fedora against 0.12s on Alpine, and every
+        # app launch from the Applications tab paid it.
+        #
+        # Nothing needed that socket in any case; MSL supplies the session bus
+        # itself. So the wait exists only for the case it was written for - a
+        # runtime directory that is not there yet on a first start - and ends
+        # the moment it appears.
+        if [ ! -d "/run/user/$msl_uid" ]; then
+            loginctl enable-linger "$msl_user" >/dev/null 2>&1 || true
+            msl_i=0
+            while [ $msl_i -lt 25 ] && [ ! -d "/run/user/$msl_uid" ]; do
+                sleep 0.2
+                msl_i=$((msl_i + 1))
+            done
+        fi
         if [ -d "/run/user/$msl_uid" ]; then echo "MSL-SESSION-OK"; else echo "MSL-SESSION-NONE"; fi
         """
     }

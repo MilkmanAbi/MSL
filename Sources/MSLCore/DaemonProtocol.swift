@@ -270,6 +270,17 @@ public enum DaemonProtocol {
         case gitQuery(instance: String, guestPath: String, operation: GitOperation,
                       argument: String = "")
 
+        /// Tries to reach a guest on the local network **from the daemon**,
+        /// so macOS raises its Local Network prompt for the process that
+        /// actually needs the permission.
+        ///
+        /// macOS grants Local Network per binary, and it is `mslhd` that
+        /// connects to an instance's address - not MSL.app. Asking from the
+        /// app prompted for the app, the person allowed it, and the daemon
+        /// was still refused, which is why this came back for everyone who
+        /// had already allowed everything.
+        case localNetworkProbe(host: String)
+
         /// The Mac's USB devices, as the daemon sees them. No instance and
         /// no entitlement - a plain IOKit registry read.
         case usbList
@@ -421,6 +432,8 @@ public enum DaemonProtocol {
                  // File operations answer only for an already-running
                  // instance and never start one - see their handlers.
                  .fileList, .fileChmod, .gitQuery,
+                 // A permission probe against an address; no instance at all.
+                 .localNetworkProbe,
                  // A file pick is a conversation about an instance that is
                  // already running - the app doing the asking is inside it.
                  .filePickDetails, .filePickResult,
@@ -463,6 +476,9 @@ public enum DaemonProtocol {
                  // MSL Files fires these while browsing; logging every
                  // directory listing would bury every real event.
                  .fileList, .fileChmod,
+                 // The permissions panel checking whether macOS lets the
+                 // daemon onto the local network. Not an action on anything.
+                 .localNetworkProbe,
                  // Asked once as the picker opens. What the person chose is
                  // logged by `HostOpenService`, which is the part worth
                  // seeing - this is just the handshake.
@@ -567,6 +583,8 @@ public enum DaemonProtocol {
                  .protectInstance(let instance, _),
                  .vaultKey(let instance, _, _):
                 return instance
+            case .localNetworkProbe:
+                return nil
             case .fileList(let instance, _), .fileChmod(let instance, _, _),
                  .gitQuery(let instance, _, _, _),
                  .usbAttach(let instance, _, _), .usbRelay(let instance, _),
@@ -691,6 +709,8 @@ public enum DaemonProtocol {
             case .maintenance(let instance, let command): line = "MAINTENANCE \(instance) \(command.rawValue)"
             case .fileList(let instance, let guestPath):
                 line = "FILE_LIST \(instance) \(Data(guestPath.utf8).base64EncodedString())"
+            case .localNetworkProbe(let host):
+                line = "LOCAL_NETWORK_PROBE \(Data(host.utf8).base64EncodedString())"
             case .fileChmod(let instance, let guestPath, let mode):
                 line = "FILE_CHMOD \(instance) \(Data(guestPath.utf8).base64EncodedString()) \(mode)"
             case .gitQuery(let instance, let guestPath, let operation, let argument):
@@ -825,6 +845,9 @@ public enum DaemonProtocol {
             case "FILE_LIST":
                 guard rest.count == 2, let path = DaemonProtocol.decodeBase64Path(rest[1]) else { return nil }
                 return .fileList(instance: rest[0], guestPath: path)
+            case "LOCAL_NETWORK_PROBE":
+                guard rest.count == 1, let host = DaemonProtocol.decodeBase64Path(rest[0]) else { return nil }
+                return .localNetworkProbe(host: host)
             case "GIT_QUERY":
                 guard rest.count == 3 || rest.count == 4,
                       let path = DaemonProtocol.decodeBase64Path(rest[1]),
@@ -986,6 +1009,7 @@ public enum DaemonProtocol {
                 .gitQuery(instance: "i", guestPath: "/", operation: .inspect),
                 .gitQuery(instance: "i", guestPath: "/", operation: .initialise),
                 .gitQuery(instance: "i", guestPath: "/", operation: .badges),
+                .localNetworkProbe(host: "192.168.64.2"),
                 .gitQuery(instance: "i", guestPath: "/", operation: .setOrigin,
                           argument: "https://example.com/a.git"),
                 .fileChmod(instance: "i", guestPath: "/", mode: 0),

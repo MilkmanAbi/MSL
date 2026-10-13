@@ -162,7 +162,14 @@ public enum MSLAPEnforcement {
         // Listed rather than defaulted, so adding a control request is a
         // decision about whether MSLAP governs it. A `default` here would
         // silently leave every future request unrestricted.
-        case .session, .attachSession, .sessionEnded,
+        case
+             // Asks macOS whether it will let the daemon onto the local
+             // network. It reaches nothing of the person's and names no
+             // instance - it exists so the prompt is raised against the
+             // process that needs the permission - so there is nothing here
+             // for an administrator to govern.
+             .localNetworkProbe,
+             .session, .attachSession, .sessionEnded,
              .snapshotSave, .snapshotRestore, .snapshotList,
              .status, .instanceList, .instanceDetails,
              .startGui, .startNativeGui,

@@ -116,6 +116,19 @@ public enum DaemonClient {
         return .success(output)
     }
 
+    /// Has the **daemon** try to reach a guest on the local network.
+    ///
+    /// This exists for the asking, not the answer. macOS grants Local Network
+    /// permission per binary, and the process that connects to an instance is
+    /// `mslhd`, not MSL.app - so a probe made from the app raised the prompt
+    /// for the app, the person allowed it, and the daemon was still refused.
+    /// That is why this came back for people who had already allowed
+    /// everything.
+    public static func probeLocalNetwork(host: String, timeout: TimeInterval = 10) -> Bool {
+        send(.localNetworkProbe(host: host), timeout: timeout)?
+            .contains("reachable") == true
+    }
+
     /// Whether the daemon is up *right now*. A live `connect()`, not a
     /// check for the socket file: `mslhd` unlinks and re-binds its socket
     /// on start but a killed daemon leaves the file behind, so the file

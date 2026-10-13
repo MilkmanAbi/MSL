@@ -170,8 +170,11 @@ final class PermissionsModel: ObservableObject {
                 networkVolumes = .unavailable("Start an instance to ask")
             }
             if let host = sshHosts.first {
+                // Through the daemon: it is `mslhd` that needs the
+                // permission, and asking from here would answer for the
+                // wrong process. See `DaemonClient.probeLocalNetwork`.
                 let reached = await Task.detached(priority: .utility) {
-                    SSHSetup.canReach(host: host, timeout: 2)
+                    DaemonClient.probeLocalNetwork(host: host)
                 }.value
                 localNetwork = reached ? .granted
                     : .unavailable("Can't reach \(host) - either MSL hasn't been allowed, or that instance isn't running")
@@ -202,8 +205,10 @@ final class PermissionsModel: ObservableObject {
                 networkVolumes = .unavailable("Start an instance to ask")
             }
             if let host = sshHosts.first {
+                // The prompt has to be raised against the daemon, which is
+                // the process macOS will be refusing.
                 let reached = await Task.detached(priority: .userInitiated) {
-                    SSHSetup.canReach(host: host)
+                    DaemonClient.probeLocalNetwork(host: host)
                 }.value
                 localNetwork = reached ? .granted
                     : .unavailable("Can't reach \(host) - either MSL hasn't been allowed, or that instance isn't running")

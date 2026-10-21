@@ -283,7 +283,10 @@ public enum GuestIntegration {
     /// Applications tab or typed at a prompt. It is written through a quoted
     /// heredoc, so nothing in it expands while being written.
     public static func sessionEnvFileCommand(settings: MSLExperimentalSettings) -> String {
-        let body = (sessionCoreLines(settings: settings) + kitEnvLines(menuBridgeFor: nil)
+        // A shell leaves a running bridge alone; it only tears one down
+        // when the menu bar has actually been switched off.
+        let body = (sessionCoreLines(settings: settings)
+                    + kitEnvLines(menuBridge: settings.globalMenuBar ? .leaveAlone : .stop)
                     + terminalShellLines())
             .joined(separator: "\n")
         return #"""
@@ -458,7 +461,28 @@ public enum GuestIntegration {
     /// `menuBridgeFor` is the command whose menus should be exported, or nil
     /// for a shell - a shell has no menus of its own, and the bridge is
     /// started per application.
-    static func kitEnvLines(menuBridgeFor command: String?) -> [String] {
+    /// What a script should do about the menu bridge.
+    ///
+    /// Three cases, not two. They used to be expressed as one optional
+    /// command, where `nil` meant "stop a bridge that is running" - and the
+    /// session-env file passed `nil` because it is not an app launch and has
+    /// nothing to start a bridge *for*. That file is sourced by
+    /// `/etc/profile.d` on **every login shell**, so opening a terminal in
+    /// the guest killed the bridge out from under every GUI app that was
+    /// already running: the menus simply vanished from the Mac's bar, and
+    /// came back only when another app was launched (2026-10-21, and the
+    /// reason the menus looked intermittent all along).
+    enum MenuBridge {
+        /// An app launch with the menu bar on: start one if none is running.
+        case start(String)
+        /// The menu bar is off: stop one left running from when it was on.
+        case stop
+        /// Neither - this script is not an app launch. A shell has no
+        /// business starting a bridge, and still less ending one.
+        case leaveAlone
+    }
+
+    static func kitEnvLines(menuBridge: MenuBridge) -> [String] {
         var lines: [String] = [
             #"MSL_D="$HOME/\#(directory)""#,
             #"if [ -f "$MSL_D/.stamp" ]; then"#,
@@ -470,10 +494,10 @@ public enum GuestIntegration {
             #"  export XDG_DATA_DIRS="$MSL_D/share:/var/lib/flatpak/exports/share:$HOME/.local/share/flatpak/exports/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}""#,
             #"  export XDG_CONFIG_DIRS="$MSL_D/config:${XDG_CONFIG_DIRS:-/etc/xdg}""#,
         ]
-        if let command {
-            lines.append(menuBridgeLines(for: command))
-        } else {
-            lines.append(menuBridgeStopLines)
+        switch menuBridge {
+        case .start(let command): lines.append(menuBridgeLines(for: command))
+        case .stop: lines.append(menuBridgeStopLines)
+        case .leaveAlone: break
         }
         lines.append("fi")
         return lines
@@ -543,7 +567,7 @@ public enum GuestIntegration {
             // steered onto the GPU by an environment inherited from elsewhere.
             lines.append("export GALLIUM_DRIVER=llvmpipe")
         }
-        lines += kitEnvLines(menuBridgeFor: settings.globalMenuBar ? command : nil)
+        lines += kitEnvLines(menuBridge: settings.globalMenuBar ? .start(command) : .stop)
         lines.append(qtPortalThemeQuirkLines(for: command))
         // Snap's confinement check looks at the launching process's cgroup:
         // started straight from MSL's service it sees

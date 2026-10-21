@@ -231,6 +231,31 @@ final class GuestIntegrationTests: XCTestCase {
         XCTAssertNotEqual(String(hash, radix: 16), GuestIntegration.stamp)
     }
 
+    // MARK: - A shell must not kill the menu bridge
+
+    /// `session-env.sh` is sourced by /etc/profile.d on every login shell.
+    /// With the menu bar ON it must not contain the teardown, or opening a
+    /// terminal takes the menus away from every app already running.
+    func testSessionEnvDoesNotStopTheBridgeWhenMenusAreOn() {
+        var on = MSLExperimentalSettings()
+        on.globalMenuBar = true
+        let script = GuestIntegration.sessionEnvFileCommand(settings: on)
+        XCTAssertFalse(script.contains("msl_menubridge.py*) kill"),
+                       "a login shell must never kill a running bridge")
+        XCTAssertFalse(script.contains("--ready-file"),
+                       "and a shell has no business starting one either")
+    }
+
+    /// Switching the menu bar off still has to reach shells, so a bridge
+    /// left running from when it was on is torn down.
+    func testSessionEnvStopsTheBridgeWhenMenusAreOff() {
+        var off = MSLExperimentalSettings()
+        off.globalMenuBar = false
+        let script = GuestIntegration.sessionEnvFileCommand(settings: off)
+        XCTAssertTrue(script.contains("msl-menubridge.pid"))
+        XCTAssertFalse(script.contains("--ready-file"))
+    }
+
     // MARK: - Qt's portal theme, for apps it breaks
 
     /// The launcher consults the list the bridge writes, and the name it

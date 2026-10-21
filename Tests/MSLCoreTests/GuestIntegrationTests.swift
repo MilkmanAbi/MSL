@@ -269,6 +269,16 @@ final class GuestIntegrationTests: XCTestCase {
         XCTAssertTrue(command.contains("unset QT_QPA_PLATFORMTHEME"))
     }
 
+    /// `/proc/<pid>/comm` is capped at 15 characters, so the name looked up
+    /// has to be capped the same way or a long-named app is recorded on
+    /// every launch and matched on none.
+    func testWedgeNameIsCappedLikeProcComm() {
+        let command = GuestIntegration.launchCommand("qtcreator-with-a-long-name",
+                                                     instance: "test-no-overrides",
+                                                     settings: MSLExperimentalSettings())
+        XCTAssertTrue(command.contains("grep -qx -- 'qtcreator-with-'"), "must compare the first 15 characters")
+    }
+
     /// `/proc/<pid>/comm` is what the bridge records, so an interpreted app
     /// has to be looked up under the interpreter: that is the process whose
     /// D-Bus connection is the one that wedged.

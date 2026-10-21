@@ -528,9 +528,14 @@ public enum GuestIntegration {
     /// so the Qt half of the file picker keeps working everywhere it works.
     static func qtPortalThemeQuirkLines(for command: String) -> String {
         guard let binary = commandBinaryName(command) else { return "" }
+        // `/proc/<pid>/comm`, which is what the bridge records, is capped at
+        // 15 characters. Comparing a longer basename against it would never
+        // match, so such an app would be recorded on every launch and never
+        // recognised on any of them.
+        let recorded = String(binary.prefix(15))
         return #"""
         msl_wedges="$HOME/\#(directory)/qt-portal-theme-wedges"
-        if [ -r "$msl_wedges" ] && grep -qx -- \#(shellQuoted(binary)) "$msl_wedges" 2>/dev/null; then
+        if [ -r "$msl_wedges" ] && grep -qx -- \#(shellQuoted(recorded)) "$msl_wedges" 2>/dev/null; then
             unset QT_QPA_PLATFORMTHEME
         fi
         """#

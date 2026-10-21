@@ -139,8 +139,10 @@ enum X11ConnectionSetup {
         w.writeU32(0) // current-input-masks
         w.writeU16(UInt16(clamping: config.screenWidthPixels))
         w.writeU16(UInt16(clamping: config.screenHeightPixels))
-        w.writeU16(UInt16(clamping: config.screenWidthPixels * 254 / 960)) // width-in-millimeters, ~96dpi
-        w.writeU16(UInt16(clamping: config.screenHeightPixels * 254 / 960))
+        // Through `X11DisplayScale` so this and RandR's two answers cannot
+        // drift apart - see `millimetres(forPixels:)`.
+        w.writeU16(UInt16(clamping: Int(X11DisplayScale.millimetres(forPixels: config.screenWidthPixels))))
+        w.writeU16(UInt16(clamping: Int(X11DisplayScale.millimetres(forPixels: config.screenHeightPixels))))
         w.writeU16(1) // min-installed-maps
         w.writeU16(1) // max-installed-maps
         w.writeU32(config.visualID) // root-visual

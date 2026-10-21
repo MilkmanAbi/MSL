@@ -5578,6 +5578,23 @@ final class X11Connection: NSObject {
             if property == atom("_NET_SUPPORTED") {
                 return words(ewmhSupportedAtoms.map { atom($0) }, type: atomType)
             }
+            // **The density, for the toolkits that do not ask the screen.**
+            //
+            // Xft, Qt, Tk and xterm read `Xft.dpi` out of the root window's
+            // X resources and never look at the screen's physical size; GTK
+            // and others work it out from the millimetres. Publishing only
+            // one of the two is how half an app's text ends up scaled and
+            // the other half not.
+            //
+            // Only in retina mode, and that restraint is deliberate: in the
+            // other modes the density is the 96 everything already assumes,
+            // and saying so out loud would be a new answer where today
+            // there is none - a behaviour change for every existing app, to
+            // tell it something it had already concluded.
+            if property == atom("RESOURCE_MANAGER"), X11DisplayScale.mode == .retina {
+                let resources = "Xft.dpi:\t\(Int(X11DisplayScale.dpi))\n"
+                return (31, 8, Array(resources.utf8))   // 31 = STRING
+            }
             return nil
         }
         if wid == wmCheckWindowID {
@@ -7150,8 +7167,8 @@ final class X11Connection: NSObject {
         let extra = X11ByteWriter(littleEndian: littleEndian)
         extra.writeU16(UInt16(clamping: screenW))
         extra.writeU16(UInt16(clamping: screenH))
-        extra.writeU16(UInt16(clamping: Int(Double(screenW) * 0.264583)))
-        extra.writeU16(UInt16(clamping: Int(Double(screenH) * 0.264583)))
+        extra.writeU16(UInt16(clamping: Int(X11DisplayScale.millimetres(forPixels: screenW))))
+        extra.writeU16(UInt16(clamping: Int(X11DisplayScale.millimetres(forPixels: screenH))))
         extra.writeU16(1)  // rates for size 0
         extra.writeU16(60)
         sendReply(fixed24: w, extra: extra.bytes, detail: 1) // detail = set of rotations: Rotate_0
@@ -7318,8 +7335,8 @@ final class X11Connection: NSObject {
         // got a draw call sent for it (a client-side layout decision, not
         // an mslgd rendering bug) regardless of whether an explicit
         // window size hint was given.
-        w.writeU32(UInt32(Double(screenW) * 0.264583)) // mmWidth
-        w.writeU32(UInt32(Double(screenH) * 0.264583)) // mmHeight
+        w.writeU32(UInt32(X11DisplayScale.millimetres(forPixels: screenW))) // mmWidth
+        w.writeU32(UInt32(X11DisplayScale.millimetres(forPixels: screenH))) // mmHeight
         w.writeU8(RandROutputConnection.connected)
         w.writeU8(0) // subpixelOrder: SubPixelUnknown
         w.writeU16(1) // nCrtcs (possible crtcs this output could use)

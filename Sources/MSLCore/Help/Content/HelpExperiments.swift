@@ -7,7 +7,7 @@ extension HelpChapter {
         id: "experiments", title: "Experimental Features", symbol: "flask", tint: .purple,
         blurb: "The switches that make Linux apps behave like Mac apps — what each one does, and what it can still get wrong.",
         articles: [.experiments, .macKeyboard, .sharedClipboard, .mslFilesIntegration,
-                   .globalMenuBar, .signInPages, .gpuAcceleration, .nativeScaling, .cameraAndMic])
+                   .globalMenuBar, .signInPages, .gpuAcceleration, .nativeScaling, .retinaRendering, .cameraAndMic])
 }
 
 extension HelpArticle {
@@ -330,6 +330,56 @@ extension HelpArticle {
         GPU.
 
         Takes effect after the instance restarts.
+        """#)
+
+    static let retinaRendering = HelpArticle(
+        id: "retina-rendering", title: "Retina rendering", symbol: "sparkle.magnifyingglass",
+        summary: "Drawing Linux windows at your Mac's real pixel density, so they look as sharp as Mac apps.",
+        keywords: ["retina", "hidpi", "sharp", "crisp", "blurry", "fuzzy", "dpi", "192", "density",
+                   "pixel", "resolution", "text quality"],
+        related: ["native-scaling", "experiments", "linux-windows"],
+        body: #"""
+        Off by default. Linux windows are normally drawn one X pixel per point — and on a Retina screen a point
+        is **four physical pixels**, so every X pixel is stretched across all four. That is why Linux text can
+        look softer than the Mac's own. With this on, each X pixel is one physical pixel instead, and Linux
+        apps draw at the detail your screen actually has.
+
+        ## What changes {#what}
+
+        | | Off | On |
+        |---|---|---|
+        | Each X pixel covers | 1 point — 4 physical pixels | 1 physical pixel |
+        | MSL tells Linux the screen is | 96 dpi | 192 dpi |
+        | Pixels an app draws | — | four times as many |
+
+        Windows stay the **same physical size**. The screen MSL reports grows by exactly as much as each pixel
+        shrinks, so an app lays out for the same amount of glass — it simply has four times the pixels to say
+        it with.
+
+        ## What it costs {#cost}
+
+        Four times the pixels, and every one of them crosses the connection between Linux and your Mac. Expect
+        it to cost speed, most obviously on large windows and on anything drawing in software rather than on
+        the GPU. That is the whole reason it is off by default rather than simply on.
+
+        > [!tip]
+        > If MSL's apps feel slower with this on, try [GPU acceleration](help:gpu-acceleration) alongside it —
+        > the extra pixels are exactly the kind of work a GPU is for.
+
+        ## With Native scaling {#both}
+
+        They answer the same question, so **Retina rendering wins** when both are on.
+        [Native scaling](help:native-scaling) makes Linux windows smaller at the detail they already had;
+        this keeps them the size they are and gives them more detail.
+
+        ## If some apps change and others do not {#partial}
+
+        Toolkits disagree about where to read the display's density from. MSL publishes it both ways — as the
+        screen's physical size, and as the `Xft.dpi` resource that Qt, Tk and xterm read — but an app that
+        hardcodes 96 will ignore both and keep its old size. Nothing breaks; it just will not have grown
+        sharper with the rest.
+
+        Applies to apps opened after turning it on. One already on screen keeps the density it started with.
         """#)
 
     static let nativeScaling = HelpArticle(

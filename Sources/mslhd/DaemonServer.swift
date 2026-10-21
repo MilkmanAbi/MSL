@@ -2495,6 +2495,17 @@ final class DaemonServer {
             self.managersLock.unlock()
             let activity = self.activitySnapshot()
             for (name, manager) in snapshot {
+                // An instance that is already down is not idle, it is
+                // *finished*. Without this the timer kept picking the same
+                // hibernated instances up every 30 seconds - the log read
+                // "idle too long - asking its apps to close" followed by
+                // "hibernating" over and over for the same names - and each
+                // pass asked the Mac's Linux apps to close again. Paused is
+                // deliberately not excluded: MSL suspends an idle guest
+                // within seconds of the last session closing, so a paused
+                // instance is the normal thing to hibernate, and skipping it
+                // would disable the idle timer altogether.
+                if manager.currentState() == .stopped { continue }
                 let last = activity[name] ?? .distantPast
                 if Date().timeIntervalSince(last) > self.idleTimeout {
                     // An open `msl` session is not idle either. This checked

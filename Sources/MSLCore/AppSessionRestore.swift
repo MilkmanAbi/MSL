@@ -109,6 +109,53 @@ public enum AppSessionRestore {
         }
     }
 
+    /// The app hosts that belong to **one** instance.
+    ///
+    /// `runningHosts()` cannot tell them apart. Every host is a copy of the
+    /// same `mslgui` binary in the same shim directory, so a filter on the
+    /// executable path matches every instance's apps at once - and that is
+    /// what made hibernating one instance close every Linux app on the Mac,
+    /// including the apps of an instance somebody was actively using. The
+    /// idle timer comes round every 30 seconds, so in practice an app on a
+    /// busy instance was closed within half a minute of being opened, as
+    /// soon as any *other* instance went idle (2026-10-14: `xterm`,
+    /// Chromium and Krita each exited with status 0 about 25 seconds after
+    /// launch - which is what a polite `WM_DELETE_WINDOW` looks like from
+    /// the app's side, and why it never looked like a crash).
+    ///
+    /// The instance is in the host's own argv: `X11AppRouter.spawn` passes
+    /// `--instance`. Read through `sysctl`, which is the only source here
+    /// that does not depend on a run loop `mslhd` never pumps.
+    public static func runningHosts(instance: String) -> [NSRunningApplication] {
+        runningHosts().filter { hostInstance(of: $0) == instance }
+    }
+
+    /// The instance named in a host's argv, or nil when it names none.
+    ///
+    /// A host started by a build from before the flag existed names none.
+    /// It is deliberately attributed to **no** instance rather than to all
+    /// of them: closing other people's windows is the bug being fixed, and
+    /// an app left running through a hibernate is the pre-existing,
+    /// recoverable case that `closeApps` already documents.
+    ///
+    /// One token, not the rest of the line: `KERN_PROCARGS2` carries the
+    /// process environment after the arguments, so "everything after the
+    /// flag" would swallow environment variables too. One token is also
+    /// exactly what `mslgui` itself parses, so both sides agree.
+    static func hostInstance(of host: NSRunningApplication) -> String? {
+        guard let line = ProcessIdentity.commandLine(pid: host.processIdentifier) else { return nil }
+        return instanceName(inCommandLine: line)
+    }
+
+    /// The instance in one `mslgui` command line. Separate from the pid
+    /// lookup above purely so the parsing is testable without spawning
+    /// real app hosts.
+    static func instanceName(inCommandLine line: String) -> String? {
+        let tokens = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
+        guard let flag = tokens.firstIndex(of: "--instance"), flag + 1 < tokens.count else { return nil }
+        return tokens[flag + 1]
+    }
+
     /// What is open right now, as a manifest - resolving each host's name
     /// to a command through the instance's own app catalog.
     /// Whether `name` lowercased looks like something a guest could run.
@@ -132,7 +179,7 @@ public enum AppSessionRestore {
                                 hosts: [NSRunningApplication]? = nil,
                                 catalog: [LinuxApp]? = nil,
                                 resolve: ((String) -> String?)? = nil) -> Manifest {
-        let live = hosts ?? runningHosts()
+        let live = hosts ?? runningHosts(instance: instance)
         let apps = catalog ?? LinuxAppCatalog.cached(instance: instance)
         var seen = Set<String>()
         var entries: [Entry] = []
@@ -187,7 +234,7 @@ public enum AppSessionRestore {
                                  hosts: [NSRunningApplication]? = nil,
                                  resolve: ((String) -> String?)? = nil,
                                  appSupport: URL = MSLPaths.appSupport) -> CloseResult {
-        let live = hosts ?? runningHosts()
+        let live = hosts ?? runningHosts(instance: instance)
         // Resolved **now**, while the guest is still running. After the
         // hibernate there is nothing to ask.
         let manifest = snapshot(instance: instance, hosts: live, resolve: resolve)

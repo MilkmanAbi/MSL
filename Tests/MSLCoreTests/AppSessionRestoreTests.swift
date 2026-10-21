@@ -27,6 +27,47 @@ final class AppSessionRestoreTests: XCTestCase {
                  name: name, command: command, comment: nil)
     }
 
+    // MARK: - Which instance a host belongs to
+
+    /// Every app host is a copy of the same binary in the same directory,
+    /// so the only thing that says which instance it serves is its argv.
+    func testHostInstanceComesFromArgv() {
+        let line = "/Users/x/Library/Caches/MSL/AppShims/Krita --msl-app-host /tmp/k.sock --host-slot 3 --instance Milk"
+        XCTAssertEqual(AppSessionRestore.instanceName(inCommandLine: line), "Milk")
+    }
+
+    /// A shim from a build older than the flag belongs to no instance.
+    /// Attributing it to *every* instance is the bug: hibernating one
+    /// instance would close it along with everything else.
+    func testHostWithNoInstanceFlagBelongsToNoInstance() {
+        let line = "/Users/x/Library/Caches/MSL/AppShims/Krita --msl-app-host /tmp/k.sock --host-slot 3"
+        XCTAssertNil(AppSessionRestore.instanceName(inCommandLine: line))
+    }
+
+    /// The whole point of matching a token rather than searching for
+    /// "--instance Milk" as a substring: an instance called `Milkium-2`
+    /// starts with the name of one called `Milk`, and a substring search
+    /// would hand `Milk`'s hibernate every one of `Milkium-2`'s apps.
+    func testOneInstanceNameIsNotAPrefixOfAnother() {
+        let line = "/Users/x/Library/Caches/MSL/AppShims/Krita --msl-app-host /tmp/k.sock --host-slot 3 --instance Milkium-2"
+        XCTAssertEqual(AppSessionRestore.instanceName(inCommandLine: line), "Milkium-2")
+        XCTAssertNotEqual(AppSessionRestore.instanceName(inCommandLine: line), "Milk")
+    }
+
+    /// `KERN_PROCARGS2` carries the process environment after the
+    /// arguments, so the name is the one token after the flag and never
+    /// "the rest of the line".
+    func testEnvironmentAfterTheArgumentsIsNotPartOfTheName() {
+        let line = "/Users/x/Library/Caches/MSL/AppShims/Krita --msl-app-host /tmp/k.sock"
+            + " --host-slot 3 --instance Milk PATH=/usr/bin HOME=/Users/x MSL_X11_TRACE=1"
+        XCTAssertEqual(AppSessionRestore.instanceName(inCommandLine: line), "Milk")
+    }
+
+    /// A flag with nothing after it must not read off the end.
+    func testTrailingInstanceFlagWithNoValue() {
+        XCTAssertNil(AppSessionRestore.instanceName(inCommandLine: "/bin/mslgui --instance"))
+    }
+
     // MARK: - The manifest
 
     func testNothingIsStoredUntilSomethingIsOpen() {

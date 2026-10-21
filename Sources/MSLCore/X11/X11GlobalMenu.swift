@@ -158,8 +158,9 @@ final class X11GlobalMenu: NSObject, NSMenuDelegate {
     private var entries: [UInt32: Entry] = [:]
     private var shownWindow: UInt32?
     private var installedItems: [NSMenuItem] = []
-    /// MSL's own Window menu, while an app's exported menus have one too.
-    private var hiddenWindowItem: NSMenuItem?
+    /// MSL's own menus that an app's exported menus duplicate, hidden for
+    /// as long as that app's menus are in the bar.
+    private var hiddenOwnItems: [NSMenuItem] = []
     private var installedSignature: [String] = []
     private var openNodes: [X11GlobalMenuNode] = []
     private var needsReinstall = false
@@ -234,8 +235,8 @@ final class X11GlobalMenu: NSObject, NSMenuDelegate {
         for item in installedItems where mainMenu.index(of: item) >= 0 {
             mainMenu.removeItem(item)
         }
-        hiddenWindowItem?.isHidden = false
-        hiddenWindowItem = nil
+        for item in hiddenOwnItems { item.isHidden = false }
+        hiddenOwnItems = []
         installedItems = []
         installedSignature = []
         guard let windowID = shownWindow, let entry = entries[windowID] else { return }
@@ -258,11 +259,23 @@ final class X11GlobalMenu: NSObject, NSMenuDelegate {
         // that application's windows, which is what someone reaching for
         // "Window" in a Linux app is after. MSL's comes back the moment the
         // app's menus leave the bar.
-        if let windowsMenu = NSApplication.shared.windowsMenu,
-           let ours = mainMenu.items.first(where: { $0.submenu === windowsMenu }),
-           tops.contains(where: { Self.plainTitle($0.label) == Self.plainTitle(Self.barTitle(of: ours)) }) {
+        //
+        // **Every** menu MSL owns, not just Window: MSL also contributes an
+        // Edit menu (Emoji & Symbols), and an app that exports its own Edit
+        // made the bar read "Edit File Edit Help Window" - two Edits, the
+        // first of which was not the app's and held one unrelated item
+        // (seen on screen 2026-10-21, a GTK3 app exporting File/Edit/Help).
+        // The app's menu wins for the same reason the Window one does: it
+        // is the menu somebody reaching for that title actually wants.
+        //
+        // The leftmost item is never hidden - it is the application menu,
+        // whose title is the app's own name rather than a menu the app
+        // could duplicate, and a menu bar without it is not a menu bar.
+        let appTitles = Set(tops.map { Self.plainTitle($0.label) })
+        for ours in mainMenu.items.dropFirst() where !ours.isHidden {
+            guard appTitles.contains(Self.plainTitle(Self.barTitle(of: ours))) else { continue }
             ours.isHidden = true
-            hiddenWindowItem = ours
+            hiddenOwnItems.append(ours)
         }
 
         let reserved = mainMenu.items.prefix(index).reduce(CGFloat(0)) { total, item in

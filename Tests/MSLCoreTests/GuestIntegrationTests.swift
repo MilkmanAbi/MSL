@@ -231,6 +231,48 @@ final class GuestIntegrationTests: XCTestCase {
         XCTAssertNotEqual(String(hash, radix: 16), GuestIntegration.stamp)
     }
 
+    // MARK: - Qt's portal theme, for apps it breaks
+
+    /// The launcher consults the list the bridge writes, and the name it
+    /// looks up is the binary - not the whole command line.
+    func testLaunchCommandChecksThePortalThemeWedgeList() {
+        let command = GuestIntegration.launchCommand("krita --nosplash",
+                                                     instance: "test-no-overrides",
+                                                     settings: MSLExperimentalSettings())
+        XCTAssertTrue(command.contains("qt-portal-theme-wedges"))
+        XCTAssertTrue(command.contains("grep -qx -- 'krita'"))
+        XCTAssertTrue(command.contains("unset QT_QPA_PLATFORMTHEME"))
+    }
+
+    /// `/proc/<pid>/comm` is what the bridge records, so an interpreted app
+    /// has to be looked up under the interpreter: that is the process whose
+    /// D-Bus connection is the one that wedged.
+    func testWedgeNameIsTheBinaryNotTheScript() {
+        XCTAssertEqual(GuestIntegration.commandBinaryName("python3 /opt/app/run.py"), "python3")
+        XCTAssertEqual(GuestIntegration.commandBinaryName("/usr/bin/krita"), "krita")
+    }
+
+    /// Custom launch commands carry both of these, and neither is the
+    /// program being run.
+    func testWedgeNameStepsOverEnvAndAssignments() {
+        XCTAssertEqual(GuestIntegration.commandBinaryName("env QT_SCALE_FACTOR=1 krita"), "krita")
+        XCTAssertEqual(GuestIntegration.commandBinaryName("GDK_BACKEND=x11 gedit notes.txt"), "gedit")
+        XCTAssertNil(GuestIntegration.commandBinaryName(""))
+    }
+
+    /// Nothing is hardcoded: with no list on the guest the check is still
+    /// emitted, finds nothing and leaves the theme alone, so an app that
+    /// has never misbehaved keeps MSL Files as its picker.
+    func testNoAppIsSkippedByName() {
+        for app in ["krita", "gimp", "chromium", "python3"] {
+            let command = GuestIntegration.launchCommand(app, instance: "test-no-overrides",
+                                                         settings: MSLExperimentalSettings())
+            XCTAssertFalse(command.contains("unset QT_QPA_PLATFORMTHEME\nexport"),
+                           "\(app) must only lose the theme through the learned list")
+            XCTAssertTrue(command.contains("[ -r \"$msl_wedges\" ]"))
+        }
+    }
+
     func testLaunchCommandPutsKitFirstAndKeepsCommand() {
         // Menus off, so this tests the kit's own ordering rather than the
         // menu bridge's own lines.

@@ -479,6 +479,39 @@ public enum GuestIntegration {
         return lines
     }
 
+    /// The binary an app's launch command actually runs, as `/proc/<pid>/comm`
+    /// would spell it.
+    ///
+    /// Leading `VAR=value` assignments and a leading `env` are stepped over,
+    /// because both appear in custom launch commands and neither is the
+    /// program. `python3 /path/app.py` gives `python3`, which is right: that
+    /// is the process whose connection to D-Bus is the one that wedges.
+    static func commandBinaryName(_ command: String) -> String? {
+        for token in command.split(separator: " ", omittingEmptySubsequences: true).map(String.init) {
+            if token == "env" || token.contains("=") { continue }
+            let name = (token as NSString).lastPathComponent
+            return name.isEmpty ? nil : name
+        }
+        return nil
+    }
+
+    /// Skips Qt's portal theme for an app already proved to choke on it.
+    ///
+    /// The list is written by the menu bridge when an application that had
+    /// the theme set stops answering D-Bus entirely - see `remember_wedge`.
+    /// Nothing is hardcoded here: an app earns its place by demonstrating
+    /// the fault on this machine, and an app that never does is untouched,
+    /// so the Qt half of the file picker keeps working everywhere it works.
+    static func qtPortalThemeQuirkLines(for command: String) -> String {
+        guard let binary = commandBinaryName(command) else { return "" }
+        return #"""
+        msl_wedges="$HOME/\#(directory)/qt-portal-theme-wedges"
+        if [ -r "$msl_wedges" ] && grep -qx -- \#(shellQuoted(binary)) "$msl_wedges" 2>/dev/null; then
+            unset QT_QPA_PLATFORMTHEME
+        fi
+        """#
+    }
+
     /// Takes the INSTANCE and resolves the app's per-app settings itself.
     ///
     /// Both of those lookups used to happen at the call sites, and when a
@@ -511,6 +544,7 @@ public enum GuestIntegration {
             lines.append("export GALLIUM_DRIVER=llvmpipe")
         }
         lines += kitEnvLines(menuBridgeFor: settings.globalMenuBar ? command : nil)
+        lines.append(qtPortalThemeQuirkLines(for: command))
         // Snap's confinement check looks at the launching process's cgroup:
         // started straight from MSL's service it sees
         // "/system.slice/shellinit.service is not a snap cgroup" and
@@ -2401,6 +2435,17 @@ public enum GuestIntegration {
     # bridge could not reach the app's macOS process, or the tree came back
     # empty - and they are indistinguishable without this.
     VERBOSE = os.environ.get("MSL_MENU_DEBUG") != "0"
+    # How often to re-ask an app that was too busy to answer, and the first
+    # gap before doing so - each retry waits twice as long as the last, so
+    # five of them span about sixteen seconds. That covers a cold start of
+    # something as heavy as Krita without pestering an app that is simply
+    # never going to answer.
+    MENU_RETRIES = 5
+    MENU_RETRY_MS = 500
+    # Apps whose D-Bus connection stops answering once Qt's
+    # `xdgdesktopportal` platform theme is loaded. Written here, read by
+    # the launcher - see `qtPortalThemeQuirkLines`.
+    WEDGE_FILE = os.path.expanduser("~/.local/share/msl-integration/qt-portal-theme-wedges")
 
 
     def log(message):
@@ -2607,6 +2652,7 @@ public enum GuestIntegration {
             self.gtk = {}          # bus name -> GTK application state
             self.gtk_windows = {}  # synthetic window id -> bus name
             self.next_gtk_window = GTK_WINDOW_BASE
+            self.generation = 0    # bumped per registration; see `register`
             self.loop = GLib.MainLoop()
 
         def run(self):
@@ -2685,7 +2731,19 @@ public enum GuestIntegration {
                 subs.append(self.bus.signal_subscribe(sender, DBUSMENU, signal, path, None,
                                                       Gio.DBusSignalFlags.NONE,
                                                       lambda *_a, w=window_id: self.schedule_refresh(w)))
-            self.windows[window_id] = {"sender": sender, "path": path, "link": link, "subs": subs, "pending": 0}
+            # A generation per registration. Qt registers the SAME window
+            # twice while starting (Krita: `/MenuBar/1` then `/MenuBar/2`),
+            # and a `GetLayout` still in flight when the second one arrives
+            # comes back against the new entry - starting a second retry
+            # chain beside the first, against a path that is no longer the
+            # one registered. Both chains then counted their attempts into
+            # one counter and the log printed "would not give up" twice for
+            # a single window. The reply carries the generation it was asked
+            # under, so a late one is recognised and dropped.
+            self.generation += 1
+            self.windows[window_id] = {"sender": sender, "path": path, "link": link,
+                                       "subs": subs, "pending": 0, "attempts": 0,
+                                       "gen": self.generation}
             self.bus.emit_signal(None, REGISTRAR_PATH, REGISTRAR, "WindowRegistered",
                                  GLib.Variant("(uso)", (window_id, sender, path)))
             self.schedule_refresh(window_id)
@@ -2735,18 +2793,104 @@ public enum GuestIntegration {
             window["pending"] = 0
             self.bus.call(window["sender"], window["path"], DBUSMENU, "GetLayout",
                           GLib.Variant("(iias)", (0, -1, [])), GLib.VariantType("(u(ia{sv}av))"),
-                          Gio.DBusCallFlags.NONE, 5000, None, self.on_layout, window_id)
+                          Gio.DBusCallFlags.NONE, 5000, None, self.on_layout,
+                          (window_id, window["gen"]))
             return False
 
-        def on_layout(self, bus, result, window_id):
+        def remember_wedge(self, sender):
+            """Notes an app whose D-Bus went silent under Qt's portal theme.
+
+            Qt's `xdgdesktopportal` platform theme is how a Qt application
+            is given MSL Files as its file picker. In some applications
+            loading it leaves the application's D-Bus connection unserviced
+            for the rest of the process's life: measured on Krita, which
+            after startup answers nothing at all on the bus - not even
+            `Introspect`, which QtDBus answers inside the library without
+            the application's code being involved. Krita with the theme
+            exported no menus at all; the same Krita without it exported
+            all eleven (2026-10-21).
+
+            So the theme buys such an app **nothing** - a connection that
+            cannot answer `Introspect` cannot complete a portal file-chooser
+            call either - while costing it every menu. Recording it here
+            lets the next launch skip the theme, which is strictly better
+            for this app and changes nothing for the apps the theme serves
+            properly.
+
+            Only apps that really had the theme are recorded, read from the
+            process's own environment rather than assumed: an app can fail
+            to answer for its own reasons, and this must not quietly take
+            the picker away from one that was never affected.
+            """
+            try:
+                reply = self.bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                           "org.freedesktop.DBus", "GetConnectionUnixProcessID",
+                                           GLib.Variant("(s)", (sender,)), GLib.VariantType("(u)"),
+                                           Gio.DBusCallFlags.NONE, 2000, None)
+                pid = reply.unpack()[0]
+                with open("/proc/%d/environ" % pid, "rb") as handle:
+                    environ = handle.read().split(b"\0")
+                with open("/proc/%d/comm" % pid, "rb") as handle:
+                    name = handle.read().decode("utf-8", "replace").strip()
+            except (GLib.Error, OSError, ValueError):
+                return
+            if not name or "/" in name:
+                return
+            if not any(entry.startswith(b"QT_QPA_PLATFORMTHEME=") and b"xdgdesktopportal" in entry
+                       for entry in environ):
+                return
+            try:
+                os.makedirs(os.path.dirname(WEDGE_FILE), exist_ok=True)
+                try:
+                    with open(WEDGE_FILE) as handle:
+                        if name in handle.read().split():
+                            return
+                except OSError:
+                    pass
+                with open(WEDGE_FILE, "a") as handle:
+                    handle.write(name + "\n")
+            except OSError:
+                return
+            log("%s answers nothing on D-Bus with Qt's portal theme loaded - "
+                "its next launch will run without it" % name)
+
+        def on_layout(self, bus, result, asked):
+            window_id, generation = asked
             window = self.windows.get(window_id)
             if window is None:
+                return
+            # Registered again since this was asked: that reply describes a
+            # menu bar this window no longer has.
+            if window.get("gen") != generation:
                 return
             try:
                 revision, layout = bus.call_finish(result).unpack()
             except GLib.Error as error:
-                log("window %s would not give up its menus: %s" % (window_id, error))
+                # **Ask again rather than give up.** A toolkit answers this
+                # call on its own main thread, and at startup that thread is
+                # busy - loading plugins, building a QML scene - so the call
+                # can time out for no reason except that the app was not
+                # listening yet. Krita does exactly this: it registers its
+                # menu bar twice while starting, the query times out, and
+                # before this it meant the app simply never had menus. It
+                # was timing, which is why it looked intermittent and why it
+                # came and went between releases.
+                #
+                # Backing off rather than hammering: an app that is busy
+                # stays busy for a moment, and a retry every 60ms would make
+                # it busier.
+                window["attempts"] = window.get("attempts", 0) + 1
+                if window["attempts"] <= MENU_RETRIES:
+                    delay = MENU_RETRY_MS * (2 ** (window["attempts"] - 1))
+                    log("window %s did not answer (%s) - asking again in %dms (%d of %d)"
+                        % (window_id, error.message, delay, window["attempts"], MENU_RETRIES))
+                    window["pending"] = GLib.timeout_add(delay, self.refresh, window_id)
+                else:
+                    log("window %s would not give up its menus after %d tries: %s"
+                        % (window_id, MENU_RETRIES, error))
+                    self.remember_wedge(window["sender"])
                 return
+            window["attempts"] = 0
             if window["link"] is None or not window["link"].alive:
                 window["link"] = self.link_for(window["sender"])
             if window["link"] is None:

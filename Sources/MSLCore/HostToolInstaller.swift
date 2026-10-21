@@ -14,7 +14,13 @@ public enum HostToolInstaller {
     /// `mslgui` is included because `X11AppRouter` looks for it as a
     /// sibling of the running host binary - installing them together keeps
     /// that relationship true in the install directory too.
-    public static let tools = ["msl", "mslhd", "mslgui", "msl-applauncher", "msl-usbd"]
+    ///
+    /// `mslod`, MSL's observer, is installed the same way as the rest and
+    /// deliberately nowhere special: it is an ordinary program that happens
+    /// to watch the others, and an observer that only existed in a build
+    /// directory would be an observer nobody ever had.
+    public static let tools = ["msl", "mslhd", "mslgui", "msl-applauncher",
+                               "msl-usbd", "mslod"]
 
     /// Tools that must carry `com.apple.security.virtualization` to work at
     /// all. `mslhd` is the only process that ever constructs a

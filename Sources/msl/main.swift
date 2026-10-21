@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import MSLCore
+import MSLObserver
 import PublicMSL
 #if canImport(Darwin)
 import Darwin
@@ -3263,7 +3264,8 @@ case "doctor":
         // includes the tamper fallback, so a policy somebody edited is
         // still checked against the last one that verified rather than
         // reported as no policy at all.
-        policy: MSLAPGate.policy)
+        policy: MSLAPGate.policy,
+        observerRunning: ObserverAgent.isRunning())
     let findings = Diagnostics.run(environment)
 
     for finding in findings {

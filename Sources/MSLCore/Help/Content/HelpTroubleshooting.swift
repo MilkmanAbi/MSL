@@ -7,7 +7,8 @@ extension HelpChapter {
         id: "troubleshooting", title: "Troubleshooting", symbol: "cross.case", tint: .watermelon,
         blurb: "Symptoms first, then what to do — and where to look when that isn't enough.",
         articles: [.troubleWontStart, .troubleService, .troubleApps, .troubleSSH, .troubleDisk, .troubleFilesystem,
-                   .troubleClock, .troubleMaintenance, .troubleMemory, .troubleNetwork, .stopCodes, .logsAndDoctor, .reclaimSpace])
+                   .troubleClock, .troubleMaintenance, .troubleMemory, .troubleNetwork,
+                   .stopCodes, .observer, .logsAndDoctor, .reclaimSpace])
 }
 
 extension HelpArticle {
@@ -284,37 +285,103 @@ static let stopCodes = HelpArticle(
         summary: "What MSL shows when it cannot carry on, and what each code means.",
         keywords: ["crash", "crash screen", "stop code", "error code", "0x", "fatal",
                    "SERVICE_CANNOT_LISTEN", "SIGNING_KEY_UNREADABLE", "KEY_STORE_UNPROTECTED",
-                   "VIRTUALIZATION_REFUSED", "quit unexpectedly"],
-        related: ["logs-and-doctor", "trouble-service", "mslap-strength"],
+                   "VIRTUALIZATION_REFUSED", "SERVICE_WILL_NOT_STAY_UP",
+                   "SERVICE_STOPPED_ANSWERING", "SERVICE_IS_NOT_INSTALLED",
+                   "STATE_DIRECTORY_UNUSABLE", "observer", "mslod", "quit unexpectedly"],
+        related: ["observer", "logs-and-doctor", "trouble-service", "mslap-strength"],
         body: #"""
         Most things that go wrong in MSL get a sentence and a way out. The crash screen is for the ones that
         do not: MSL has stopped, and carrying on would mean pretending.
 
-        Every stop carries a **code** — a number like `0x00000010` and a name like `SERVICE_CANNOT_LISTEN`.
+        The picture on it is a joke. The panel beside it is not - it carries the code, which part of MSL the
+        failure was about, which part noticed, when, and what was actually measured. That panel is what you
+        quote; **Copy report** puts all of it on the clipboard, with the observer's own record of the minutes
+        beforehand when the observer is what raised it.
+
+        Every stop carries a **code** - a number like `0x00000010` and a name like `SERVICE_CANNOT_LISTEN`.
         The number never changes meaning, so it is worth quoting in a bug report or searching for.
 
-        **Copy details** puts the code, the component and MSL's version on the clipboard. **Open the log**
-        opens `~/Library/Logs/MSL`, which is where a crash is actually diagnosed.
+        ## Who raises one {#who}
 
-        ## Codes MSL understands {#known}
+        | Raised by | |
+        |---|---|
+        | **MSL, about itself** | A condition MSL detects where it happens and cannot continue past. `0x10`-`0x13`. |
+        | **MSL's observer** | A separate program, `mslod`, that watches MSL from outside and reports a state MSL cannot get itself out of. `0x20` upwards. See [MSL's observer](help:observer). |
+        | **Nothing** | A signal or an unhandled error. `0x01`-`0x06`, and they carry no advice on purpose. |
 
-        These are conditions MSL recognises and can tell you what to do about.
+        ## Codes MSL raises about itself {#known}
 
-        | Code | What happened | What to do |
-        |---|---|---|
-        | `0x00000010` SERVICE_CANNOT_LISTEN | MSL's background service could not open the socket everything talks to it on | Another copy may be running. Quit MSL and open it again; failing that, restart the Mac |
-        | `0x00000011` SIGNING_KEY_UNREADABLE | The key MSL signs your instances with is there but unreadable | Check that `/Users/Shared/MSL` and `machine-key` inside it still belong to you |
-        | `0x00000012` KEY_STORE_UNPROTECTED | This Mac is managed, but the administrator's keys can be written by other accounts | An administrator repairs it — see [How strong a policy is](help:mslap-strength) |
-        | `0x00000013` VIRTUALIZATION_REFUSED | macOS will not let this copy of MSL create a virtual machine | Install MSL from its package rather than copying the files in |
+        ### 0x00000010 SERVICE_CANNOT_LISTEN {#service-cannot-listen}
+
+        MSL's background service could not open the socket everything else talks to it on, so nothing can
+        reach it. Another copy may already be running. Quit MSL and open it again; failing that, restart
+        the Mac.
+
+        ### 0x00000011 SIGNING_KEY_UNREADABLE {#signing-key-unreadable}
+
+        The key MSL signs your instances with is there and cannot be read. Check that `/Users/Shared/MSL`
+        and the `machine-key` file inside it still belong to you.
 
         > [!important]
         > MSL will **not** replace an unreadable signing key. A new one would make every instance on this Mac
-        > unverifiable, permanently — so it stops instead, which is the recoverable outcome.
+        > unverifiable, permanently - so it stops instead, which is the recoverable outcome.
 
-        ## Codes MSL does not understand {#unknown}
+        ### 0x00000012 KEY_STORE_UNPROTECTED {#key-store-unprotected}
+
+        This Mac is managed, but the folder holding the administrator's keys can be written by other
+        accounts, so signed policies no longer verify. An administrator repairs it - see
+        [How strong a policy is](help:mslap-strength).
+
+        ### 0x00000013 VIRTUALIZATION_REFUSED {#virtualization-refused}
+
+        macOS will not let this copy of MSL's service create a virtual machine, so no instance can start.
+        Install MSL from its package rather than copying the files in: the permission is part of the
+        signature and does not survive a plain copy.
+
+        ## Codes MSL's observer raises {#observer-codes}
+
+        These come from `mslod`, which is not part of MSL and does not depend on it. Each one is a state MSL
+        has been in **for minutes**, not a moment of trouble - a single crash that the service recovered from
+        is recorded and never shown. See [MSL's observer](help:observer) for how it decides.
+
+        ### 0x00000020 SERVICE_WILL_NOT_STAY_UP {#service-will-not-stay-up}
+
+        The background service has crashed and restarted several times in a few minutes and never answered
+        anything in between. Quit MSL and open it again - that reinstalls the service from the app. If it
+        keeps happening, the crash report named `mslhd` in Console's Crash Reports says why, and the report
+        panel quotes the exception type it found.
+
+        ### 0x00000021 SERVICE_STOPPED_ANSWERING {#service-stopped-answering}
+
+        The service is running and accepting connections but has stopped replying to them, so anything that
+        asks it something waits forever instead of being told no. Restart it:
+
+        ```shell
+        launchctl kickstart -k gui/$(id -u)/com.msl.mslhd
+        ```
+
+        Your instances keep their disks, and anything that was running comes back. If it wedges again,
+        restart the Mac before using MSL for anything you care about.
+
+        ### 0x00000022 SERVICE_IS_NOT_INSTALLED {#service-is-not-installed}
+
+        The program MSL runs everything through is missing from where MSL installs it, so nothing can start -
+        most likely an install or update that stopped part-way. Open MSL once: the app reinstalls its own
+        command-line programs every launch. If MSL will not open either, install it again from its package;
+        your instances and their disks are untouched by that.
+
+        ### 0x00000023 STATE_DIRECTORY_UNUSABLE {#state-directory-unusable}
+
+        MSL cannot use the folder it keeps your instances, accounts and settings in, so instances may appear
+        to have vanished. **Nothing has been deleted.** Check that `~/Library/Application Support/MSL` still
+        belongs to you, is readable and writable, and that its disk is not full. Do not delete anything in
+        there - it is where your instances live.
+
+        ## Codes nothing understands {#unknown}
 
         These mean MSL fell over in a way it did not anticipate. They carry no advice, deliberately: inventing
-        a next step for something MSL cannot explain would be worse than admitting it.
+        a next step for something MSL cannot explain would be worse than admitting it. They name no subsystem
+        either, for the same reason.
 
         | Code | |
         |---|---|
@@ -333,8 +400,73 @@ static let stopCodes = HelpArticle(
         crash like this fixable. So MSL shows the screen and then lets the process die exactly as it would
         have. Nothing is given up for the window.
 
-        You will find that report in **Console ▸ Crash Reports**, named after the part that stopped —
+        You will find that report in **Console ▸ Crash Reports**, named after the part that stopped -
         `mslhd`, `MSLApp`, `MSLFiles` or `msl`.
+        """#)
+
+    static let observer = HelpArticle(
+        id: "observer", title: "MSL's observer", symbol: "eye",
+        summary: "The separate program that watches MSL, what it records, and when it interrupts you.",
+        keywords: ["observer", "mslod", "watchdog", "observer.log", "monitoring", "watching",
+                   "com.msl.observer", "incident", "crash screen"],
+        related: ["stop-codes", "logs-and-doctor", "trouble-service", "background-service"],
+        body: #"""
+        `mslod` is a small program that watches MSL from outside and does nothing else. It is installed
+        beside MSL's other programs and runs as its own login job - never inside MSL's background service,
+        because a watchdog that lives in the thing it watches is missing at the only moment it matters.
+
+        Nothing in MSL depends on it. If it is not running, MSL works exactly the same; you simply get no
+        report when something goes badly wrong. `msl doctor` says whether it is running.
+
+        ## What it watches {#watches}
+
+        From outside, every few seconds, using nothing but the process table and MSL's own control socket:
+
+        - the background service starting, stopping and being replaced, by process id;
+        - whether it **answers**, not merely whether it can be connected to - a socket accepts connections on
+          the kernel's behalf, so connecting proves nothing;
+        - every Linux application host starting and ending, and which instance each belongs to;
+        - your instances appearing, running and stopping;
+        - crash reports macOS writes for any part of MSL, and the exception type inside them;
+        - whether MSL's own folder can be written and its list of instances read.
+
+        It also quotes MSL's own log lines into its record, so one file holds both what MSL said about
+        itself and what was seen from outside. Guest kernel output is left out - that is Linux talking,
+        not MSL.
+
+        ## When it interrupts you {#interrupts}
+
+        Almost never, by design. A crash screen for a healthy MSL is worse than no observer at all, so every
+        threshold is minutes rather than seconds, and all of the following are recorded and **not** shown:
+
+        - one crash that the service came back from - that is the system working;
+        - the service being replaced during an update, or booted out by the installer;
+        - `launchctl kickstart`;
+        - a slow reply while MSL freezes and saves a guest's memory, however long that takes - a service
+          still writing its own log is busy, not wedged;
+        - the Mac waking from sleep;
+        - the service being off because you turned it off;
+        - MSL having already put up its own crash screen, which says more than the observer can.
+
+        What it does show is a state MSL has been in for minutes and cannot get out of: the service in a
+        restart loop, a service that has stopped replying, a missing installation, or a folder MSL cannot
+        use. Each is one of the [stop codes](help:stop-codes), and each is shown **once** per session.
+
+        ## Its record {#record}
+
+        `~/Library/Logs/MSL/observer.log`, and it belongs to **this time you turned the Mac on**. The next
+        boot deletes it and starts again, so there is nothing to clear out and nothing that grows forever.
+        Restarting the observer, or MSL, does not clear it - only booting does.
+
+        That is deliberately short-lived, so an incident keeps its own copy. When the observer raises a stop
+        code it writes `observer-incident.txt` into `~/Library/Application Support/MSL` with the code, what
+        it measured, and the tail of what it saw beforehand. **Copy report** on the crash screen includes all
+        of it. That file survives the log, and is removed once the screen has shown it.
+
+        ## Turning it off {#off}
+
+        It follows **Start MSL's background service** in Settings. Turning that off removes the observer's
+        job along with the service's; turning it back on reinstates both.
         """#)
 
     static let logsAndDoctor = HelpArticle(

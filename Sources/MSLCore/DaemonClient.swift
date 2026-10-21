@@ -6,6 +6,7 @@
 // section.
 
 import Foundation
+import MSLObserver
 #if canImport(Darwin)
 import Darwin
 #endif
@@ -233,6 +234,17 @@ public enum DaemonClient {
     /// should stay stopped; a crash should come back.
     @discardableResult
     public static func installLaunchAgent() -> Bool {
+        // **MSL's observer goes up with the service, and comes down with
+        // it.** Here rather than at each call site because there are four of
+        // them, and an observer that only half the paths install is an
+        // observer that is missing on exactly the Macs nobody tested.
+        //
+        // It is *installed* beside the daemon and runs completely apart from
+        // it: its own launchd job, never a child of mslhd, so it is still
+        // there when mslhd is not - which is the only time it matters.
+        // Someone who turned the background service off meant no background
+        // MSL at all, so `removeLaunchAgent` takes it away again.
+        ObserverAgent.install()
         let daemon = MSLPaths.tool("mslhd")
         guard FileManager.default.isExecutableFile(atPath: daemon.path) else { return false }
         MSLPaths.ensureDirectory(MSLPaths.launchAgentPlist.deletingLastPathComponent())
@@ -326,7 +338,13 @@ public enum DaemonClient {
     }
 
     /// Removes the LaunchAgent, so `mslhd` stops coming back at login.
+    ///
+    /// The observer goes first, and for the same reason the uninstaller stops
+    /// it first: it is about to watch the service it is meant to be watching
+    /// disappear, which is a crash screen in the middle of something the
+    /// person asked for.
     public static func removeLaunchAgent() {
+        ObserverAgent.remove()
         runLaunchctl(["bootout", "gui/\(getuid())/\(MSLPaths.launchAgentLabel)"])
         try? FileManager.default.removeItem(at: MSLPaths.launchAgentPlist)
     }

@@ -107,6 +107,13 @@ CONSOLE_USER=$(id -un "$CONSOLE_UID" 2>/dev/null) || exit 0
 SUPPORT="$(eval echo ~"$CONSOLE_USER")/Library/Application Support/MSL"
 MSL="$SUPPORT/bin/msl"
 
+# **MSL's observer goes first, before anything is touched.** Everything below
+# this line is MSL being taken apart on purpose - instances saved, the daemon
+# stopped, the bundles replaced - and that is exactly the shape of the failure
+# the observer exists to report. Left running, it would put a crash screen up
+# in the middle of an upgrade.
+launchctl bootout "gui/$CONSOLE_UID/com.msl.observer" 2>/dev/null || true
+
 # Hibernate rather than power off: the same instances are coming back in a
 # minute, and hibernate brings them back where they were. As the console
 # user, because that is who owns the daemon and the instances.
@@ -154,6 +161,10 @@ set -e
 CONSOLE_UID=$(stat -f %u /dev/console 2>/dev/null || echo 0)
 if [ "$CONSOLE_UID" -gt 0 ]; then
     launchctl bootout "gui/$CONSOLE_UID/com.msl.mslhd" 2>/dev/null || true
+    # The observer too, as the same backstop. It comes back when MSL is next
+    # opened or `msl` is next run, both of which install it - so an upgrade
+    # leaves no watchdog watching a half-replaced install.
+    launchctl bootout "gui/$CONSOLE_UID/com.msl.observer" 2>/dev/null || true
 fi
 
 # `msl` on PATH, which only the installer can do: /usr/local/bin needs root,

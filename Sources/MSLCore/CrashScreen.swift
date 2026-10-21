@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import MSLObserver
 import Security
 
 /// A signal handler is a plain C function pointer, so it can capture
@@ -36,6 +37,10 @@ public enum CrashScreen {
         case daemon = "mslhd"
         case cli = "msl"
         case files = "MSLFiles"
+        /// Not MSL falling over, but MSL's observer saying from outside that
+        /// it has. See `MSLObserver` - and note the window reads one note
+        /// format and does not care which of them wrote it.
+        case observer = "mslod"
     }
 
     /// Where the last crash left its note, for the window to read.
@@ -60,25 +65,79 @@ public enum CrashScreen {
         public let name: String
         public let happened: String
         public let next: String?
+        /// Which part of MSL this is about. nil for the unanticipated ones,
+        /// for the same reason `next` is: naming a subsystem MSL has not
+        /// actually established was at fault would send somebody looking in
+        /// a place nobody has any reason to think is wrong.
+        public let subsystem: String?
 
-        public init(number: UInt32, name: String, happened: String, next: String? = nil) {
+        public init(number: UInt32, name: String, happened: String, next: String? = nil,
+                    subsystem: String? = nil) {
             self.number = number
             self.name = name
             self.happened = happened
             self.next = next
+            self.subsystem = subsystem
         }
 
         /// `0x00000010`, the form that goes on screen and into a search box.
         public var printed: String { String(format: "0x%08X", number) }
+
+        /// The same code, declared by the observer. A plain conversion and
+        /// nothing more: the observer owns the words, this type owns how
+        /// they are shown.
+        public init(_ observer: ObserverStopCode) {
+            self.init(number: observer.number, name: observer.name,
+                      happened: observer.happened, next: observer.next,
+                      subsystem: observer.subsystem)
+        }
     }
 
     /// Every code, which is also how `code(named:)` finds one.
-    public static let allStopCodes: [StopCode] = [
+    ///
+    /// **One table, including the observer's.** `MSLObserver` is a leaf
+    /// target with no dependencies - it cannot import this file - so its
+    /// codes are declared there and folded in here rather than written out
+    /// twice. Two switches over the same thing is how a name ends up with
+    /// one number here and another on screen, which is the mistake the rest
+    /// of this file was already written to avoid.
+    public static let allStopCodes: [StopCode] =
+        ownStopCodes + ObserverStopCode.all.map(StopCode.init)
+
+    /// The ones MSL raises about itself.
+    public static let ownStopCodes: [StopCode] = [
         .wentSomewhereItShouldnt, .busTookAWrongTurn, .instructionMakesNoSense,
         .mathsHappened, .gaveUpOnItself, .trippedOverATrap,
         .serviceCannotListen, .signingKeyUnreadable, .keyStoreUnprotected,
         .virtualizationRefused,
     ]
+
+    /// Where the guide that explains a code lives. The crash screen's one
+    /// piece of advice that always applies is "read this".
+    public static let wikiStopCodes = ObserverWiki.stopCodes
+
+    /// The page for one code, by its anchor, so the screen can send somebody
+    /// to the paragraph about the number in front of them rather than to the
+    /// top of a long page. nil in, the top of the page out - an uncaught
+    /// error has no paragraph of its own to go to.
+    public static func wikiPage(for code: StopCode?) -> String {
+        guard let code else { return ObserverWiki.stopCodes }
+        return ObserverWiki.stopCodes + "#" + code.name.lowercased()
+            .replacingOccurrences(of: "_", with: "-")
+    }
+
+    /// The observer's report on an incident it raised: the code, the detail,
+    /// and the tail of everything it saw leading up to it.
+    ///
+    /// Separate from the log on purpose. The observer's log is **this boot's
+    /// only** and goes at the next one; this is the evidence behind a screen
+    /// that may not have been read yet, so it survives until it has been.
+    public static var observerIncidentURL: URL { ObserverPaths.incident }
+
+    /// Clears the observer's report, once it has been shown.
+    public static func clearObserverIncident() {
+        try? FileManager.default.removeItem(at: observerIncidentURL)
+    }
 
     /// The code a recorded name belongs to, for the window to show more than
     /// the name. An uncaught exception has no fixed name - it carries the
@@ -297,7 +356,8 @@ extension CrashScreen.StopCode {
         happened: "MSL's background service could not open the socket everything "
                 + "else talks to it on, so nothing can reach it.",
         next: "Another copy of it may already be running. Quit MSL, open it again, "
-            + "and if that does not help, restart the Mac.")
+            + "and if that does not help, restart the Mac.",
+        subsystem: "mslhd - the control socket")
 
     /// 0x11. The signing key is there and cannot be read. MSL must not
     /// generate another - that would orphan every identity on this Mac - so
@@ -308,7 +368,8 @@ extension CrashScreen.StopCode {
                 + "MSL will not replace it: a new key would make every instance on "
                 + "this Mac unverifiable, permanently.",
         next: "Check that /Users/Shared/MSL and the machine-key file inside it still "
-            + "belong to you and are readable.")
+            + "belong to you and are readable.",
+        subsystem: "instance identity - the machine key")
 
     /// 0x12. The store that decides which policies are honoured is writable
     /// by somebody else, so every signature check fails closed - on a Mac
@@ -320,7 +381,8 @@ extension CrashScreen.StopCode {
                 + "keys can be written by other accounts - so signed policies no "
                 + "longer verify and the rules have stopped applying.",
         next: "An administrator can repair it with: "
-            + "sudo chown -R root /Users/Shared/MSL && sudo chmod -R go-w /Users/Shared/MSL")
+            + "sudo chown -R root /Users/Shared/MSL && sudo chmod -R go-w /Users/Shared/MSL",
+        subsystem: "MSL Admin Portal - the key store")
 
     /// 0x13. macOS will not let this build create a virtual machine, so no
     /// instance can ever start. Almost always a copy of `mslhd` that was
@@ -330,5 +392,6 @@ extension CrashScreen.StopCode {
         happened: "macOS will not let this copy of MSL's service create a virtual "
                 + "machine, so no instance can start.",
         next: "Install MSL from its package rather than copying the files in: the "
-            + "permission is part of the signature and does not survive a plain copy.")
+            + "permission is part of the signature and does not survive a plain copy.",
+        subsystem: "mslhd - the virtualization entitlement")
 }

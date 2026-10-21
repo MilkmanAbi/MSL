@@ -11,6 +11,7 @@ let package = Package(
     // with nothing MSL-specific about it.
     products: [
         .library(name: "MSLCore", targets: ["MSLCore"]),
+        .library(name: "MSLObserver", targets: ["MSLObserver"]),
         .library(name: "PublicMSL", targets: ["PublicMSL"]),
         .executable(name: "msl", targets: ["msl"]),
         .executable(name: "mslhd", targets: ["mslhd"]),
@@ -24,13 +25,31 @@ let package = Package(
         .executable(name: "MSLPeripherals", targets: ["MSLPeripherals"]),
         .executable(name: "mslgui", targets: ["mslgui"]),
         .executable(name: "msl-applauncher", targets: ["msl-applauncher"]),
+        .executable(name: "mslod", targets: ["mslod"]),
     ],
     dependencies: [
         .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.20.0"),
     ],
     targets: [
+        // MSL's observer, and the one target in this package with no
+        // dependencies at all - not even MSLCore.
+        //
+        // That is the point of it. The observer has to keep working when the
+        // thing it watches does not, and a watchdog linked against the same
+        // library as its subject falls over for the same reasons its subject
+        // does: MSLCore carries a `Bundle.module` resource bundle that
+        // fatalErrors off the machine that built it, and links IOKit,
+        // IOUSBHost and NetFS. So this is Foundation and the system, and the
+        // few paths it shares with MSLCore are spelled out again, with
+        // `ObserverParityTests` failing if any of them drifts.
+        //
+        // MSLCore depends on *it*, not the other way round, so there is one
+        // stop-code table rather than two.
+        .target(name: "MSLObserver"),
+        .executableTarget(name: "mslod", dependencies: ["MSLObserver"]),
         .target(
             name: "MSLCore",
+            dependencies: ["MSLObserver"],
             // The melon, a second time. `LinuxAppBundle` builds app bundles
             // from both the GUI and the CLI and falls back to this when a
             // Linux app ships no icon of its own, so MSLCore needs its own
@@ -45,7 +64,8 @@ let package = Package(
                 .linkedFramework("NetFS"),
             ]
         ),
-        .testTarget(name: "MSLCoreTests", dependencies: ["MSLCore"]),
+        .testTarget(name: "MSLCoreTests", dependencies: ["MSLCore", "MSLObserver"]),
+        .testTarget(name: "MSLObserverTests", dependencies: ["MSLObserver"]),
         .testTarget(name: "PublicMSLTests", dependencies: ["PublicMSL", "MSLCore"]),
         // Renders the app's own views offscreen, so a card that crashes or
         // lays out to nothing is caught by `swift test` rather than by
@@ -77,7 +97,7 @@ let package = Package(
         // MSLApp.entitlements`).
         .executableTarget(
             name: "MSLApp",
-            dependencies: ["MSLCore", "PublicMSL",
+            dependencies: ["MSLCore", "MSLObserver", "PublicMSL",
                            .product(name: "SwiftTerm", package: "SwiftTerm")],
             // `.process`, not `.copy`: it flattens the files into the
             // bundle root, so `Bundle.module.url(forResource:)` finds them

@@ -1,4 +1,5 @@
 import Foundation
+import MSLObserver
 
 /// Removing MSL from a Mac without removing the Linux on it.
 ///
@@ -115,7 +116,13 @@ public enum Uninstaller {
 
         var launchAgents: [URL] {
             let directory = home.appendingPathComponent("Library/LaunchAgents")
-            return [MSLPaths.launchAgentLabel, LoginItem.terminal.label, LoginItem.app.label]
+            // **The observer first.** Everything after this takes MSL apart -
+            // stops the daemon, removes its binary, empties its folder - and
+            // an observer still running would watch exactly that and put a
+            // crash screen up in the middle of an uninstall the person asked
+            // for. It is booted out before anything else goes.
+            return [ObserverAgent.label, MSLPaths.launchAgentLabel,
+                    LoginItem.terminal.label, LoginItem.app.label]
                 .map { directory.appendingPathComponent("\($0).plist") }
         }
 

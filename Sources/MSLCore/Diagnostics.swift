@@ -53,6 +53,10 @@ public enum Diagnostics {
         public let instances: [String: GuestDistro]
         public let expectedTools: [String]
         public let daemonRunning: Bool
+        /// Whether MSL's observer is running. nil when the caller did not
+        /// look - a test building an environment by hand is not making a
+        /// claim about a watchdog it never asked about.
+        public let observerRunning: Bool?
         /// The MSLAP policy in force, or nil on an unmanaged Mac.
         ///
         /// Injected like every other path here, so the protection checks
@@ -64,8 +68,10 @@ public enum Diagnostics {
             appSupport: URL, generatedApps: URL, binDirectory: URL,
             instances: [String: GuestDistro], expectedTools: [String], daemonRunning: Bool,
             // Defaulted so every existing call site keeps compiling and
-            // keeps meaning what it meant: no policy, no protection checks.
-            policy: MSLAPPolicy? = nil
+            // keeps meaning what it meant: no policy, no protection checks,
+            // and no claim either way about the observer.
+            policy: MSLAPPolicy? = nil,
+            observerRunning: Bool? = nil
         ) {
             self.appSupport = appSupport
             self.generatedApps = generatedApps
@@ -73,6 +79,7 @@ public enum Diagnostics {
             self.instances = instances
             self.expectedTools = expectedTools
             self.daemonRunning = daemonRunning
+            self.observerRunning = observerRunning
             self.policy = policy
         }
     }
@@ -112,6 +119,7 @@ public enum Diagnostics {
         var findings: [Finding] = []
         findings.append(contentsOf: toolFindings(environment))
         findings.append(daemonFinding(environment))
+        findings.append(observerFinding(environment))
         findings.append(contentsOf: instanceFindings(environment))
         findings.append(contentsOf: orphanFindings(environment))
         findings.append(contentsOf: diskFindings(environment))
@@ -244,6 +252,27 @@ public enum Diagnostics {
         return [Finding(
             severity: .problem, title: "Host tools missing",
             detail: "\(missing.joined(separator: ", ")) - generated apps and the daemon launch from here. Run `msl install-tools` from a build.")]
+    }
+
+    /// Whether anything is watching.
+    ///
+    /// Worth a line of its own because the observer is the one part of MSL
+    /// whose absence is **silent by construction**: everything else announces
+    /// itself by not working, and a missing watchdog looks exactly like a
+    /// healthy Mac right up until the moment somebody needed it.
+    ///
+    /// A warning, never a problem. Nothing in MSL depends on the observer -
+    /// that is the point of it - so its absence costs a report, not a
+    /// capability.
+    static func observerFinding(_ environment: Environment) -> Finding {
+        guard environment.observerRunning ?? false else {
+            return Finding(severity: .warning, title: "Nothing is watching MSL",
+                           detail: "mslod isn't running, so a failure it would report "
+                                 + "will just be a failure. Opening MSL installs and starts it.")
+        }
+        return Finding(severity: .ok, title: "Observer running",
+                       detail: "mslod is watching; its record of this session is in "
+                             + "~/Library/Logs/MSL/observer.log")
     }
 
     private static func daemonFinding(_ environment: Environment) -> Finding {

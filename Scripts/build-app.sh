@@ -6,11 +6,11 @@
 # icon, no Info.plist. Everything below is the packaging step the Swift
 # package deliberately doesn't do (see Package.swift's MSLApp comment).
 #
-# The four command-line tools are copied into Contents/MacOS alongside the
-# app. That is not decoration: `HostToolInstaller.runningBinaryDirectory`
-# looks for them next to the running binary, so this is what lets a
-# double-clicked MSL.app install a working `msl`, `mslhd`, `mslgui`,
-# `msl-applauncher` and `msl-usbd` into ~/Library/Application Support/MSL/bin.
+# The command-line tools are copied into Contents/MacOS alongside the app.
+# That is not decoration: `HostToolInstaller.runningBinaryDirectory` looks for
+# them next to the running binary, so this is what lets a double-clicked
+# MSL.app install a working `msl`, `mslhd`, `mslgui`, `msl-applauncher`,
+# `msl-usbd` and `mslod` into ~/Library/Application Support/MSL/bin.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -35,12 +35,17 @@ swift build -c release
 # shared library they all build on - not against all of Sources, which would
 # fail the app for an edit to the command line and teach everyone to ignore
 # the check.
-for pair in "MSLApp:MSLApp" "msl:msl" "mslhd:mslhd" "mslgui:mslgui" "msl-applauncher:msl-applauncher" "msl-usbd:msl-usbd"; do
+for pair in "MSLApp:MSLApp" "msl:msl" "mslhd:mslhd" "mslgui:mslgui" "msl-applauncher:msl-applauncher" "msl-usbd:msl-usbd" "mslod:mslod"; do
     binary=${pair%%:*}
     target=${pair#*:}
     [ -f "$BUILD/$binary" ] || continue
-    newer=$(find "$ROOT/Sources/$target" "$ROOT/Sources/MSLCore" -name '*.swift' \
-            -newer "$BUILD/$binary" -print -quit 2>/dev/null || true)
+    # MSLObserver as well as MSLCore: every shipped binary builds on one or
+    # both, and a library left out of this check is a library whose changes
+    # ship as a stale binary - which is the failure this whole block exists
+    # to catch, and which once shipped a week-old app while every build
+    # "succeeded".
+    newer=$(find "$ROOT/Sources/$target" "$ROOT/Sources/MSLCore" "$ROOT/Sources/MSLObserver" \
+            -name '*.swift' -newer "$BUILD/$binary" -print -quit 2>/dev/null || true)
     if [ -n "$newer" ]; then
         echo "build-app: $BUILD/$binary is older than $newer - the build did not produce what you are shipping" >&2
         exit 1
@@ -56,7 +61,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # line client instead of the GUI. The user-visible name comes from
 # CFBundleName, not from this filename.
 cp "$BUILD/MSLApp" "$APP/Contents/MacOS/MSLApp"
-for tool in msl mslhd mslgui msl-applauncher msl-usbd; do
+for tool in msl mslhd mslgui msl-applauncher msl-usbd mslod; do
     cp "$BUILD/$tool" "$APP/Contents/MacOS/$tool"
 done
 # App icons, the Apple way for every macOS MSL runs on.

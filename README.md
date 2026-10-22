@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Pseudonymous-Nano/MSL-Pseudo/main/Assets/App_Logo.png" width="148" alt="The MSL melon">
+  <img src="https://raw.githubusercontent.com/MilkmanAbi/MSL-Pseudo/main/Assets/App_Logo.png" width="148" alt="The MSL melon">
 </p>
 
 <h1 align="center">MSL</h1>

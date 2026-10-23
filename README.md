@@ -28,9 +28,9 @@
 
 <br>
 
-MSL runs real Linux distributions on your Mac: an actual Linux kernel and an actual Linux userland on Apple's own Virtualization framework, with nothing emulated and no virtual machine window to babysit. You type `msl` and you're in. Your home folder is already there. Linux apps show up in the Dock, in Spotlight and in ⌘-Tab like they always lived there. ✨
+MSL runs real Linux distributions on your Mac — an actual kernel, an actual userland, on Apple's own Virtualization framework. Nothing's emulated, and there's no VM window to babysit. Type `msl` and you're in. Your home folder's already there. Linux apps show up in the Dock, in Spotlight, in ⌘-Tab, like they always lived there.
 
-MSL has been in development for over a year, and getting here took an honestly insane amount of engineering effort. It's free, it's open source, and it's still held together with a great deal of love. ヽ(・∀・)ﾉ
+It's been over a year getting here, and most of that time was spent on problems I didn't know existed until I hit them. It's free, open source, and still held together by a fair amount of stubbornness. ヽ(・∀・)ﾉ
 
 <p align="center">
   <img src="Gallery/hero.jpg" width="900" alt="Linux Chromium running as a Mac window, its menus in the Mac menu bar and its own tile in the Dock, with MSL's window behind it">
@@ -89,25 +89,25 @@ MSL has been in development for over a year, and getting here took an honestly i
   <b>Tried MSL?</b> Tell me how it went in the <a href="https://docs.google.com/forms/d/e/1FAIpQLScJm6KavA6mDJE9ntoH2YPvlsSoEJZaissnvr_b4gG68b3ixA/viewform?usp=dialog">community feedback form</a>. ( ´ ▽ ` )ﾉ
 </p>
 
-## First, an honest word about the name
+## First, a word about the name
 
-MSL isn't really a subsystem. Nothing is woven into macOS, there's no kernel extension and no compatibility layer. Underneath, every Linux instance is a lightweight virtual machine, the same foundation plenty of other Mac apps are built on. (WSL 2 on Windows is a lightweight virtual machine too, for what it's worth.)
+MSL isn't really a subsystem — nothing's woven into macOS, there's no kernel extension, no compatibility layer. Underneath, every instance is a lightweight VM, the same foundation a lot of other Mac virtualization apps use (WSL 2 on Windows is one too, for what it's worth).
 
-The name describes a feeling rather than an architecture. Everything MSL does is aimed at making that virtual machine disappear, until Linux on your Mac stops feeling like a trip to another computer and starts feeling like something your Mac simply does.
+The name is about the feeling more than the architecture. Everything MSL does is pointed at making that VM disappear, so Linux on your Mac stops feeling like a trip to another computer and starts feeling like something your Mac just does.
 
 ## What MSL isn't
 
-MSL is not a replacement for Docker, and it doesn't try to be. Containers are the right tool for reproducible builds, services and deployments, and Docker is excellent at them. It's not VMware Fusion, Parallels or UTM either: if you want a full desktop, Windows, or another operating system in a window, those are made for exactly that. OrbStack and Lima are great at what they do too.
+It's not a Docker replacement, and it doesn't try to be — containers are the right tool for reproducible builds and deployments, and Docker's already good at that. It's not VMware Fusion, Parallels or UTM either; if you want a full desktop or another OS in a window, those are built for exactly that. OrbStack and Lima are good at what they do too.
 
-MSL is a different take on the same old idea. Less about containers, less about desktops, and more about a Linux you live right next to, the way WSL feels on Windows. It's just another piece of software, built by someone who wanted that feeling on a Mac and couldn't stop. Use it alongside everything else, or don't use it at all. Both are completely fine. ( ˘ω˘ )
+This is a different take on the same old idea — not containers, not a full desktop, just a Linux you live right next to, the way WSL feels on Windows. It's a piece of software built by someone who wanted that feeling on a Mac and couldn't leave it alone. Use it next to everything else you've got, or don't use it at all. Either's fine. ( ˘ω˘ )
 
 ## What it feels like
 
-Open Terminal and type `msl debian`. About a second later you're in a real Linux shell, signed in as your own account, with job control, colours and line editing, and your Mac's home folder is waiting at `/mnt/mac`. Type `gimp`, and GIMP opens as a Mac window with its own icon in the Dock and its own name in the menu bar.
+Open Terminal and type `msl debian`. A second later you're in a real Linux shell, signed in as your own account, with job control, colours, line editing, and your Mac's home folder waiting at `/mnt/mac`. Type `gimp`, and GIMP opens as a Mac window with its own icon in the Dock and its own name in the menu bar.
 
-Close the lid, and MSL freezes your instances before the Mac goes to sleep; open it again and everything is exactly where you left it. Walk away from an instance and it quietly suspends itself so it stops using your processor, then wakes the moment you open a shell or an app. Shut the Mac down and your Linux apps get the chance to ask about unsaved work first.
+Close the lid and MSL freezes your instances before the Mac sleeps; open it again and everything's exactly where you left it. Walk away from an instance and it suspends itself so it stops burning CPU, then wakes the moment you open a shell or an app. Shut the Mac down and your Linux apps get a chance to ask about unsaved work first.
 
-None of that needs a window of its own. MSL has one if you want it, and you rarely have to open it.
+None of that needs a window of its own. MSL has one if you want it, but you rarely have to open it.
 
 ## What's inside
 
@@ -162,23 +162,23 @@ None of that needs a window of its own. MSL has one if you want it, and you rare
 
 ## MSL Files
 
-It looks like Finder. It is not Finder. (◞‸◟)
+It looks like Finder. It isn't Finder. (◞‸◟)
 
-A running Linux instance does show up in Finder, as a network volume called `127.0.0.1` with nothing to tell you which instance it is. The sensible fix would have been a better volume name. What MSL has instead is an entire file manager, written from scratch in SwiftUI, over 5,000 lines of it, in a sincere and slightly unhinged attempt to make moving files between macOS and Linux feel like a normal Mac thing to do. 😆
+A running instance does show up in Finder, as a network volume called `127.0.0.1`, with nothing telling you which instance it even is. The easy fix would've been a better volume name. Instead there's a whole file manager, written from scratch in SwiftUI — over 5,000 lines — just to make moving files between macOS and Linux feel like something your Mac does normally.
 
-It has Finder's four views, Finder's sidebar and Finder's keyboard shortcuts, right down to Return renaming instead of opening and ⇧⌘. for hidden files. Quick Look, Get Info, copy and paste, drag and drop, real Finder tags, Recents and tag searches through Spotlight, and a Trash that knows Linux volumes don't have one. Your Mac's folders sit in the sidebar right above every running instance, listed by name, so getting a file from Downloads into Linux is a single drag.
+It has Finder's four views, Finder's sidebar, Finder's keyboard shortcuts, right down to Return renaming instead of opening and ⇧⌘. for hidden files. Quick Look, Get Info, copy and paste, drag and drop, real Finder tags, Recents and tag searches through Spotlight, a Trash that knows Linux volumes don't have one. Your Mac folders sit in the sidebar right above every running instance, so getting a file from Downloads into Linux is one drag.
 
-Along the way it turned out that SwiftUI's own table never delivers a double-click, so the list view is laid out by hand. It is a genuinely silly amount of effort to rebuild something every Mac already ships with, and it's one of the parts of MSL I'm fondest of. ( ˶ˆ ᗜ ˆ˵ )
+Turns out SwiftUI's own table view never delivers a double-click, so the list view ended up laid out by hand. Rebuilding something every Mac already ships with is a ridiculous amount of effort for what it is — and it's still one of the parts of MSL I'm fondest of. ( ˶ˆ ᗜ ˆ˵ )
 
 <a id="mslgd"></a>
 
 ## mslgd
 
-Linux GUI apps draw through a display protocol called X11. On a Mac the usual answer is XQuartz, and XQuartz works: the windows appear. But under XQuartz every Linux app is a window belonging to XQuartz. One Dock tile for all of them, one icon, a menu bar that says XQuartz whichever app you're actually in, and Mission Control stacking them all together.
+Linux GUI apps draw through a display protocol called X11. On a Mac the usual answer is XQuartz, and XQuartz works — the windows appear. But under XQuartz, every Linux app is a window belonging to XQuartz. One Dock tile for all of them, one icon, a menu bar that says XQuartz no matter which app you're actually in, Mission Control stacking them all together.
 
-MSL wanted the windows to belong to the apps. As far as I could find, the only way to get there is to be the X server. So MSL has its own.
+I wanted the windows to belong to the apps. As far as I could tell, the only way there is to be the X server. So MSL has its own.
 
-**mslgd** is an X11 server written from scratch in Swift: about 13,700 lines across 30 files, with no Xlib and no X.Org code underneath. It speaks the X11 wire protocol directly and draws straight into AppKit and Core Graphics, so every Linux window is a real `NSWindow`. Each Linux app runs in a small process of its own on the Mac side, because macOS gives out exactly one Dock tile per process, and that's what earns every app its own tile, icon, menu bar name, and place in Mission Control and ⌘-Tab.
+**mslgd** is an X11 server written from scratch in Swift: about 13,700 lines across 30 files, no Xlib, no X.Org code underneath. It speaks the X11 wire protocol directly and draws straight into AppKit and Core Graphics, so every Linux window is a real `NSWindow`. Each Linux app runs in its own small process on the Mac side, because macOS hands out exactly one Dock tile per process — that's what gets every app its own tile, icon, menu bar name, and place in Mission Control and ⌘-Tab.
 
 What it handles today:
 
@@ -188,14 +188,14 @@ What it handles today:
 - **Behaving like a Mac app**: the close button asks the app first, so unsaved work gets its "Save changes?", and window icons come from the app itself.
 - **Experiments you can switch on**: Linux app menus in the Mac menu bar, ⌘ shortcuts and Mac text navigation inside Linux apps, and a choice of what each Option key means.
 
-A few things it turns out you have to know when you write one of these:
+A few things you apparently have to find out the hard way, writing one of these:
 
-- The 68 predefined atoms have to be seeded by hand. Skip that and `WM_NAME` can never match, so every window title is silently dead code, for months.
-- Send one input as both XI2 and core events and every click lands twice. Krita's menus were broken for a very long time because of one doubled click.
-- Coverage masks belong in the **alpha** channel, because Core Graphics clips by alpha, not brightness. Get it wrong and a calculator renders like a haunted photocopy.
-- AppKit will happily send a mouse Enter with no matching Leave. GTK 4 does not find this funny, and simply stops responding to the mouse.
+- The 68 predefined atoms have to be seeded by hand. Skip that and `WM_NAME` can never match, so every window title is dead code — for months, in my case.
+- Send one input as both XI2 and a core event and every click lands twice. Krita's menus were broken for a long time because of exactly one doubled click.
+- Coverage masks belong in the **alpha** channel, because Core Graphics clips by alpha, not brightness. Get it backwards and a calculator renders like a haunted photocopy.
+- AppKit will happily send a mouse Enter with no matching Leave. GTK 4 does not find this funny, and just stops responding to the mouse.
 
-GTK 3 and 4 apps, Qt apps like Krita, GIMP, LibreOffice, galculator and xeyes all run as Mac windows. It's still the most experimental part of MSL: some apps draw imperfectly, there's no OpenGL, and copy and paste doesn't cross between apps yet. mslgd is the part MSL exists to attempt, rather than a finished claim about how well it does it. Would I do it again? Yes, and I think that's the problem. ( ͡° ᴥ ͡°)
+GTK 3 and 4 apps run, Qt apps like Krita, GIMP, LibreOffice, galculator and xeyes all run as Mac windows. It's still the shakiest part of MSL — some apps draw wrong, there's no OpenGL yet, and copy-paste doesn't cross between apps. mslgd is the part of MSL that's more an attempt than a finished answer. I'd still do it again. ( ͡° ᴥ ͡°)
 
 ## Getting started
 
@@ -272,9 +272,9 @@ This is **MSL 1.0.0**.
 
 ## Contributing
 
-Bug reports, ideas and pull requests are all welcome, and so is simply telling me what you think in the [community feedback form](https://docs.google.com/forms/d/e/1FAIpQLScJm6KavA6mDJE9ntoH2YPvlsSoEJZaissnvr_b4gG68b3ixA/viewform?usp=dialog). A good bug report says which Mac and macOS version you're on, which distro, what you expected and what happened, and includes what `msl doctor` prints. Logs live in `~/Library/Logs/MSL`.
+Bug reports, ideas and pull requests are all welcome, and so is just telling me what you think in the [community feedback form](https://docs.google.com/forms/d/e/1FAIpQLScJm6KavA6mDJE9ntoH2YPvlsSoEJZaissnvr_b4gG68b3ixA/viewform?usp=dialog). A good bug report says which Mac and macOS version you're on, which distro, what you expected and what happened, and includes what `msl doctor` prints. Logs live in `~/Library/Logs/MSL`.
 
-Everyone who has helped is in [CONTRIBUTORS.md](CONTRIBUTORS.md), and if you're pointing an AI coding agent at the repository, [AGENTS.md](AGENTS.md) is written for it.
+Everyone who's helped is in [CONTRIBUTORS.md](CONTRIBUTORS.md), and if you're pointing an AI coding agent at the repository, [AGENTS.md](AGENTS.md) is written for it.
 
 <a id="licence"></a>
 
@@ -282,7 +282,7 @@ Everyone who has helped is in [CONTRIBUTORS.md](CONTRIBUTORS.md), and if you're 
 
 MSL uses two licences, on purpose.
 
-- **mslgd**, the X11 server, is under the **GNU General Public License v3**, along with anything derived from it. It lives in `Sources/MSLCore/X11`, `Sources/MSLCore/X11InputGate.swift`, `Sources/mslgui` and `Guest/init/x11tunnel.c`. It's the hard, stubborn part, and it should stay free: use it, change it, ship it, and if you ship changes, share their source.
+- **mslgd**, the X11 server, is under the **GNU General Public License v3**, along with anything derived from it. It lives in `Sources/MSLCore/X11`, `Sources/MSLCore/X11InputGate.swift`, `Sources/mslgui` and `Guest/init/x11tunnel.c`. It's the hardest part to build, and it should stay free: use it, change it, ship it, and if you ship changes, share their source.
 - **Everything else** is under the **MIT License**: the app, the `msl` command, the background service, MSL Files, the guest services and all of the virtual machine plumbing. Take it and build whatever you like.
 
 MSL.app and the programs built from this repository include mslgd, so those builds, taken as a whole, are distributed under the GPL v3. The distribution images MSL downloads keep their own upstream licences. The full texts are in [LICENSE](LICENSE) and [LICENSE-MIT](LICENSE-MIT).

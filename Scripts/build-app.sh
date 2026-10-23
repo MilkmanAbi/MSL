@@ -31,21 +31,34 @@ swift build -c release
 
 # A stale binary is worse than a failed build: it looks like it worked.
 #
-# Each shipped binary is checked against its own target's sources and the
-# shared library they all build on - not against all of Sources, which would
-# fail the app for an edit to the command line and teach everyone to ignore
-# the check.
-for pair in "MSLApp:MSLApp" "msl:msl" "mslhd:mslhd" "mslgui:mslgui" "msl-applauncher:msl-applauncher" "msl-usbd:msl-usbd" "mslod:mslod"; do
-    binary=${pair%%:*}
-    target=${pair#*:}
+# Not against all of Sources, which would fail the app for an edit to the
+# command line and teach everyone to ignore the check.
+#
+# Each binary is checked against its own target and **the libraries it
+# actually links**, which is not the same list for all of them. A library
+# left out ships its changes as a stale binary - the failure this block
+# exists to catch, and which once shipped a week-old app while every build
+# "succeeded". A library wrongly put *in* is just as bad in the other
+# direction: `mslod` deliberately does not link MSLCore, so checking it
+# against MSLCore failed the whole build for an edit the observer could not
+# possibly contain, which teaches everyone to ignore the check.
+for entry in "MSLApp:MSLApp:MSLCore MSLObserver" \
+             "msl:msl:MSLCore MSLObserver PublicMSL" \
+             "mslhd:mslhd:MSLCore MSLObserver PublicMSL" \
+             "mslgui:mslgui:MSLCore MSLObserver" \
+             "msl-applauncher:msl-applauncher:MSLCore MSLObserver" \
+             "msl-usbd:msl-usbd:MSLCore MSLObserver" \
+             "mslod:mslod:MSLObserver"; do
+    binary=${entry%%:*}
+    rest=${entry#*:}
+    target=${rest%%:*}
+    libraries=${rest#*:}
     [ -f "$BUILD/$binary" ] || continue
-    # MSLObserver as well as MSLCore: every shipped binary builds on one or
-    # both, and a library left out of this check is a library whose changes
-    # ship as a stale binary - which is the failure this whole block exists
-    # to catch, and which once shipped a week-old app while every build
-    # "succeeded".
-    newer=$(find "$ROOT/Sources/$target" "$ROOT/Sources/MSLCore" "$ROOT/Sources/MSLObserver" \
-            -name '*.swift' -newer "$BUILD/$binary" -print -quit 2>/dev/null || true)
+    sources="$ROOT/Sources/$target"
+    for library in $libraries; do sources="$sources $ROOT/Sources/$library"; done
+    # Unquoted on purpose: $sources is a list of directories to search.
+    # shellcheck disable=SC2086
+    newer=$(find $sources -name '*.swift' -newer "$BUILD/$binary" -print -quit 2>/dev/null || true)
     if [ -n "$newer" ]; then
         echo "build-app: $BUILD/$binary is older than $newer - the build did not produce what you are shipping" >&2
         exit 1

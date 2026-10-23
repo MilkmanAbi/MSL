@@ -140,6 +140,24 @@ public enum Uninstaller {
         var filesPreferences: URL { home.appendingPathComponent("Library/Preferences/com.msl.files.plist") }
         var filesSavedState: URL { home.appendingPathComponent("Library/Saved Application State/com.msl.files.savedState") }
         var binDirectory: URL { appSupport.appendingPathComponent("bin") }
+
+        /// MSL's own account of its last irrecoverable failure: the note the
+        /// crash screen reads, and the observer's incident report behind it.
+        ///
+        /// They sit in Application Support beside the instances, but they are
+        /// not Linux and they are not settings - they are two files about a
+        /// time MSL broke, and they go in **both** modes. Left behind by a
+        /// keepLinux uninstall they would be handed to the next install,
+        /// which would then have evidence of a crash that happened to a
+        /// version it has never been.
+        /// Named after the two files themselves rather than re-spelled here,
+        /// so a rename on either side cannot leave this looking for a file
+        /// that no longer exists.
+        var crashRecords: [URL] {
+            [CrashScreen.reportURL.lastPathComponent,
+             ObserverPaths.incident.lastPathComponent]
+                .map(appSupport.appendingPathComponent)
+        }
     }
 
     /// The guest-side helpers that share `bin/` with MSL's own tools. They
@@ -201,6 +219,14 @@ public enum Uninstaller {
         if let found = item("App caches", locations.appCaches) { removing.append(found) }
         if let found = item("Web storage", locations.httpStorage) { removing.append(found) }
         if let found = item("Logs", locations.logs) { removing.append(found) }
+        let crashRecords = locations.crashRecords.filter(exists)
+        if !crashRecords.isEmpty {
+            removing.append(Item(
+                label: crashRecords.count == 1 ? "A crash record" : "Crash records",
+                path: crashRecords.map(\.path).joined(separator: ", "),
+                bytes: crashRecords.reduce(0) { $0 + size(of: $1) },
+                note: "what MSL and its observer wrote down about a failure"))
+        }
         if let found = item("Saved window state", locations.savedState) { removing.append(found) }
         if let found = item("MSL Files window state", locations.filesSavedState) { removing.append(found) }
 
@@ -326,9 +352,13 @@ public enum Uninstaller {
         }
         // Everything else in the folder, counted together: the registry, the
         // remembered accounts, storage policies, SSH keys, the app catalog.
+        // The crash records are listed on their own and removed in both
+        // modes, so they must not also be counted as Linux to keep.
+        let notLinux = Set(locations.crashRecords.map(\.lastPathComponent))
         let rest = entries.filter {
             !imageFiles.contains($0) && $0.lastPathComponent != CustomImage.folderName
                 && $0.lastPathComponent != "bin" && $0.lastPathComponent != "mslhd.sock"
+                && !notLinux.contains($0.lastPathComponent)
         }
         if !rest.isEmpty {
             items.append(Item(
@@ -623,6 +653,7 @@ public enum Uninstaller {
         remove(locations.appCaches, "app caches")
         remove(locations.httpStorage, "web storage")
         remove(locations.logs, "logs")
+        for record in locations.crashRecords { remove(record, record.lastPathComponent) }
         remove(locations.savedState, "saved window state")
         remove(locations.filesSavedState, "MSL Files window state")
 

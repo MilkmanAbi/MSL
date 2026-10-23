@@ -1,14 +1,14 @@
 import AppKit
 import MSLCore
 
-/// Tells someone a new MSL exists - see `UpdateCheck` for which releases
-/// reach which installs, and `READMES/22-UPDATE-SYSTEM.md` for the whole
-/// system.
+/// Tells someone a new MSL exists - see `UpdateCheck` for the policy, and
+/// `READMES/22-UPDATE-SYSTEM.md` for the whole system.
 ///
-/// It never installs anything: "Get MSL x" opens that release's page, and the
-/// install stays the person's own step. Every release ships an `info.txt`,
-/// which is fetched and shown in the alert, because "what changed" is the
-/// thing that decides whether to bother.
+/// The policy in one line: a **patch** release is found but never announced,
+/// a **minor** release is announced, and a **major** release is announced
+/// with "read the repository first" as the first thing on offer. Every
+/// release ships an `info.txt`, which is fetched and shown here, because
+/// "what changed" is the thing that decides whether to bother.
 @MainActor
 enum UpdatePrompt {
     private static let stateKey = "update.state"
@@ -32,8 +32,8 @@ enum UpdatePrompt {
         if let data = try? JSONEncoder().encode(state) { UserDefaults.standard.set(data, forKey: stateKey) }
     }
 
-    /// The quiet launch check: throttled, and silent unless there is
-    /// something this install can actually be offered.
+    /// The quiet launch check: throttled, and silent unless the release is
+    /// one worth interrupting someone for - which a patch release is not.
     static func checkAtLaunch() {
         guard ProcessInfo.processInfo.environment["MSL_NO_UPDATE_CHECK"] == nil else { return }
         Task {
@@ -41,13 +41,14 @@ enum UpdatePrompt {
             try? await Task.sleep(nanoseconds: 4_000_000_000)
             let (decision, state) = await UpdateCheck.run(current: currentVersion, state: loadState())
             save(state)
-            guard let decision, decision.shouldPrompt else { return }
+            guard let decision, decision.announces else { return }
             await show(decision)
         }
     }
 
-    /// "Check for Updates…": always checks, always answers, and ignores both
-    /// the silence and the skipped version - asking is asking.
+    /// "Check for Updates…": always checks, always answers, and ignores the
+    /// silence, the skipped version and the "patches are not announced" rule
+    /// - asking is asking, and a fix you came looking for is a fix you get.
     static func checkNow() {
         Task {
             var probe = loadState()
@@ -63,11 +64,11 @@ enum UpdatePrompt {
             kept.backoffUntil = fetched.backoffUntil
             save(kept)
             switch decision?.kind {
-            case .update?, .advisory?:
+            case .update?:
                 await show(decision!)
-            case .upToDate?, .suppressed?:
+            case .upToDate?:
                 inform("MSL is up to date", """
-                    You have MSL \(currentVersion), and nothing newer applies to it. \
+                    You have MSL \(currentVersion), and it is the newest release. \
                     Every release is listed on the releases page.
                     """)
             default:
@@ -80,33 +81,39 @@ enum UpdatePrompt {
     private static func show(_ decision: UpdateCheck.Decision) async {
         guard let release = decision.release else { return }
         let info = await UpdateCheck.fetchInfo(for: release.tag)
-        present(decision, release: release, info: info)
+        present(release: release, bump: decision.bump ?? .patch, info: info)
     }
 
-    private static func present(_ decision: UpdateCheck.Decision, release: UpdateCheck.Release, info: String?) {
+    /// What the alert's buttons can do. Named rather than counted, because
+    /// the order changes with the kind of release and a button mapped by
+    /// position alone is how "Later" becomes "Skip This Version".
+    private enum Choice {
+        case download, openRelease, openRepository, later, skip
+    }
+
+    private static func present(release: UpdateCheck.Release, bump: UpdateCheck.Bump, info: String?) {
         let alert = NSAlert()
         let version = release.version.description
 
-        if decision.kind == .advisory {
-            // Nothing to install: this release needs a newer MSL than this one.
-            alert.messageText = "MSL \(version) fixes unsafe behaviour - but needs a newer MSL"
+        switch bump {
+        case .major:
+            alert.messageText = "MSL \(version) is a new major version"
             alert.informativeText = """
-                You have MSL \(currentVersion). This fix applies to MSL \
-                \(release.minimum.map(\.description) ?? version) and newer, so it cannot be installed here. \
-                Updating to a current MSL first is the way to get it.
+                You have MSL \(currentVersion). A major version is where MSL itself changes, so read \
+                what changed on the repository before you take it. Your instances and settings are kept.
                 """
-        } else if decision.urgent {
-            alert.messageText = "Important: MSL \(version) patches unsafe behaviour"
-            alert.informativeText = """
-                You have MSL \(currentVersion). This release fixes behaviour that can harm your \
-                instances or your data, so it is worth taking now. Your instances and settings are kept.
-                """
-        } else {
+        case .minor:
             alert.messageText = "MSL \(version) is available"
             alert.informativeText = """
-                You have MSL \(currentVersion). MSL can download it to your Downloads and offer \
-                to replace this copy; nothing is removed until it has the new one and asks again. \
-                Your instances and settings are kept either way.
+                You have MSL \(currentVersion). This release adds to MSL. It can be downloaded to your \
+                Downloads and offered to replace this copy; nothing is removed until it has the new one \
+                and asks again. Your instances and settings are kept either way.
+                """
+        case .patch:
+            alert.messageText = "MSL \(version) is available"
+            alert.informativeText = """
+                You have MSL \(currentVersion). This release is a fix - MSL doesn't raise these on its \
+                own, so you are seeing it because you asked. Your instances and settings are kept.
                 """
         }
 
@@ -116,29 +123,28 @@ enum UpdatePrompt {
         } else {
             alert.informativeText += "\n\nThe release page has an info.txt worth reading before you update."
         }
-        if !decision.alsoAvailable.isEmpty {
-            let list = decision.alsoAvailable.prefix(3).map { "\($0.version) (\($0.marker.label))" }.joined(separator: ", ")
-            alert.informativeText += "\n\nAlso released, but for newer MSL than yours: \(list)."
-        }
 
-        // "Download and Update" first, because it is what almost everyone
-        // wants and because doing it by hand is four steps. It is still only
-        // a *download* until a second alert asks again - nothing is removed
-        // on this click (`UpdateRunner`).
-        if decision.kind == .advisory {
-            alert.addButton(withTitle: "See the Releases")
-            alert.addButton(withTitle: "Later")
-        } else {
-            alert.addButton(withTitle: "Download and Update…")
-            alert.addButton(withTitle: "Open the Release Page")
-            alert.addButton(withTitle: "Later")
-            alert.addButton(withTitle: "Skip This Version")
-        }
+        // For a minor or a patch, "Download and Update" comes first, because
+        // it is what almost everyone wants and doing it by hand is four
+        // steps. It is still only a *download* until a second alert asks
+        // again - nothing is removed on this click (`UpdateRunner`).
+        //
+        // For a major release the repository comes first instead. That is the
+        // whole difference a major version makes here: the recommended thing
+        // to do is go and read, not go and install.
+        let buttons: [(title: String, choice: Choice)] = bump.readTheRepositoryFirst
+            ? [("Open the Repository", .openRepository),
+               ("Download and Update…", .download),
+               ("Later", .later),
+               ("Skip This Version", .skip)]
+            : [("Download and Update…", .download),
+               ("Open the Release Page", .openRelease),
+               ("Later", .later),
+               ("Skip This Version", .skip)]
+        for button in buttons { alert.addButton(withTitle: button.title) }
 
-        // The silence switch. An unsafe-behaviour patch deliberately ignores
-        // it later, and the wording says so rather than surprising anyone.
         alert.showsSuppressionButton = true
-        alert.suppressionButton?.title = "Stop telling me about updates (except unsafe-behaviour patches)"
+        alert.suppressionButton?.title = "Stop telling me about updates"
         alert.suppressionButton?.state = loadState().silenced ? .on : .off
 
         NSApp.activate(ignoringOtherApps: true)
@@ -149,26 +155,25 @@ enum UpdatePrompt {
         // Saved before anything else happens: an update that quits the app
         // must not lose the suppression choice made in the same alert.
         save(state)
-        if decision.kind == .advisory {
-            if response == .alertFirstButtonReturn { NSWorkspace.shared.open(UpdateCheck.releasesPage) }
-            return
-        }
-        switch response {
-        case .alertFirstButtonReturn:
+
+        // Mapped by index into the list that was actually built, and bounds
+        // checked: a response that is not one of these buttons - a dismissed
+        // alert, something new - must do nothing at all, never fall through
+        // to "never tell me about this version again".
+        let index = Int(response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue)
+        guard buttons.indices.contains(index) else { return }
+        switch buttons[index].choice {
+        case .download:
             UpdateRunner.run(release)
-        case .alertSecondButtonReturn:
+        case .openRelease:
             NSWorkspace.shared.open(release.page)
-        case .alertThirdButtonReturn:
-            break   // Later.
-        case NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertThirdButtonReturn.rawValue + 1):
-            // Skip This Version. Matched explicitly rather than by `default`:
-            // `default` would have treated *any* other response - a dismissed
-            // alert, a future button - as "never tell me about this version
-            // again", which is the one outcome nobody would have chosen.
+        case .openRepository:
+            NSWorkspace.shared.open(UpdateCheck.repositoryPage)
+        case .later:
+            break
+        case .skip:
             state.skippedTag = release.tag
             save(state)
-        default:
-            break
         }
     }
 

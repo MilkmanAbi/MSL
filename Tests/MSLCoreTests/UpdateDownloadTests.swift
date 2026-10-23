@@ -63,14 +63,13 @@ final class UpdateDownloadTests: XCTestCase {
                        "https://github.com/MilkmanAbi/MSL/releases/download/v2.1.0/MSL-2.1.0.pkg")
     }
 
-    /// A marker tag downloads from the tag, not from the bare version -
-    /// "the tag we compared is the tag we install" (OIS).
-    func testMarkerTagKeepsItsWholeTag() {
-        let marked = UpdateCheck.Release(tag: "v2.1.0-UBP-2.0",
-                                         version: UpdateCheck.Version("2.1.0")!,
-                                         marker: UpdateCheck.Marker(kind: .unsafePatch))
-        let url = UpdateDownload.candidateURLs(for: marked).first
-        XCTAssertEqual(url?.absoluteString.contains("/download/v2.1.0-UBP-2.0/"), true)
+    /// A tag spelled differently from its version downloads from the *tag* -
+    /// "the tag we compared is the tag we install" (OIS). The package inside
+    /// is still named for the version, which is what MSL verifies against.
+    func testTagIsWhatTheDownloadPathUses() {
+        let odd = UpdateCheck.Release(tag: "v2.1", version: UpdateCheck.Version("2.1.0")!)
+        let url = UpdateDownload.candidateURLs(for: odd).first
+        XCTAssertEqual(url?.absoluteString.contains("/download/v2.1/"), true)
         XCTAssertEqual(url?.lastPathComponent, "MSL-2.1.0.pkg")
     }
 

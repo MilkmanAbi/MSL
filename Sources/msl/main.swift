@@ -995,23 +995,20 @@ func runUpdate(_ action: UpdateAction) -> Never {
         exit(1)
     case .upToDate:
         print("You have the newest MSL.")
-        for other in decision.alsoAvailable {
-            print("  (\(other.tag) exists but needs MSL \(other.minimum?.description ?? "newer") or later)")
-        }
         exit(0)
-    case .advisory:
-        // Nothing installable: this copy is below the release's minimum.
-        if let release = decision.release {
-            print("MSL \(release.version) is out, but it needs MSL \(release.minimum?.description ?? "newer") or later.")
-            print("See \(release.page.absoluteString)")
-        }
-        exit(0)
-    case .suppressed, .update:
+    case .update:
         break
     }
     guard let release = decision.release else { exit(0) }
 
-    print("MSL \(release.version) is available\(decision.urgent ? " - unsafe-behaviour patch" : "").")
+    // Typing the command is asking, so every release is reported here -
+    // including a patch, which MSL never raises on its own.
+    let bump = decision.bump ?? .patch
+    print("MSL \(release.version) is available - \(bump.label).")
+    if bump.readTheRepositoryFirst {
+        print("This is a new major version: read what changed before taking it.")
+        print("  \(UpdateCheck.repositoryPage.absoluteString)")
+    }
     if let info = runBlocking({ await UpdateCheck.fetchInfo(for: release.tag) }), !info.isEmpty {
         print("")
         for line in info.split(separator: "\n") { print("  \(line)") }

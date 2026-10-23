@@ -30,7 +30,7 @@
 
 MSL runs real Linux distributions on your Mac — an actual kernel, an actual userland, on Apple's own Virtualization framework. Nothing's emulated, and there's no VM window to babysit. Type `msl` and you're in. Your home folder's already there. Linux apps show up in the Dock, in Spotlight, in ⌘-Tab, like they always lived there.
 
-It's been over a year getting here, and most of that time was spent on problems I didn't know existed until I hit them. It's free, open source, and still held together by a fair amount of stubbornness. ヽ(・∀・)ﾉ
+It's been over a year getting here, and most of that time was spent on problems I didn't know existed until I hit them. It's free, open source, and still held together by a fair amount of stubbornness. No like genuinely, around 4 months in planning every single subsystem, two weeks figuring out the linux guest side implementation details, a month learning about the VM framework Apple provides and most of the remaining time on testing. YES, the project has the classic AI signature mark of thousands of tests - I did manually test, for more than 100 over hours easily, I just absolutely had to automate some of the testing with scripting to even make this project semi-viable. Even now, a lot of the QC for this proj comes from me, since... I made it primarily because I wanted it.
 
 <p align="center">
   <img src="Gallery/hero.jpg" width="900" alt="Linux Chromium running as a Mac window, its menus in the Mac menu bar and its own tile in the Dock, with MSL's window behind it">

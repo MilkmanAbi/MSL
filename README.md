@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/MilkmanAbi/MSL-Pseudo/main/Assets/App_Logo.png" width="148" alt="The MSL melon">
+  <img src="Assets/App_Logo.png" width="148" alt="The MSL melon">
 </p>
 
 <h1 align="center">MSL</h1>
@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Pseudonymous-Nano/MSL-Pseudo?label=release&color=e8735a"></a>
+  <a href="../../releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/MilkmanAbi/MSL?label=release&color=e8735a"></a>
   <img alt="macOS 14 or later" src="https://img.shields.io/badge/macOS-14%2B-555555">
   <img alt="Apple silicon" src="https://img.shields.io/badge/Apple%20silicon-arm64-555555">
   <img alt="12 distributions" src="https://img.shields.io/badge/distros-12-4c9a6a">
@@ -22,7 +22,7 @@
   <a href="#getting-started">Getting started</a> &nbsp;·&nbsp;
   <a href="#msl-files">MSL Files</a> &nbsp;·&nbsp;
   <a href="#mslgd">mslgd</a> &nbsp;·&nbsp;
-  <a href="MSL-HELP.md">The guide</a> &nbsp;·&nbsp;
+  <a href="https://milkmanabi.github.io/MSL-Wiki/">The guide</a> &nbsp;·&nbsp;
   <a href="#the-msl-family">The MSL family</a>
 </p>
 
@@ -31,6 +31,59 @@
 MSL runs real Linux distributions on your Mac: an actual Linux kernel and an actual Linux userland on Apple's own Virtualization framework, with nothing emulated and no virtual machine window to babysit. You type `msl` and you're in. Your home folder is already there. Linux apps show up in the Dock, in Spotlight and in ⌘-Tab like they always lived there. ✨
 
 MSL has been in development for over a year, and getting here took an honestly insane amount of engineering effort. It's free, it's open source, and it's still held together with a great deal of love. ヽ(・∀・)ﾉ
+
+<p align="center">
+  <img src="Gallery/hero.jpg" width="900" alt="Linux Chromium running as a Mac window, its menus in the Mac menu bar and its own tile in the Dock, with MSL's window behind it">
+</p>
+
+<p align="center">
+  <i>That's Chromium — the Linux one, inside Ubuntu — with its menus in the Mac menu bar and its own Dock tile.</i>
+</p>
+
+<details>
+<summary><b>More of MSL</b> &nbsp;— the app, the terminal, the file browser, the switches <i>(click to open)</i></summary>
+<br>
+
+**One window for every instance.** The apps it has, a terminal into it, what it is, what it can reach.
+
+<table>
+<tr>
+<td width="50%"><img src="Gallery/applications.png" alt="The Applications tab, showing the Linux apps found inside the instance"><br><sub><b>Applications</b> — every app Linux has, read from its own <code>.desktop</code> files. Add one and it becomes a real Mac app.</sub></td>
+<td width="50%"><img src="Gallery/terminal.png" alt="The Terminal tab, showing a real Linux shell"><br><sub><b>Terminal</b> — a real shell, in the app or in Terminal.app. Same kernel, same userland, no emulation.</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="Gallery/overview.png" alt="The Overview tab, showing the instance's name, distribution, state and SSH details"><br><sub><b>Overview</b> — what this machine is, and <code>ssh msl-Work</code> set up for you, so scp and VS Code's Remote-SSH just work.</sub></td>
+<td width="50%"><img src="Gallery/tools.png" alt="The Tools tab, showing shipments, the background service, generated apps and snapshots"><br><sub><b>Tools</b> — snapshots, the background service, and shipments: a whole instance in one file, for another Mac.</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="Gallery/sandbox.png" alt="The Sandbox tab, with gates for network, the Mac home share, graphics and input"><br><sub><b>Sandbox</b> — close the network, the Mac home share, the display server or input. Kept across restarts.</sub></td>
+<td width="50%"><img src="Gallery/new-instance.png" alt="The New Instance sheet, showing twelve distributions to choose from"><br><sub><b>Twelve distributions</b> — each a verified download, kept as a base. Every instance you make from it is a fresh install.</sub></td>
+</tr>
+</table>
+
+**MSL Files.** The Mac side and the Linux side in one window — and the Open and Save dialog Linux apps get.
+
+<table>
+<tr>
+<td width="50%"><img src="Gallery/files-linux.png" alt="MSL Files showing a Linux filesystem with real Unix permissions"><br><sub>A Linux filesystem with its real permissions, its symlinks and its owners — next to your Mac folders and your Finder tags.</sub></td>
+<td width="50%"><img src="Gallery/files-home.png" alt="MSL Files showing where MSL keeps its instances and images on the Mac"><br><sub>And where it all actually lives on the Mac, with the space each instance is using.</sub></td>
+</tr>
+</table>
+
+**The rest of it.**
+
+<table>
+<tr>
+<td width="50%"><img src="Gallery/welcome.jpg" alt="The welcome guide shown on first run"><br><sub><b>A six-page welcome</b> on first run, then a 121-article guide inside the app.</sub></td>
+<td width="50%"><img src="Gallery/permissions.png" alt="The Permissions and Startup window"><br><sub><b>Permissions &amp; Startup</b> — every macOS permission MSL wants, asked for once, with what each one is for.</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="Gallery/experimental.png" alt="The Experimental Features window, listing MSL's flags"><br><sub><b>MSL Flags</b> — retina rendering, the Mac menu bar, Mac shortcuts, OpenGL on the real GPU. Experiments aren't promises.</sub></td>
+<td width="50%"></td>
+</tr>
+</table>
+
+</details>
 
 <p align="center">
   <b>Tried MSL?</b> Tell me how it went in the <a href="https://docs.google.com/forms/d/e/1FAIpQLScJm6KavA6mDJE9ntoH2YPvlsSoEJZaissnvr_b4gG68b3ixA/viewform?usp=dialog">community feedback form</a>. ( ´ ▽ ` )ﾉ
@@ -117,8 +170,6 @@ It has Finder's four views, Finder's sidebar and Finder's keyboard shortcuts, ri
 
 Along the way it turned out that SwiftUI's own table never delivers a double-click, so the list view is laid out by hand. It is a genuinely silly amount of effort to rebuild something every Mac already ships with, and it's one of the parts of MSL I'm fondest of. ( ˶ˆ ᗜ ˆ˵ )
 
-MSL Files is also available as [a standalone app](https://github.com/Pseudonymous-Nano/MSL-Files-Pseudo).
-
 <a id="mslgd"></a>
 
 ## mslgd
@@ -145,8 +196,6 @@ A few things it turns out you have to know when you write one of these:
 - AppKit will happily send a mouse Enter with no matching Leave. GTK 4 does not find this funny, and simply stops responding to the mouse.
 
 GTK 3 and 4 apps, Qt apps like Krita, GIMP, LibreOffice, galculator and xeyes all run as Mac windows. It's still the most experimental part of MSL: some apps draw imperfectly, there's no OpenGL, and copy and paste doesn't cross between apps yet. mslgd is the part MSL exists to attempt, rather than a finished claim about how well it does it. Would I do it again? Yes, and I think that's the problem. ( ͡° ᴥ ͡°)
-
-mslgd is also available as [a standalone Swift package](https://github.com/Pseudonymous-Nano/mslgd-Pseudo).
 
 ## Getting started
 
@@ -197,7 +246,7 @@ Installing a newer package over an older one keeps every instance, image and set
 | openSUSE Leap | 16.0 | 124 MB |
 | Nix | on Debian 13 | 203 MB |
 
-Every image ships with MSL's guest services, git, curl, wget, gcc, make, nano, zsh and sudo, and no usable passwords until you create your own account. Arch here is Arch Linux ARM, since Arch itself has no arm64 port, and Nix is the Nix package manager on Debian rather than NixOS. Want something else? The [MSL Image Builder](https://github.com/Pseudonymous-Nano/msl-image-builder-Pseudo) makes custom images from any arm64 container, built to the same standard.
+Every image ships with MSL's guest services, git, curl, wget, gcc, make, nano, zsh and sudo, and no usable passwords until you create your own account. Arch here is Arch Linux ARM, since Arch itself has no arm64 port, and Nix is the Nix package manager on Debian rather than NixOS. Want something else? The [MSL Image Builder](https://github.com/MilkmanAbi/msl-image-builder) makes custom images from any arm64 container, built to the same standard.
 
 ## Where things stand
 
@@ -209,7 +258,7 @@ This is **MSL 1.0.0**.
 
 ## Documentation
 
-- **[MSL-HELP.md](MSL-HELP.md)** is the complete guide that ships inside the app: 77 articles across 13 chapters, from your first instance to repairing a disk, on one page.
+- **[The MSL Wiki](https://milkmanabi.github.io/MSL-Wiki/)** is the complete guide that ships inside the app, published as a site: 123 articles across 20 chapters, from your first instance to repairing a disk and reading a stop code.
 - **In the app**, it lives under **Help ▸ MSL Help**, with a search that forgives typos and knows that "RAM" means memory.
 - **In Terminal**, `msl help` prints every command.
 
@@ -218,17 +267,14 @@ This is **MSL 1.0.0**.
 | Project | What it is |
 |---|---|
 | **MSL** | This repository: the app, the `msl` command, the background service and the guest services. |
-| [**mslgd**](https://github.com/Pseudonymous-Nano/mslgd-Pseudo) | The X11 server, as a standalone Swift package. |
-| [**MSL Files**](https://github.com/Pseudonymous-Nano/MSL-Files-Pseudo) | The file browser, as a standalone app. |
-| [**MSL Image Builder**](https://github.com/Pseudonymous-Nano/msl-image-builder-Pseudo) | A friendly terminal app for building your own Linux images for MSL. |
-| [**MSL experiments**](https://github.com/Pseudonymous-Nano/msl-experiments-Pseudo) | The code behind Experimental Features, for reference. |
+| [**MSL Image Builder**](https://github.com/MilkmanAbi/msl-image-builder) | A friendly terminal app for building your own Linux images for MSL. |
 | [**msl-files on SourceForge**](https://sourceforge.net/projects/msl-files/files/) | Where the distribution images are published. |
 
 ## Contributing
 
 Bug reports, ideas and pull requests are all welcome, and so is simply telling me what you think in the [community feedback form](https://docs.google.com/forms/d/e/1FAIpQLScJm6KavA6mDJE9ntoH2YPvlsSoEJZaissnvr_b4gG68b3ixA/viewform?usp=dialog). A good bug report says which Mac and macOS version you're on, which distro, what you expected and what happened, and includes what `msl doctor` prints. Logs live in `~/Library/Logs/MSL`.
 
-Please read the [Code of Conduct](CODE_OF_CONDUCT.md) before joining in. Everyone who has helped is in [CONTRIBUTORS.md](CONTRIBUTORS.md), and if you're pointing an AI coding agent at the repository, [AGENTS.md](AGENTS.md) is written for it.
+Everyone who has helped is in [CONTRIBUTORS.md](CONTRIBUTORS.md), and if you're pointing an AI coding agent at the repository, [AGENTS.md](AGENTS.md) is written for it.
 
 <a id="licence"></a>
 
@@ -243,7 +289,7 @@ MSL.app and the programs built from this repository include mslgd, so those buil
 
 ## Thanks
 
-<img src="https://raw.githubusercontent.com/Pseudonymous-Nano/MSL-Pseudo/main/Assets/Mascot.png" width="120" align="right" alt="MSL's mascot, a small knight holding the docs">
+<img src="Assets/Mascot.png" width="120" align="right" alt="MSL's mascot, a small knight holding the docs">
 
 - **neekocat_2025**, who drew the little guy on the right. He carries the docs around and looks concerned about the kernel panics. Same. ( ˘•ω•˘ )
 - **[SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)** by Miguel de Icaza, the terminal inside the app.
@@ -255,8 +301,8 @@ MSL.app and the programs built from this repository include mslgd, so those buil
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/Pseudonymous-Nano/MSL-Pseudo/main/Assets/Abi_Logo-Dark.png">
-    <img src="https://raw.githubusercontent.com/Pseudonymous-Nano/MSL-Pseudo/main/Assets/Abi_Logo-Light.png" width="120" alt="Abi">
+    <source media="(prefers-color-scheme: dark)" srcset="Assets/Abi_Logo-Dark.png">
+    <img src="Assets/Abi_Logo-Light.png" width="120" alt="Abi">
   </picture>
   <br>
   Made with care, stubbornness and a lot of getting it wrong first. ♡
